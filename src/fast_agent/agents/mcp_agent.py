@@ -12,6 +12,7 @@ import time
 from abc import ABC
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from contextlib import suppress
+from copy import deepcopy
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
@@ -97,6 +98,11 @@ from fast_agent.tools.filesystem_tool_definitions import (
 from fast_agent.tools.local_filesystem_runtime import LocalFilesystemRuntime
 from fast_agent.tools.shell_runtime import ShellRuntime
 from fast_agent.tools.skill_reader import READ_SKILL_TOOL_NAME, SkillReader
+from fast_agent.transactional.execution import (
+    ToolExecutionRequest,
+    execute_with_interceptor,
+)
+from fast_agent.transactional.models import ToolCallId
 from fast_agent.types import (
     PromptMessageExtended,
     RequestParams,
@@ -176,6 +182,8 @@ if TYPE_CHECKING:
     from fast_agent.context import Context
     from fast_agent.llm.usage_tracking import UsageAccumulator
     from fast_agent.tools.execution_environment import ShellEnvironment
+    from fast_agent.transactional.execution import ToolExecutionInterceptor
+    from fast_agent.transactional.models import JsonValue, RunId
 
 
 class McpAgent(ABC, ToolAgent):
@@ -192,9 +200,15 @@ class McpAgent(ABC, ToolAgent):
         connection_persistence: bool = True,
         context: "Context | None" = None,
         shell_environment: "ShellEnvironment | None" = None,
+        transactional_run_id: "RunId | None" = None,
+        tool_execution_interceptor: "ToolExecutionInterceptor | None" = None,
         **kwargs,
     ) -> None:
         self._shell_environment = shell_environment
+        if tool_execution_interceptor is not None and transactional_run_id is None:
+            raise ValueError("transactional_run_id is required when an interceptor is configured")
+        self._transactional_run_id = transactional_run_id
+        self._tool_execution_interceptor = tool_execution_interceptor
         super().__init__(
             config=config,
             context=context,
@@ -252,6 +266,14 @@ class McpAgent(ABC, ToolAgent):
         # Register the MCP UI handler as the elicitation callback so fast_agent.tools can call it
         # without importing MCP types. This avoids circular imports and ensures the callback is ready.
         self._register_mcp_elicitation_adapter()
+
+    def _clone_constructor_kwargs(self) -> dict[str, Any]:
+        """Preserve the execution boundary when cloning an active transactional agent."""
+        kwargs = super()._clone_constructor_kwargs()
+        if self._tool_execution_interceptor is not None:
+            kwargs["transactional_run_id"] = self._transactional_run_id
+            kwargs["tool_execution_interceptor"] = self._tool_execution_interceptor
+        return kwargs
 
     def _managed_mcp_setup(
         self,
@@ -1613,7 +1635,11 @@ class McpAgent(ABC, ToolAgent):
         namespaced_tools = self._aggregator._namespaced_tool_map
 
         tool_call_items = list(request.tool_calls.items())
-        should_parallel = should_parallelize_tool_calls(len(tool_call_items))
+        # Transactional calls must not overlap: ordering is established around
+        # each individual side effect by the interceptor.
+        should_parallel = self._tool_execution_interceptor is None and should_parallelize_tool_calls(
+            len(tool_call_items)
+        )
         self._maybe_close_display_for_parallel_subagent_tools(tool_call_items, should_parallel)
         smart_parallel_calls = self._smart_parallel_call_count(tool_call_items)
 
@@ -1821,14 +1847,62 @@ class McpAgent(ABC, ToolAgent):
         request_params: RequestParams | None,
     ) -> tuple[str, CallToolResult, float]:
         start_time = time.perf_counter()
-        result = await self.call_tool(
-            call.execution_tool_name,
-            call.tool_args,
-            call.correlation_id,
-            request_params=request_params,
-        )
+
+        async def execute() -> CallToolResult:
+            return await self.call_tool(
+                call.execution_tool_name,
+                call.tool_args,
+                call.correlation_id,
+                request_params=request_params,
+            )
+
+        if self._should_intercept_local_tool(call):
+            request = self._transactional_execution_request(call)
+            outcome = await execute_with_interceptor(
+                request,
+                execute,
+                self._tool_execution_interceptor,
+            )
+            result = outcome.result
+        else:
+            result = await execute()
         end_time = time.perf_counter()
         return call.correlation_id, result, round((end_time - start_time) * 1000, 2)
+
+    def _should_intercept_local_tool(self, call: _PlannedMcpToolCall) -> bool:
+        if self._tool_execution_interceptor is None:
+            return False
+        if call.execution_tool_name != call.tool_name:
+            return False
+        if call.tool_name in {
+            READ_TEXT_FILE_TOOL_NAME,
+            WRITE_TEXT_FILE_TOOL_NAME,
+            APPLY_PATCH_TOOL_NAME,
+        }:
+            return self._is_filesystem_runtime_tool(call.tool_name)
+        return bool(
+            self._shell_runtime
+            and self._shell_runtime.tool
+            and call.tool_name == self._shell_runtime.tool.name
+        )
+
+    def _transactional_execution_request(
+        self,
+        call: _PlannedMcpToolCall,
+    ) -> ToolExecutionRequest:
+        run_id = self._transactional_run_id
+        if run_id is None:
+            raise RuntimeError("Transactional execution requires a run ID")
+
+        # MCP arguments are JSON by protocol; copy them at this boundary so
+        # interceptor code cannot mutate the planned call owned by the agent.
+        arguments = cast("dict[str, JsonValue]", deepcopy(call.tool_args))
+        return ToolExecutionRequest(
+            run_id=run_id,
+            tool_call_id=ToolCallId(call.correlation_id),
+            tool_name=call.tool_name,
+            arguments=arguments,
+        )
 
     async def _record_planned_tool_result(
         self,

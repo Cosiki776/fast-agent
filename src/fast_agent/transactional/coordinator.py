@@ -172,6 +172,16 @@ class TransactionCoordinator:
             )
         return outcome
 
+    async def __call__(
+        self,
+        request: ToolExecutionRequest,
+        call_next: ToolCallNext,
+        /,
+    ) -> ToolExecutionOutcome:
+        """Adapt the coordinator to the per-tool execution interceptor contract."""
+
+        return await self.coordinate(request, call_next)
+
 
 def classify_tool_effect(tool_name: str) -> ToolEffect:
     """Classify the explicit first-phase local coding tool names."""

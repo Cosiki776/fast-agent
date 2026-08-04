@@ -6,6 +6,11 @@ from typing import TYPE_CHECKING
 import pytest
 from mcp.types import CallToolResult, TextContent
 
+from fast_agent.transactional.context.reducers import (
+    CodingToolResultReducer,
+    ReducerLimits,
+    ToolResultReducer,
+)
 from fast_agent.transactional.coordinator import (
     TransactionCoordinator,
     classify_tool_effect,
@@ -63,6 +68,7 @@ def _coordinator(
     tmp_path: Path,
     *,
     denial_reason: ToolDenialResolver | None = None,
+    result_reducer: ToolResultReducer | None = None,
 ) -> tuple[TransactionCoordinator, SQLiteEventStore, FileArtifactStore]:
     event_store = SQLiteEventStore(tmp_path / "events.sqlite3")
     artifact_store = FileArtifactStore(tmp_path / "artifacts")
@@ -70,6 +76,7 @@ def _coordinator(
         event_store,
         artifact_store,
         denial_reason=denial_reason,
+        result_reducer=result_reducer,
         transaction_id_factory=lambda: TRANSACTION_ID,
     )
     return coordinator, event_store, artifact_store
@@ -215,3 +222,64 @@ def test_raw_result_serialization_preserves_standard_mcp_fields() -> None:
         "structuredContent": {"text": "完成"},
         "isError": False,
     }
+
+
+@pytest.mark.asyncio
+async def test_reducer_returns_bounded_result_after_raw_artifact_is_stored(tmp_path: Path) -> None:
+    reducer = CodingToolResultReducer(ReducerLimits(max_result_bytes=512, max_items=4))
+    coordinator, event_store, artifact_store = _coordinator(tmp_path, result_reducer=reducer)
+    raw_text = "\n".join(f"log line {index}" for index in range(2_000))
+    expected_result = _result(raw_text)
+
+    async def call_next() -> ToolExecutionOutcome:
+        return ToolExecutionOutcome(result=expected_result)
+
+    outcome = await coordinator.coordinate(
+        ToolExecutionRequest(
+            run_id=RUN_ID,
+            tool_call_id=TOOL_CALL_ID,
+            tool_name="execute",
+            arguments={"command": "python noisy_job.py"},
+        ),
+        call_next,
+    )
+    events = _events(event_store)
+    stored = events[2]
+    assert isinstance(stored, ToolResultStored)
+
+    assert artifact_store.read(ArtifactId(stored.artifact_id)) == serialize_tool_result(
+        expected_result
+    )
+    content = outcome.result.content[0]
+    assert isinstance(content, TextContent)
+    assert len(content.text.encode("utf-8")) <= 512
+    assert raw_text not in content.text
+    assert f"full_output_artifact: {stored.artifact_id}" in content.text
+    event_store.close()
+
+
+@pytest.mark.asyncio
+async def test_reducer_failure_returns_bounded_fallback_with_artifact_reference(
+    tmp_path: Path,
+) -> None:
+    def failing_reducer(
+        request: ToolExecutionRequest,
+        result: CallToolResult,
+        artifact_id: ArtifactId,
+        /,
+    ) -> CallToolResult:
+        raise RuntimeError("reducer bug")
+
+    coordinator, event_store, _ = _coordinator(tmp_path, result_reducer=failing_reducer)
+
+    async def call_next() -> ToolExecutionOutcome:
+        return ToolExecutionOutcome(result=_result("x" * 20_000))
+
+    outcome = await coordinator.coordinate(_request("execute"), call_next)
+    stored = _events(event_store)[2]
+    assert isinstance(stored, ToolResultStored)
+    content = outcome.result.content[0]
+    assert isinstance(content, TextContent)
+    assert len(content.text.encode("utf-8")) <= 8 * 1024
+    assert f"full_output_artifact: {stored.artifact_id}" in content.text
+    event_store.close()

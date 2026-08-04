@@ -10,6 +10,10 @@ from fast_agent.tools.filesystem_tool_definitions import (
     READ_TEXT_FILE_TOOL_NAME,
     WRITE_TEXT_FILE_TOOL_NAME,
 )
+from fast_agent.transactional.context.reducers import (
+    ToolResultReducer,
+    bounded_fallback_result,
+)
 from fast_agent.transactional.events import (
     ToolCommitted,
     ToolDenied,
@@ -58,11 +62,13 @@ class TransactionCoordinator:
         artifact_store: FileArtifactStore,
         *,
         denial_reason: ToolDenialResolver | None = None,
+        result_reducer: ToolResultReducer | None = None,
         transaction_id_factory: TransactionIdFactory = new_transaction_id,
     ) -> None:
         self._event_store = event_store
         self._artifact_store = artifact_store
         self._denial_reason = denial_reason
+        self._result_reducer = result_reducer
         self._transaction_id_factory = transaction_id_factory
 
     async def coordinate(
@@ -153,6 +159,15 @@ class TransactionCoordinator:
             )
         )
 
+        reduced_result = result
+        if self._result_reducer is not None:
+            try:
+                reduced_result = self._result_reducer(request, result, artifact.artifact_id)
+            except Exception:
+                # The raw artifact is already durable, so reduction failure can safely
+                # degrade to a bounded deterministic view without losing evidence.
+                reduced_result = bounded_fallback_result(result, artifact.artifact_id)
+
         if is_error:
             self._event_store.append(
                 ToolFailed(
@@ -170,7 +185,7 @@ class TransactionCoordinator:
                     tool_call_id=request.tool_call_id,
                 )
             )
-        return outcome
+        return ToolExecutionOutcome(result=reduced_result)
 
     async def __call__(
         self,

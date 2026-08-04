@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING
 import pytest
 from mcp.types import CallToolResult, TextContent
 
+from fast_agent.transactional.budget import RunBudgetLimits, RunBudgetTracker
 from fast_agent.transactional.context.reducers import (
     CodingToolResultReducer,
     ReducerLimits,
@@ -69,6 +70,7 @@ def _coordinator(
     *,
     denial_reason: ToolDenialResolver | None = None,
     result_reducer: ToolResultReducer | None = None,
+    run_budget: RunBudgetTracker | None = None,
 ) -> tuple[TransactionCoordinator, SQLiteEventStore, FileArtifactStore]:
     event_store = SQLiteEventStore(tmp_path / "events.sqlite3")
     artifact_store = FileArtifactStore(tmp_path / "artifacts")
@@ -77,6 +79,7 @@ def _coordinator(
         artifact_store,
         denial_reason=denial_reason,
         result_reducer=result_reducer,
+        run_budget=run_budget,
         transaction_id_factory=lambda: TRANSACTION_ID,
     )
     return coordinator, event_store, artifact_store
@@ -282,4 +285,49 @@ async def test_reducer_failure_returns_bounded_fallback_with_artifact_reference(
     assert isinstance(content, TextContent)
     assert len(content.text.encode("utf-8")) <= 8 * 1024
     assert f"full_output_artifact: {stored.artifact_id}" in content.text
+    event_store.close()
+
+
+@pytest.mark.asyncio
+async def test_exhausted_tool_budget_returns_explicit_result_without_execution(
+    tmp_path: Path,
+) -> None:
+    budget = RunBudgetTracker(RunBudgetLimits(max_tool_calls=0))
+    coordinator, event_store, _ = _coordinator(tmp_path, run_budget=budget)
+    executed = False
+
+    async def call_next() -> ToolExecutionOutcome:
+        nonlocal executed
+        executed = True
+        return ToolExecutionOutcome(result=_result("unexpected"))
+
+    outcome = await coordinator.coordinate(_request(), call_next)
+
+    assert executed is False
+    assert outcome.result.isError is True
+    assert outcome.result.structuredContent == {
+        "status": "budget_exhausted",
+        "dimensions": ["tool_calls"],
+    }
+    assert [event.kind for event in _events(event_store)] == [
+        ToolEventKind.PROPOSED,
+        ToolEventKind.DENIED,
+        ToolEventKind.FAILED,
+    ]
+    event_store.close()
+
+
+@pytest.mark.asyncio
+async def test_coordinator_records_serialized_artifact_bytes_in_run_budget(tmp_path: Path) -> None:
+    budget = RunBudgetTracker(RunBudgetLimits(max_artifact_output_bytes=10_000))
+    coordinator, event_store, _ = _coordinator(tmp_path, run_budget=budget)
+    expected_result = _result("stored output")
+
+    async def call_next() -> ToolExecutionOutcome:
+        return ToolExecutionOutcome(result=expected_result)
+
+    await coordinator.coordinate(_request(), call_next)
+
+    assert budget.snapshot.tool_calls == 1
+    assert budget.snapshot.artifact_output_bytes == len(serialize_tool_result(expected_result))
     event_store.close()

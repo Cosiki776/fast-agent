@@ -36,6 +36,7 @@ from fast_agent.transactional.models import (
 from fast_agent.transactional.storage.artifact_store import ArtifactKind
 
 if TYPE_CHECKING:
+    from fast_agent.transactional.budget import BudgetDimension, RunBudgetTracker
     from fast_agent.transactional.storage.artifact_store import FileArtifactStore
     from fast_agent.transactional.storage.event_store import SQLiteEventStore
 
@@ -63,12 +64,14 @@ class TransactionCoordinator:
         *,
         denial_reason: ToolDenialResolver | None = None,
         result_reducer: ToolResultReducer | None = None,
+        run_budget: RunBudgetTracker | None = None,
         transaction_id_factory: TransactionIdFactory = new_transaction_id,
     ) -> None:
         self._event_store = event_store
         self._artifact_store = artifact_store
         self._denial_reason = denial_reason
         self._result_reducer = result_reducer
+        self._run_budget = run_budget
         self._transaction_id_factory = transaction_id_factory
 
     async def coordinate(
@@ -88,6 +91,31 @@ class TransactionCoordinator:
                 effect=classify_tool_effect(request.tool_name),
             )
         )
+
+        if self._run_budget is not None:
+            budget_decision = self._run_budget.start_tool_call()
+            if not budget_decision.allowed:
+                exhausted = ", ".join(item.value for item in budget_decision.exhausted)
+                reason = f"budget exhausted: {exhausted}"
+                self._event_store.append(
+                    ToolDenied(
+                        run_id=request.run_id,
+                        transaction_id=transaction_id,
+                        tool_call_id=request.tool_call_id,
+                        reason=reason,
+                    )
+                )
+                self._event_store.append(
+                    ToolFailed(
+                        run_id=request.run_id,
+                        transaction_id=transaction_id,
+                        tool_call_id=request.tool_call_id,
+                        reason="budget exhausted",
+                    )
+                )
+                return ToolExecutionOutcome(
+                    result=_budget_exhausted_result(budget_decision.exhausted)
+                )
 
         denial_reason = self._denial_reason(request) if self._denial_reason is not None else None
         if denial_reason is not None:
@@ -143,11 +171,14 @@ class TransactionCoordinator:
             )
 
         result = outcome.result
+        serialized_result = serialize_tool_result(result)
         artifact = self._artifact_store.put(
-            serialize_tool_result(result),
+            serialized_result,
             media_type="application/json",
             kind=ArtifactKind.RAW_RESULT,
         )
+        if self._run_budget is not None:
+            self._run_budget.record_artifact_output(len(serialized_result))
         is_error = bool(result.isError)
         self._event_store.append(
             ToolResultStored(
@@ -235,5 +266,21 @@ def _execution_failed_result(*, error_type: str, message: str) -> CallToolResult
             "error_type": error_type,
             "message": message,
         },
+        isError=True,
+    )
+
+
+def _budget_exhausted_result(
+    dimensions: tuple[BudgetDimension, ...],
+) -> CallToolResult:
+    exhausted = [dimension.value for dimension in dimensions]
+    return CallToolResult(
+        content=[
+            TextContent(
+                type="text",
+                text=f"Tool execution stopped: budget exhausted ({', '.join(exhausted)})",
+            )
+        ],
+        structuredContent={"status": "budget_exhausted", "dimensions": exhausted},
         isError=True,
     )

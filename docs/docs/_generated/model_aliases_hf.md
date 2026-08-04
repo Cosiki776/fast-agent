@@ -1,5 +1,7 @@
 | Model Alias | Maps to |
 | --- | --- |
+| `deepseek-ai/deepseek-v3.1` | `deepseek-ai/deepseek-v3.1` |
+| `deepseek-ai/deepseek-v3.2` | `deepseek-ai/deepseek-v3.2` |
 | `deepseek-ai/deepseek-v4-pro` | `deepseek-ai/deepseek-v4-pro` |
 | `deepseek-hf` | `hf.deepseek-ai/DeepSeek-V4-Pro:together` |
 | `deepseek32` | `hf.deepseek-ai/DeepSeek-V3.2:fireworks-ai` |
@@ -37,6 +39,7 @@
 | `moonshotai/kimi-k2.5` | `moonshotai/kimi-k2.5` |
 | `moonshotai/kimi-k2.6` | `moonshotai/kimi-k2.6` |
 | `moonshotai/kimi-k2.7-code` | `moonshotai/kimi-k2.7-code` |
+| `moonshotai/kimi-k3` | `moonshotai/kimi-k3` |
 | `qwen/qwen3.5-397b-a17b` | `qwen/qwen3.5-397b-a17b` |
 | `qwen/qwen3.6-35b-a3b` | `qwen/qwen3.6-35b-a3b` |
 | `qwen35` | `hf.Qwen/Qwen3.5-397B-A17B:novita?temperature=0.6&top_p=0.95&top_k=20&min_p=0.0&presence_penalty=0.0&repetition_penalty=1.0&reasoning=on` |

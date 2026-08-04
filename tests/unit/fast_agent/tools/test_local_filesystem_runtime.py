@@ -1,3 +1,4 @@
+import base64
 import logging
 from pathlib import Path
 
@@ -17,6 +18,10 @@ from fast_agent.tools import attach_media
 from fast_agent.tools.apply_patch_tool import APPLY_PATCH_TOOL_NAME
 from fast_agent.tools.attach_media import _classify_source
 from fast_agent.tools.local_filesystem_runtime import LocalFilesystemRuntime
+
+_PNG_BYTES = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+)
 
 
 def _tool_by_name(runtime: LocalFilesystemRuntime, name: str):
@@ -134,7 +139,7 @@ def test_attach_media_classifies_remote_sources_as_links(tmp_path: Path) -> None
 
 def test_attach_media_classifies_local_sources_as_local(tmp_path: Path) -> None:
     image_path = tmp_path / "pixel.png"
-    image_path.write_bytes(b"\x89PNG\r\n\x1a\nfake")
+    image_path.write_bytes(_PNG_BYTES)
 
     source = _classify_source(
         "pixel.png",
@@ -149,7 +154,7 @@ def test_attach_media_classifies_local_sources_as_local(tmp_path: Path) -> None:
 
 def test_attach_media_file_uri_localhost_resolves_local_path(tmp_path: Path) -> None:
     image_path = tmp_path / "pixel.png"
-    image_path.write_bytes(b"\x89PNG\r\n\x1a\nfake")
+    image_path.write_bytes(_PNG_BYTES)
 
     source = _classify_source(
         image_path.as_uri().replace("file://", "file://localhost", 1),
@@ -189,7 +194,7 @@ def test_attach_media_file_uri_preserves_nonlocal_authority(
 @pytest.mark.asyncio
 async def test_attach_media_local_png_stages_image_content(tmp_path: Path) -> None:
     image_path = tmp_path / "pixel.png"
-    image_path.write_bytes(b"\x89PNG\r\n\x1a\nfake")
+    image_path.write_bytes(_PNG_BYTES)
     runtime = LocalFilesystemRuntime(
         logging.getLogger("local-filesystem-runtime-test"),
         enable_attach_media="on",
@@ -282,7 +287,7 @@ async def test_attach_media_trims_optional_mime_type() -> None:
 @pytest.mark.asyncio
 async def test_attach_media_ignores_blank_optional_name(tmp_path: Path) -> None:
     image_path = tmp_path / "pixel.png"
-    image_path.write_bytes(b"\x89PNG\r\n\x1a\nfake")
+    image_path.write_bytes(_PNG_BYTES)
     runtime = LocalFilesystemRuntime(
         logging.getLogger("local-filesystem-runtime-test"),
         enable_attach_media="on",
@@ -348,7 +353,7 @@ async def test_attach_media_rejects_google_remote_pdf_link() -> None:
 @pytest.mark.asyncio
 async def test_attach_media_rejects_unsupported_mime_for_model(tmp_path: Path) -> None:
     image_path = tmp_path / "pixel.png"
-    image_path.write_bytes(b"\x89PNG\r\n\x1a\nfake")
+    image_path.write_bytes(_PNG_BYTES)
     runtime = LocalFilesystemRuntime(
         logging.getLogger("local-filesystem-runtime-test"),
         enable_attach_media="on",
@@ -363,6 +368,47 @@ async def test_attach_media_rejects_unsupported_mime_for_model(tmp_path: Path) -
     assert (
         "does not support embedded attachments with MIME type 'image/png'" in result.content[0].text
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("target_mime", "magic"),
+    [
+        ("image/png", b"\x89PNG\r\n\x1a\n"),
+        ("image/jpeg", b"\xff\xd8\xff"),
+    ],
+)
+async def test_attach_media_converts_unsupported_local_image(
+    tmp_path: Path,
+    target_mime: str,
+    magic: bytes,
+) -> None:
+    image_path = tmp_path / "screen.ppm"
+    image_path.write_bytes(b"P6\n1 1\n255\n\x00\x00\x00")
+    runtime = LocalFilesystemRuntime(
+        logging.getLogger("local-filesystem-runtime-test"),
+        enable_attach_media="on",
+        model_info=_model_info(target_mime),
+    )
+
+    result = await runtime.attach_media(
+        {
+            "source": str(image_path),
+        }
+    )
+
+    assert result.isError is False
+    assert result.content is not None
+    assert isinstance(result.content[0], TextContent)
+    assert (
+        f"Converted screen.ppm from image/x-portable-anymap to {target_mime}"
+        in result.content[0].text
+    )
+    pending = runtime.consume_pending_media_attachments()
+    assert len(pending) == 1
+    assert isinstance(pending[0], ImageContent)
+    assert pending[0].mimeType == target_mime
+    assert base64.b64decode(pending[0].data).startswith(magic)
 
 
 @pytest.mark.asyncio
@@ -381,12 +427,14 @@ async def test_attach_media_rejects_oversized_local_file(tmp_path: Path) -> None
     assert result.isError is True
     assert result.content is not None
     assert isinstance(result.content[0], TextContent)
-    assert "maximum inline attachment size" in result.content[0].text
+    assert result.content[0].text == (
+        "Error: attachment is 9 B; maximum inline attachment size is 4 B"
+    )
 
 
 def test_attach_media_rejects_boolean_size_limits(tmp_path: Path) -> None:
     image_path = tmp_path / "pixel.png"
-    image_path.write_bytes(b"\x89PNG\r\n\x1a\nfake")
+    image_path.write_bytes(_PNG_BYTES)
 
     with pytest.raises(ValueError, match="integer greater than or equal to 1"):
         LocalFilesystemRuntime(
@@ -767,6 +815,9 @@ def test_attach_media_tool_description_conditional() -> None:
     google_tool = _tool_by_name(google_runtime, "attach_media")
     assert google_tool is not None
     assert "Gemini YouTube links" in google_tool.description
+    assert "Supported MIME types for the current model: image/png." in google_tool.description
+    assert "20971520 bytes" in google_tool.description
+    assert "Use this for images, PDFs, audio, and video" not in google_tool.description
 
     # OpenAI (Non-Google)
     openai_runtime = LocalFilesystemRuntime(

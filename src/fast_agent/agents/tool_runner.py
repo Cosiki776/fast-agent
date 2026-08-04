@@ -85,6 +85,7 @@ _HOOK_STATUS_BUCKET_AFTER_TURN_COMPLETE = "after_turn_complete"
 HistoryRollbackStatus = Literal[
     "history_disabled",
     "history_empty",
+    "appended_completed_tool_result",
     "appended_interrupted_tool_result",
     "history_unchanged",
 ]
@@ -191,6 +192,7 @@ class ToolRunner:
         if staged is not None:
             return staged
 
+        self._maybe_fold_managed_process_poll_history()
         await self._maybe_auto_compact_before_followup_llm()
         await self._ensure_tools_ready()
         await self._run_before_llm_hook()
@@ -359,6 +361,51 @@ class ToolRunner:
             # Mid-turn compaction is opportunistic; never break a tool loop.
             _logger.exception("Auto-compaction failed during tool loop; history unchanged")
 
+    def _maybe_fold_managed_process_poll_history(self) -> None:
+        from fast_agent.agents.llm_agent import LlmAgent
+
+        if not isinstance(self._agent, LlmAgent) or len(self._delta_messages) != 1:
+            return
+        try:
+            context = self._agent.context
+            config = context.config if context is not None else None
+            if config is None:
+                return
+            policy = config.shell_execution.managed_process_poll_history_folding
+            if policy == "off":
+                return
+            if policy == "auto":
+                llm = self._agent.llm
+                if llm is None:
+                    return
+                request_params = llm.get_request_params(self._request_params)
+                if not llm.resolve_managed_process_poll_folding(request_params):
+                    return
+
+            from fast_agent.history.process_poll_folding import (
+                fold_managed_process_poll_history,
+            )
+
+            folded = fold_managed_process_poll_history(
+                list(self._agent.message_history),
+                self._delta_messages[0],
+            )
+            if folded is None:
+                return
+
+            self._agent.load_message_history(folded.history)
+            self._delta_messages = [folded.tool_message]
+            self._pending_tool_response = folded.tool_message
+            _logger.info(
+                "Folded completed managed-process polling history",
+                data=folded.metadata,
+            )
+        except Exception:
+            # Mid-turn history folding is opportunistic; never break a tool loop.
+            _logger.exception(
+                "Managed-process polling fold failed during tool loop; history unchanged"
+            )
+
     def _record_cancelled_turn(
         self,
         *,
@@ -491,9 +538,20 @@ class ToolRunner:
         )
 
     def _reset_history_after_cancelled_turn(self) -> HistoryRollbackState:
+        history = list(self._agent.message_history)
+        resumable_history = self._history_for_resumable_persistence()
+        if resumable_history is not None and len(resumable_history) > len(history):
+            self._agent.load_message_history(resumable_history)
+            return HistoryRollbackState(
+                status="appended_completed_tool_result",
+                history_before=len(history),
+                history_after=len(resumable_history),
+                removed_messages=0,
+            )
+
         return ToolRunner.reconcile_interrupted_history(
             self._agent,
-            use_history=self._agent.config.use_history,
+            use_history=self._use_history_enabled(),
         )
 
     @staticmethod
@@ -817,6 +875,16 @@ class ToolRunner:
             else DEFAULT_MAX_ITERATIONS
         )
         if self._iteration > max_iterations:
+            _logger.warning(
+                "Tool loop stopped: maximum iterations reached",
+                data={
+                    "agent_name": self._agent.name,
+                    "iterations": self._iteration,
+                    "max_iterations": max_iterations,
+                },
+            )
+            if self._last_message is not None:
+                self._last_message.stop_reason = LlmStopReason.MAX_ITERATIONS
             self._done = True
             return
 

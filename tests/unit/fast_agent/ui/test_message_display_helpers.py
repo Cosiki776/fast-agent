@@ -14,6 +14,8 @@ from fast_agent.ui.message_display_helpers import (
     extract_user_local_image_previews,
     resolve_highlight_indexes,
     tool_use_requests_file_read_access,
+    tool_use_requests_process_lifecycle,
+    tool_use_requests_process_poll,
     tool_use_requests_shell_access,
 )
 
@@ -49,6 +51,18 @@ def _tool_use_message_with_names(*tool_names: str) -> PromptMessageExtended:
         tool_calls={
             str(index): CallToolRequest(params=CallToolRequestParams(name=tool_name, arguments={}))
             for index, tool_name in enumerate(tool_names, start=1)
+        },
+    )
+
+
+def _process_tool_use_message(action: str | None = None) -> PromptMessageExtended:
+    arguments = {} if action is None else {"action": action}
+    return PromptMessageExtended(
+        role="assistant",
+        content=[],
+        stop_reason=LlmStopReason.TOOL_USE,
+        tool_calls={
+            "1": CallToolRequest(params=CallToolRequestParams(name="Process", arguments=arguments))
         },
     )
 
@@ -110,6 +124,48 @@ def test_build_tool_use_additional_message_uses_file_read_copy() -> None:
     additional = build_tool_use_additional_message(message, file_read=True)
 
     assert additional is None
+
+
+def test_process_lifecycle_tool_use_omits_generic_additional_message() -> None:
+    message = _tool_use_message_with_names("poll_process")
+
+    assert tool_use_requests_process_lifecycle(message)
+    assert tool_use_requests_process_poll(message)
+    assert build_tool_use_additional_message(message) is None
+
+
+def test_process_poll_rejects_terminate_process() -> None:
+    message = _tool_use_message_with_names("terminate_process")
+
+    assert tool_use_requests_process_lifecycle(message)
+    assert not tool_use_requests_process_poll(message)
+
+
+@pytest.mark.parametrize("action", [None, "status", "wait"])
+def test_process_facade_status_and_wait_are_process_polls(
+    action: str | None,
+) -> None:
+    message = _process_tool_use_message(action)
+
+    assert tool_use_requests_process_lifecycle(message)
+    assert tool_use_requests_process_poll(message)
+    assert build_tool_use_additional_message(message) is None
+
+
+def test_process_facade_stop_is_lifecycle_but_not_poll() -> None:
+    message = _process_tool_use_message("stop")
+
+    assert tool_use_requests_process_lifecycle(message)
+    assert not tool_use_requests_process_poll(message)
+
+
+def test_mixed_process_and_other_tool_use_keeps_generic_additional_message() -> None:
+    message = _tool_use_message_with_names("poll_process", "read_text_file")
+
+    assert not tool_use_requests_process_lifecycle(message)
+    additional = build_tool_use_additional_message(message)
+    assert additional is not None
+    assert additional.plain == "The assistant requested tool calls"
 
 
 def test_build_tool_use_additional_message_pluralizes_file_reads() -> None:

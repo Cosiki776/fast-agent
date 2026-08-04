@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -13,6 +14,7 @@ from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator
 
 import fast_agent.config as config_module
 from fast_agent.config import load_yaml_mapping
+from fast_agent.constants import MAX_TERMINAL_OUTPUT_BYTE_LIMIT
 from fast_agent.core.exceptions import ModelConfigError
 from fast_agent.core.logging.logger import get_logger
 from fast_agent.home import resolve_fast_agent_home
@@ -108,6 +110,7 @@ class ModelOverlayDefaults(BaseModel):
     repetition_penalty: float | None = None
     transport: Literal["sse", "websocket", "auto"] | None = None
     service_tier: Literal["fast", "flex"] | None = None
+    streaming_timeout: float | None = None
     web_search: bool | None = None
     web_fetch: bool | None = None
     max_tokens: int | None = Field(
@@ -129,6 +132,26 @@ class ModelOverlayDefaults(BaseModel):
     def _reject_bool_numeric_values(cls, value: object) -> object:
         return _reject_bool_numeric_overlay_value(value)
 
+    @field_validator("streaming_timeout", mode="before")
+    @classmethod
+    def _validate_streaming_timeout(cls, value: object) -> object:
+        value = _reject_bool_numeric_overlay_value(value)
+        if isinstance(value, str) and strip_casefold(value) == "none":
+            return None
+        if value is None:
+            return None
+        if not isinstance(value, int | float | str):
+            raise ValueError("streaming_timeout must be a positive number of seconds or 'none'.")
+        try:
+            timeout = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "streaming_timeout must be a positive number of seconds or 'none'."
+            ) from exc
+        if not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError("streaming_timeout must be a positive number of seconds or 'none'.")
+        return timeout
+
     def to_query_pairs(self) -> list[tuple[str, str]]:
         pairs: list[tuple[str, str]] = []
         reasoning = _normalize_reasoning_value(self.reasoning)
@@ -146,6 +169,13 @@ class ModelOverlayDefaults(BaseModel):
             ("service_tier", self.service_tier),
         )
         pairs.extend((name, str(value)) for name, value in scalar_values if value is not None)
+        if "streaming_timeout" in self.model_fields_set:
+            pairs.append(
+                (
+                    "streaming_timeout",
+                    "none" if self.streaming_timeout is None else str(self.streaming_timeout),
+                )
+            )
 
         toggle_values = (
             ("web_search", _normalize_toggle_value(self.web_search)),
@@ -165,6 +195,13 @@ class ModelOverlayMetadata(BaseModel):
     tokenizes: list[str] | None = None
     json_mode: Literal["schema", "object"] | None = None
     structured_tool_policy: Literal["always", "defer", "no_tools"] | None = None
+    managed_process_poll_folding: bool | None = None
+    process_poll_default_wait_seconds: int | None = Field(default=None, ge=0, le=600)
+    shell_output_byte_limit: int | None = Field(
+        default=None,
+        ge=1,
+        le=MAX_TERMINAL_OUTPUT_BYTE_LIMIT,
+    )
     model_specific: str | None = None
     # Legacy fallback retained for older overlay files. New overlays should use
     # defaults.temperature instead.
@@ -174,6 +211,8 @@ class ModelOverlayMetadata(BaseModel):
     @field_validator(
         "context_window",
         "max_output_tokens",
+        "process_poll_default_wait_seconds",
+        "shell_output_byte_limit",
         "default_temperature",
         mode="before",
     )
@@ -349,6 +388,11 @@ class LoadedModelOverlay:
             tokenizes=self.manifest.metadata.tokenizes or list(ModelDatabase.TEXT_ONLY),
             json_mode=self._new_model_json_mode(),
             structured_tool_policy=self.manifest.metadata.structured_tool_policy,
+            managed_process_poll_folding=(self.manifest.metadata.managed_process_poll_folding),
+            process_poll_default_wait_seconds=(
+                self.manifest.metadata.process_poll_default_wait_seconds or 0
+            ),
+            shell_output_byte_limit=self.manifest.metadata.shell_output_byte_limit,
             model_specific=self.manifest.metadata.model_specific,
             default_provider=self.provider,
             default_temperature=self._default_temperature(),
@@ -394,6 +438,14 @@ class LoadedModelOverlay:
             update_payload["json_mode"] = metadata.json_mode
         if metadata.structured_tool_policy is not None:
             update_payload["structured_tool_policy"] = metadata.structured_tool_policy
+        if metadata.managed_process_poll_folding is not None:
+            update_payload["managed_process_poll_folding"] = metadata.managed_process_poll_folding
+        if metadata.process_poll_default_wait_seconds is not None:
+            update_payload["process_poll_default_wait_seconds"] = (
+                metadata.process_poll_default_wait_seconds
+            )
+        if metadata.shell_output_byte_limit is not None:
+            update_payload["shell_output_byte_limit"] = metadata.shell_output_byte_limit
         if metadata.model_specific is not None:
             update_payload["model_specific"] = metadata.model_specific
         if self._default_temperature() is not None:
@@ -649,6 +701,9 @@ def build_model_overlay_manifest_from_database(
         model_specific=existing.model_specific,
         json_mode=json_mode,
         structured_tool_policy=existing.structured_tool_policy,
+        managed_process_poll_folding=existing.managed_process_poll_folding,
+        process_poll_default_wait_seconds=existing.process_poll_default_wait_seconds,
+        shell_output_byte_limit=existing.shell_output_byte_limit,
         fast=existing.fast,
         default_temperature=existing.default_temperature,
     )
@@ -727,9 +782,7 @@ def _settings_home_override(
         raw_config_file if isinstance(raw_config_file, str) and raw_config_file.strip() else None
     )
     home = getattr(settings, "home", None)
-    if home is None and (
-        os.getenv("FAST_AGENT_HOME") or os.getenv("FAST_AGENT_RUNTIME_HOME")
-    ):
+    if home is None and (os.getenv("FAST_AGENT_HOME") or os.getenv("FAST_AGENT_RUNTIME_HOME")):
         return None
     if home is None and not (start_path is None and config_file is not None):
         return None

@@ -69,6 +69,7 @@ _SINGLE_VALUE_MODEL_QUERY_KEYS = (
     "context",
     "transport",
     "service_tier",
+    "streaming_timeout",
 )
 _STRUCTURED_TOOL_QUERY_KEYS = (
     "structured_tools",
@@ -77,6 +78,7 @@ _STRUCTURED_TOOL_QUERY_KEYS = (
 )
 _WEB_TOOL_QUERY_KEYS = ("web_search", "x_search", "web_fetch")
 _TASK_BUDGET_QUERY_KEYS = ("task_budget", "taskBudget")
+_MAX_TOKENS_QUERY_KEYS = ("max_tokens", "maxTokens")
 _SAMPLING_QUERY_KEYS = {
     "temperature": ("temperature", "temp"),
     "top_p": ("top_p", "topP"),
@@ -91,6 +93,7 @@ SUPPORTED_MODEL_QUERY_KEYS = frozenset(
         *_STRUCTURED_TOOL_QUERY_KEYS,
         *_WEB_TOOL_QUERY_KEYS,
         *_TASK_BUDGET_QUERY_KEYS,
+        *_MAX_TOKENS_QUERY_KEYS,
         *(key for key_group in _SAMPLING_QUERY_KEYS.values() for key in key_group),
     )
 )
@@ -102,7 +105,12 @@ _PROVIDER_CLASS_PATHS: dict[Provider, tuple[str, str]] = {
         "AnthropicVertexLLM",
     ),
     Provider.OPENAI: ("fast_agent.llm.provider.openai.llm_openai", "OpenAILLM"),
-    Provider.DEEPSEEK: ("fast_agent.llm.provider.openai.llm_deepseek", "DeepSeekLLM"),
+    Provider.DEEPSEEK: (
+        "fast_agent.llm.provider.openai.llm_deepseek",
+        "DeepSeekResponsesLLM",
+    ),
+    Provider.ZAI: ("fast_agent.llm.provider.openai.llm_zai", "ZaiLLM"),
+    Provider.MOONSHOT: ("fast_agent.llm.provider.openai.llm_moonshot", "MoonshotLLM"),
     Provider.GENERIC: ("fast_agent.llm.provider.openai.llm_generic", "GenericLLM"),
     Provider.GOOGLE_OAI: ("fast_agent.llm.provider.openai.llm_google_oai", "GoogleOaiLLM"),
     Provider.GOOGLE: ("fast_agent.llm.provider.google.llm_google_native", "GoogleNativeLLM"),
@@ -158,12 +166,15 @@ class ModelConfig(BaseModel):
     web_fetch: bool | None = None
     task_budget_tokens: int | None = None
     task_budget_configured: bool = False
+    max_tokens: int | None = None
     temperature: float | None = None
     top_p: float | None = None
     top_k: int | None = None
     min_p: float | None = None
     presence_penalty: float | None = None
     repetition_penalty: float | None = None
+    streaming_timeout: float | None = None
+    streaming_timeout_configured: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -183,12 +194,15 @@ class ModelQueryOverrides:
     web_fetch: bool | None = None
     task_budget_tokens: int | None = None
     task_budget_configured: bool = False
+    max_tokens: int | None = None
     temperature: float | None = None
     top_p: float | None = None
     top_k: int | None = None
     min_p: float | None = None
     presence_penalty: float | None = None
     repetition_penalty: float | None = None
+    streaming_timeout: float | None = None
+    streaming_timeout_configured: bool = False
 
     def with_defaults(self, defaults: Self) -> "ModelQueryOverrides":
         """Return a copy with unset values filled from defaults."""
@@ -218,12 +232,21 @@ class ModelQueryOverrides:
                 else defaults.task_budget_tokens
             ),
             task_budget_configured=self.task_budget_configured or defaults.task_budget_configured,
+            max_tokens=coalesce(self.max_tokens, defaults.max_tokens),
             temperature=coalesce(self.temperature, defaults.temperature),
             top_p=coalesce(self.top_p, defaults.top_p),
             top_k=coalesce(self.top_k, defaults.top_k),
             min_p=coalesce(self.min_p, defaults.min_p),
             presence_penalty=coalesce(self.presence_penalty, defaults.presence_penalty),
             repetition_penalty=coalesce(self.repetition_penalty, defaults.repetition_penalty),
+            streaming_timeout=(
+                self.streaming_timeout
+                if self.streaming_timeout_configured
+                else defaults.streaming_timeout
+            ),
+            streaming_timeout_configured=(
+                self.streaming_timeout_configured or defaults.streaming_timeout_configured
+            ),
         )
 
 
@@ -255,12 +278,15 @@ class ParsedModelSpec:
             web_fetch=self.query_overrides.web_fetch,
             task_budget_tokens=self.query_overrides.task_budget_tokens,
             task_budget_configured=self.query_overrides.task_budget_configured,
+            max_tokens=self.query_overrides.max_tokens,
             temperature=self.query_overrides.temperature,
             top_p=self.query_overrides.top_p,
             top_k=self.query_overrides.top_k,
             min_p=self.query_overrides.min_p,
             presence_penalty=self.query_overrides.presence_penalty,
             repetition_penalty=self.query_overrides.repetition_penalty,
+            streaming_timeout=self.query_overrides.streaming_timeout,
+            streaming_timeout_configured=self.query_overrides.streaming_timeout_configured,
         )
 
 
@@ -347,6 +373,24 @@ def _parse_int_query(
         raise ModelConfigError(
             f"Invalid {label} query value: '{raw_value}' in '{model_spec}'"
         ) from exc
+
+
+def _parse_positive_int_query(
+    query_params: ModelQueryPairs,
+    model_spec: str,
+    *,
+    keys: tuple[str, ...],
+    label: str,
+) -> int | None:
+    value = _parse_int_query(query_params, model_spec, keys=keys, label=label)
+    if value is None:
+        return None
+    if value <= 0:
+        raw_value = _collect_query_values(query_params, keys)[-1]
+        raise ModelConfigError(
+            f"Invalid {label} query value: '{raw_value}' in '{model_spec}'. Use a positive integer."
+        )
+    return value
 
 
 def _parse_bool_query(raw_value: str, query_key: str, model_spec: str) -> bool:
@@ -493,6 +537,31 @@ def _parse_service_tier_query(
     return None
 
 
+def _parse_streaming_timeout_query(
+    query_params: ModelQueryPairs,
+    model_spec: str,
+) -> tuple[float | None, bool]:
+    if not _has_query_key(query_params, "streaming_timeout"):
+        return None, False
+
+    raw_value = _collect_query_values(query_params, ("streaming_timeout",))[-1]
+    if strip_casefold(raw_value) == "none":
+        return None, True
+
+    timeout = _parse_float_query(
+        query_params,
+        model_spec,
+        keys=("streaming_timeout",),
+        label="streaming_timeout",
+    )
+    if timeout is None or not math.isfinite(timeout) or timeout <= 0:
+        raise ModelConfigError(
+            f"Invalid streaming_timeout query value: '{raw_value}' in '{model_spec}'. "
+            "Use a positive number of seconds or 'none'."
+        )
+    return timeout, True
+
+
 def _parse_task_budget_query(
     query_params: ModelQueryPairs, model_spec: str
 ) -> tuple[int | None, bool]:
@@ -513,6 +582,10 @@ def _parse_query_overrides(
 ) -> ModelQueryOverrides:
     _raise_for_unsupported_query_keys(query_params, model_spec)
     task_budget_tokens, task_budget_configured = _parse_task_budget_query(query_params, model_spec)
+    streaming_timeout, streaming_timeout_configured = _parse_streaming_timeout_query(
+        query_params,
+        model_spec,
+    )
     web_tool_overrides = _parse_web_tool_queries(query_params, model_spec)
 
     return ModelQueryOverrides(
@@ -529,6 +602,12 @@ def _parse_query_overrides(
         web_fetch=web_tool_overrides["web_fetch"],
         task_budget_tokens=task_budget_tokens,
         task_budget_configured=task_budget_configured,
+        max_tokens=_parse_positive_int_query(
+            query_params,
+            model_spec,
+            keys=_MAX_TOKENS_QUERY_KEYS,
+            label="max_tokens",
+        ),
         temperature=_parse_float_query(
             query_params,
             model_spec,
@@ -565,6 +644,8 @@ def _parse_query_overrides(
             keys=_SAMPLING_QUERY_KEYS["repetition_penalty"],
             label="repetition_penalty",
         ),
+        streaming_timeout=streaming_timeout,
+        streaming_timeout_configured=streaming_timeout_configured,
     )
 
 
@@ -778,21 +859,15 @@ class ModelFactory:
         "claude": "claude-sonnet-5",
         "haiku": "claude-haiku-4-5",
         "haiku45": "claude-haiku-4-5",
-        "opus": "claude-opus-4-8",
+        "opus": "claude-opus-5",
         "opus4": "claude-opus-4-8",
+        "opus5": "claude-opus-5",
         "opus46": "claude-opus-4-6",
         "opus47": "claude-opus-4-7",
         "opus48": "claude-opus-4-8",
         "fable": "claude-fable-5",
         "fable5": "claude-fable-5",
-        "deepseek": "deepseek.deepseek-v4-pro",
-        "deepseek4": "deepseek.deepseek-v4-pro",
-        "deepseek4pro": "deepseek.deepseek-v4-pro",
-        "deepseekv4pro": "deepseek.deepseek-v4-pro",
-        "deepseek-direct": "deepseek.deepseek-v4-pro",
-        "deepseek4flash": "deepseek.deepseek-v4-flash",
-        "deepseek4pro-direct": "deepseek.deepseek-v4-pro",
-        "deepseek-reasoner": "deepseek.deepseek-reasoner",
+        "deepseek": "deepseek.deepseek-v4-flash",
         "gemini": "gemini-3.1-pro-preview",
         "gemini2": "gemini-2.0-flash",
         "gemini25": "gemini-2.5-flash",
@@ -823,6 +898,7 @@ class ModelFactory:
         "kimi27code": (
             "hf.moonshotai/Kimi-K2.7-Code:fireworks-ai?temperature=1.0&top_p=0.95&reasoning=on"
         ),
+        "kimik3": "moonshot.kimi-k3",
         "kimithink": "hf.moonshotai/Kimi-K2.6:novita?temperature=1.0&top_p=0.95&reasoning=on",
         "gpt-oss": "hf.openai/gpt-oss-120b:cerebras",
         "gpt-oss-20b": "hf.openai/gpt-oss-20b",
@@ -831,6 +907,7 @@ class ModelFactory:
         "glm5": "hf.zai-org/GLM-5:novita",
         "glm52": "hf.zai-org/GLM-5.2:zai-org",
         "glm": "hf.zai-org/GLM-5.2:zai-org",
+        "zaiglm": "zai.glm-5.2",
         "deepseek-hf": "hf.deepseek-ai/DeepSeek-V4-Pro:together",
         "deepseek32": "hf.deepseek-ai/DeepSeek-V3.2:fireworks-ai",
         "deepseek4-hf": "hf.deepseek-ai/DeepSeek-V4-Pro:together",

@@ -29,18 +29,17 @@ from fast_agent.llm.model_display_name import resolve_model_display_name
 from fast_agent.llm.model_info import ModelInfo
 from fast_agent.llm.provider_types import Provider
 from fast_agent.ui import notification_tracker
-from fast_agent.ui.attachment_indicator import (
-    DraftAttachmentSummary,
-    render_attachment_indicator,
-    summarize_draft_attachments,
-)
 from fast_agent.ui.context_usage_display import (
     ContextUsageAccumulator,
     resolve_context_usage_percent,
 )
-from fast_agent.ui.model_chip_display import render_model_chip
-from fast_agent.ui.prompt.alert_flags import _resolve_alert_flags_from_history
-from fast_agent.ui.prompt.toolbar import (
+from fast_agent.ui.prompt.status_bar.alert_flags import _resolve_alert_flags_from_history
+from fast_agent.ui.prompt.status_bar.attachment import (
+    DraftAttachmentSummary,
+    render_attachment_indicator,
+    summarize_draft_attachments,
+)
+from fast_agent.ui.prompt.status_bar.formatting import (
     _can_fit_shell_path_and_version,
     _fit_shell_identity_for_toolbar,
     _fit_shell_path_for_toolbar,
@@ -50,9 +49,11 @@ from fast_agent.ui.prompt.toolbar import (
     _resolve_toolbar_width,
     _toolbar_markup_width,
 )
-from fast_agent.ui.service_tier_display import render_service_tier_indicator
-from fast_agent.ui.web_fetch_display import render_web_fetch_indicator
-from fast_agent.ui.web_search_display import render_web_search_indicator
+from fast_agent.ui.prompt.status_bar.managed_process import render_managed_process_indicator
+from fast_agent.ui.prompt.status_bar.model_chip import render_model_chip
+from fast_agent.ui.prompt.status_bar.service_tier import render_service_tier_indicator
+from fast_agent.ui.prompt.status_bar.web_fetch import render_web_fetch_indicator
+from fast_agent.ui.prompt.status_bar.web_search import render_web_search_indicator
 from fast_agent.utils.collections import unique_preserve_order
 from fast_agent.utils.count_display import format_count
 
@@ -112,6 +113,7 @@ class ToolbarAgentState:
     service_tier_indicator: str | None = None
     web_search_indicator: str | None = None
     web_fetch_indicator: str | None = None
+    active_process_count: int = 0
 
 
 @dataclass(slots=True)
@@ -396,6 +398,7 @@ def _build_toolbar_agent_state(
         service_tier_indicator=model_visuals.service_tier_indicator,
         web_search_indicator=model_visuals.web_search_indicator,
         web_fetch_indicator=model_visuals.web_fetch_indicator,
+        active_process_count=_active_process_count_for_agent(agent),
     )
 
 
@@ -419,7 +422,7 @@ def _build_toolbar_agent_state_cache_key(
         model_name,
         history_len,
         last_message_id,
-        _safe_cache_value(usage_accumulator.turn_count if usage_accumulator is not None else None),
+        _safe_cache_value(len(usage_accumulator.turns) if usage_accumulator is not None else None),
         _safe_cache_value(
             usage_accumulator.current_context_tokens if usage_accumulator is not None else None
         ),
@@ -431,6 +434,7 @@ def _build_toolbar_agent_state_cache_key(
         _safe_cache_value(resolve_service_tier(llm)),
         _safe_cache_value(resolve_web_search_enabled(llm)),
         _safe_cache_value(resolve_web_fetch_enabled(llm)),
+        _active_process_count_for_agent(agent),
         _parallel_fan_out_model_cache_key(agent),
     )
 
@@ -471,6 +475,12 @@ def _resolve_current_agent(
         return cast("AgentProtocol", agent_provider._agent(agent_name))
     except Exception:
         return None
+
+
+def _active_process_count_for_agent(agent: object) -> int:
+    shell_runtime = getattr(agent, "shell_runtime", None)
+    active_count = getattr(shell_runtime, "active_process_count", 0)
+    return active_count if type(active_count) is int and active_count > 0 else 0
 
 
 def _turn_count_for_agent(agent: AgentProtocol) -> int:
@@ -656,6 +666,19 @@ def _toolbar_style_segment(
     return f"<style fg='{escaped_foreground}' bg='{escaped_background}'>{escaped_content}</style>"
 
 
+def _format_toolbar_mode_segment(mode_style: str, mode_text: str) -> str:
+    if mode_text == "MLT":
+        return _toolbar_style_segment(
+            mode_text,
+            foreground=mode_style,
+        )
+    return _toolbar_style_segment(
+        mode_text,
+        foreground="ansiblack",
+        background=mode_style,
+    )
+
+
 def _build_middle_segment(
     agent_state: ToolbarAgentState,
     shortcut_text: str,
@@ -663,6 +686,8 @@ def _build_middle_segment(
     attachment_summary=None,
 ) -> str:
     middle_segments: list[str] = []
+    context_chip = _format_context_usage_percent_for_toolbar(agent_state.context_pct)
+    context_or_turns = context_chip if context_chip is not None else f"{agent_state.turn_count:03d}"
     if agent_state.model_display:
         model_prefix = ""
         if agent_state.is_codex_responses_model:
@@ -671,6 +696,7 @@ def _build_middle_segment(
             model_prefix = "▼"
         model_label = f"{model_prefix}{agent_state.model_display}"
         attachment_indicator = render_attachment_indicator(attachment_summary)
+        process_indicator = render_managed_process_indicator(agent_state.active_process_count)
         model_chip = render_model_chip(
             model_label=model_label,
             web_search_indicator=agent_state.web_search_indicator,
@@ -684,12 +710,10 @@ def _build_middle_segment(
             prefix += attachment_indicator
         if agent_state.model_gauges:
             prefix += agent_state.model_gauges
-        middle_segments.append(f"{prefix} {model_chip}" if prefix else model_chip)
-
-    context_chip = _format_context_usage_percent_for_toolbar(agent_state.context_pct)
-    middle_segments.append(
-        context_chip if context_chip is not None else f"{agent_state.turn_count:03d}"
-    )
+        model_segment = f"{prefix} {model_chip}" if prefix else model_chip
+        middle_segments.append(f"{process_indicator}| {model_segment} {context_or_turns}")
+    else:
+        middle_segments.append(context_or_turns)
     if shortcut_text:
         middle_segments.append(shortcut_text)
     return " | ".join(middle_segments)
@@ -788,15 +812,10 @@ def _format_toolbar_prefix(
     mode_style: str,
     mode_text: str,
 ) -> str:
+    mode_segment = _format_toolbar_mode_segment(mode_style, mode_text)
     if middle:
-        return (
-            f" {agent_identity_segment} "
-            f" {middle} | {_toolbar_style_segment(mode_text, foreground=mode_style, padded=True)} | "
-        )
-    return (
-        f" {agent_identity_segment} "
-        f"Mode: {_toolbar_style_segment(mode_text, foreground=mode_style, padded=True)} | "
-    )
+        return f"{agent_identity_segment} {middle} | {mode_segment} | "
+    return f"{agent_identity_segment} Mode: {mode_segment} | "
 
 
 def _build_toolbar_html(

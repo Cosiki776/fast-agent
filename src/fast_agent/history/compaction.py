@@ -23,6 +23,7 @@ from mcp.types import TextContent
 from fast_agent.constants import FAST_AGENT_COMPACTION_CHANNEL
 from fast_agent.core.logging.logger import get_logger
 from fast_agent.event_progress import ProgressAction
+from fast_agent.mcp.helpers.content_helpers import get_text
 from fast_agent.mcp.prompt import Prompt
 from fast_agent.types.llm_stop_reason import LlmStopReason
 
@@ -151,7 +152,7 @@ def should_auto_compact(
     if not window or window <= 0:
         return False
     current = usage.current_context_tokens
-    if current <= 0:
+    if current is None or current <= 0:
         return False
     return (current / window) >= settings.threshold
 
@@ -185,6 +186,10 @@ def estimate_tokens(messages: list[PromptMessageExtended]) -> int:
     for message in messages:
         chars += len(message.all_text())
         for content in message.content:
+            if get_text(content) is not None:
+                # Text is already counted via all_text() above; only serialize
+                # non-text payloads here (matches the "non-text" docstring).
+                continue
             try:
                 chars += len(content.model_dump_json())
             except Exception:
@@ -472,7 +477,9 @@ def _archive_history(
         return None
 
 
-def _resolve_active_session_manager(manager: "SessionManager", cwd: Path | None) -> "SessionManager":
+def _resolve_active_session_manager(
+    manager: "SessionManager", cwd: Path | None
+) -> "SessionManager":
     if cwd is not None and cwd.resolve() != manager.workspace_dir:
         raise RuntimeError(
             "Compaction archive requested a different cwd than the active session manager."

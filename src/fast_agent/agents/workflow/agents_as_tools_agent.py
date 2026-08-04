@@ -299,6 +299,7 @@ class _ChildToolRunPlan:
     descriptor_by_id: dict[str, _ChildToolDescriptor]
     id_list: list[str]
 
+
 def _trajectory_timestamp() -> str:
     return datetime.now(UTC).isoformat().replace("+00:00", "Z")
 
@@ -1173,7 +1174,7 @@ class AgentsAsToolsAgent(McpAgent):
                     rendered_child_input=trace.rendered_child_input,
                     messages=trace.messages,
                     usage_summary=(
-                        clone.usage_accumulator.get_summary()
+                        clone.usage_accumulator.summary.model_dump(mode="json")
                         if clone.usage_accumulator is not None
                         else None
                     ),
@@ -1207,7 +1208,9 @@ class AgentsAsToolsAgent(McpAgent):
         session_cwd = _resolved_path(
             getattr(acp_context, "session_cwd", None) if acp_context is not None else None
         )
-        manager = agent_context.session_manager if agent_context else current_context.session_manager
+        manager = (
+            agent_context.session_manager if agent_context else current_context.session_manager
+        )
         if manager is None:
             manager = get_session_manager()
         identity = resolve_session_for_save(

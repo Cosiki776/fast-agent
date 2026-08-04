@@ -1,8 +1,18 @@
 """Tests for converting logger events into progress display events."""
 
-from fast_agent.core.logging.events import Event
+from fast_agent.core.logging.events import Event, StreamingExclusionFilter
 from fast_agent.core.logging.listeners import convert_log_event
 from fast_agent.event_progress import ProgressAction
+
+
+def test_process_output_progress_refresh_is_excluded_from_persisted_logs() -> None:
+    event = Event(
+        type="info",
+        namespace="fast_agent.tools.shell_runtime",
+        message="Process output progress",
+    )
+
+    assert not StreamingExclusionFilter(min_level="info").matches(event)
 
 
 def test_convert_log_event_extracts_tool_correlation_id() -> None:
@@ -31,6 +41,52 @@ def test_convert_log_event_extracts_tool_correlation_id() -> None:
     assert progress_event.correlation_id == "use-123"
     assert progress_event.tool_name == "search"
     assert progress_event.details == "search - step 1"
+
+
+def test_convert_poll_start_uses_process_details_without_tool_prefix() -> None:
+    event = Event(
+        type="info",
+        namespace="fast_agent.custom.runtime",
+        message="Shell tool lifecycle",
+        data={
+            "data": {
+                "progress_action": ProgressAction.CALLING_TOOL,
+                "agent_name": "assistant",
+                "tool_name": "poll_process",
+                "server_name": "local",
+                "tool_use_id": "call-poll",
+                "tool_event": "start",
+                "details": "process-4",
+                "process_elapsed_seconds": 65,
+                "process_command": "uv run worker.py",
+                "process_id": "process-4",
+                "process_wait_seconds": 30,
+                "process_has_observed_output": True,
+                "process_seconds_since_last_output": 4,
+                "process_total_output_bytes": 12_500,
+                "process_seconds_since_last_stdout": 4,
+                "process_seconds_since_last_stderr": 2,
+                "process_stdout_bytes": 12_000,
+                "process_stderr_bytes": 500,
+            }
+        },
+    )
+
+    progress_event = convert_log_event(event)
+
+    assert progress_event is not None
+    assert progress_event.details == "process-4"
+    assert progress_event.process_elapsed_seconds == 65
+    assert progress_event.process_command == "uv run worker.py"
+    assert progress_event.process_id == "process-4"
+    assert progress_event.process_wait_seconds == 30
+    assert progress_event.process_has_observed_output is True
+    assert progress_event.process_seconds_since_last_output == 4
+    assert progress_event.process_total_output_bytes == 12_500
+    assert progress_event.process_seconds_since_last_stdout == 4
+    assert progress_event.process_seconds_since_last_stderr == 2
+    assert progress_event.process_stdout_bytes == 12_000
+    assert progress_event.process_stderr_bytes == 500
 
 
 def test_convert_log_event_uses_tool_use_id_when_call_id_missing() -> None:
@@ -121,6 +177,27 @@ def test_convert_log_event_mcp_resource_read_uses_resource_action_and_details() 
     progress_event = convert_log_event(event)
     assert progress_event is not None
     assert progress_event.action == ProgressAction.READING_RESOURCE
+    assert progress_event.details == "docs - file://README.md"
+
+
+def test_convert_log_event_mcp_resource_read_completion_preserves_details() -> None:
+    event = Event(
+        type="info",
+        namespace="fast_agent.mcp.mcp_aggregator",
+        message="Resource read complete",
+        data={
+            "data": {
+                "progress_action": ProgressAction.RESOURCE_READ,
+                "agent_name": "assistant",
+                "server_name": "docs",
+                "details": "file://README.md",
+            }
+        },
+    )
+
+    progress_event = convert_log_event(event)
+    assert progress_event is not None
+    assert progress_event.action == ProgressAction.RESOURCE_READ
     assert progress_event.details == "docs - file://README.md"
 
 

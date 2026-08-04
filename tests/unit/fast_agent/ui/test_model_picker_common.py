@@ -32,6 +32,7 @@ from fast_agent.ui.model_picker_common import (
     model_capabilities,
     model_options_for_option,
     model_options_for_provider,
+    provider_activation_action,
     provider_option_count_label,
 )
 
@@ -249,6 +250,72 @@ def test_provider_is_active_accepts_provider_specific_fallbacks() -> None:
     )
 
 
+def test_provider_is_active_for_codex_auth_json(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "fast_agent.llm.provider.openai.codex_oauth.get_codex_token_status",
+        lambda: {
+            "present": True,
+            "expired": False,
+            "source": "auth.json",
+            "expires_at": 1_900_000_000,
+        },
+    )
+
+    assert _provider_is_active(Provider.CODEX_RESPONSES, {})
+
+    from fast_agent.ui.model_picker_common import provider_credential_summary
+
+    summary = provider_credential_summary(Provider.CODEX_RESPONSES, {})
+    assert summary.active is True
+    assert summary.label == "Codex auth.json"
+
+
+def test_provider_is_active_for_xai_oauth(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "fast_agent.llm.provider.openai.xai_oauth.get_xai_token_status",
+        lambda: {
+            "present": True,
+            "expired": False,
+            "source": "keyring",
+            "expires_at": 1_900_000_000,
+        },
+    )
+
+    assert _provider_is_active(Provider.XAI, {})
+
+    from fast_agent.ui.model_picker_common import provider_credential_summary
+
+    summary = provider_credential_summary(Provider.XAI, {})
+    assert summary.active is True
+    assert summary.label == "OAuth keyring"
+
+
+def test_build_snapshot_marks_codex_active_from_auth_json(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "fast_agent.llm.provider.openai.codex_oauth.get_codex_token_status",
+        lambda: {
+            "present": True,
+            "expired": False,
+            "source": "auth.json",
+            "expires_at": 1_900_000_000,
+        },
+    )
+    monkeypatch.setattr(
+        "fast_agent.llm.provider.openai.codex_oauth.get_codex_access_token",
+        lambda: "codex-token",
+    )
+
+    option = _provider_option(build_snapshot(config_payload={}), Provider.CODEX_RESPONSES)
+    assert option.active is True
+    assert option.credential_label == "Codex auth.json"
+
+
 def test_46_models_do_not_report_optional_long_context() -> None:
     capabilities = model_capabilities("claude-opus-4-6?context=1m")
 
@@ -414,6 +481,32 @@ def test_build_snapshot_places_deepseek_under_llamacpp() -> None:
     )
 
 
+def test_build_snapshot_includes_native_zai_provider() -> None:
+    snapshot = build_snapshot(config_payload={})
+    option = next(
+        provider
+        for provider in snapshot.providers
+        if provider.option_key == Provider.ZAI.config_name
+    )
+
+    assert option.provider is Provider.ZAI
+    assert [entry.alias for entry in option.curated_entries] == ["zaiglm"]
+    assert [entry.model for entry in option.curated_entries] == ["zai.glm-5.2"]
+
+
+def test_build_snapshot_includes_native_moonshot_provider() -> None:
+    snapshot = build_snapshot(config_payload={})
+    option = next(
+        provider
+        for provider in snapshot.providers
+        if provider.option_key == Provider.MOONSHOT.config_name
+    )
+
+    assert option.provider is Provider.MOONSHOT
+    assert [entry.alias for entry in option.curated_entries] == ["kimik3"]
+    assert [entry.model for entry in option.curated_entries] == ["moonshot.kimi-k3"]
+
+
 def test_build_snapshot_uses_xai_brand_casing() -> None:
     snapshot = build_snapshot(config_payload={})
     option = next(
@@ -425,6 +518,32 @@ def test_build_snapshot_uses_xai_brand_casing() -> None:
     assert option.provider is Provider.XAI
     assert option.display_name is None
     assert Provider.XAI.display_name == "xAI"
+
+
+def test_build_snapshot_surfaces_oauth_credential_source(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from fast_agent.auth.credentials import OAuthCredential, export_oauth_credential
+
+    auth_path = tmp_path / "auth.json"
+    export_oauth_credential(
+        "xai",
+        OAuthCredential(access_token="stored-xai-token"),
+        auth_path,
+    )
+    monkeypatch.setenv("FAST_AGENT_AUTH_FILE", str(auth_path))
+
+    snapshot = build_snapshot(config_payload={})
+    option = next(
+        provider
+        for provider in snapshot.providers
+        if provider.option_key == Provider.XAI.config_name
+    )
+
+    assert option.active is True
+    assert option.credential_label == "OAuth file"
+    assert provider_activation_action(snapshot, Provider.XAI) is None
 
 
 def test_has_explicit_provider_prefix_handles_supported_delimiters() -> None:

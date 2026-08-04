@@ -8,8 +8,9 @@ from typing import TYPE_CHECKING, Any, cast
 
 import pytest
 from aiohttp import WSMsgType
-from mcp.types import TextContent
+from mcp.types import CallToolResult, TextContent
 
+from fast_agent.constants import FAST_AGENT_ERROR_CHANNEL, FAST_AGENT_RETRY
 from fast_agent.llm.provider.openai.codex_responses import CodexResponsesLLM
 from fast_agent.llm.provider.openai.responses import ResponsesLLM
 from fast_agent.llm.provider.openai.responses_websocket import (
@@ -29,11 +30,17 @@ from fast_agent.llm.provider.openai.responses_websocket import (
 )
 from fast_agent.llm.provider.openai.streaming_utils import (
     validate_incomplete_tool_entries,
+)
+from fast_agent.llm.provider.streaming_timeouts import (
+    StreamIdleTimeoutError,
+    StreamTiming,
     with_stream_idle_timeout,
 )
 from fast_agent.llm.provider_types import Provider
 from fast_agent.llm.request_params import RequestParams
 from fast_agent.llm.tool_call_errors import format_incomplete_tool_call_error
+from fast_agent.mcp.prompt import Prompt
+from fast_agent.mcp.prompt_message_extended import PromptMessageExtended
 
 if TYPE_CHECKING:
     from mcp import Tool
@@ -176,6 +183,10 @@ class _CapturingLogger:
     def __init__(self) -> None:
         self.info_messages: list[str] = []
         self.info_data: list[dict[str, Any] | None] = []
+        self.warning_messages: list[str] = []
+        self.warning_data: list[dict[str, Any] | None] = []
+        self.error_messages: list[str] = []
+        self.error_data: list[dict[str, Any] | None] = []
 
     def info(self, message: str, data: dict[str, Any] | None = None) -> None:
         self.info_messages.append(message)
@@ -185,10 +196,13 @@ class _CapturingLogger:
         del message, data
 
     def warning(self, message: str, data: dict[str, Any] | None = None) -> None:
-        del message, data
+        self.warning_messages.append(message)
+        self.warning_data.append(data)
 
     def error(self, message: str, data: dict[str, Any] | None = None, exc_info: Any = None) -> None:
-        del message, data, exc_info
+        del exc_info
+        self.error_messages.append(message)
+        self.error_data.append(data)
 
 
 class _CapturingDisplay:
@@ -279,7 +293,6 @@ async def test_with_stream_idle_timeout_allows_long_active_stream() -> None:
     timed_stream = with_stream_idle_timeout(
         _DelayedStream(delays=[0.005, 0.005, 0.005], values=["a", "b", "c"]),
         idle_timeout_seconds=0.01,
-        timeout_message="idle timeout",
     )
 
     observed = [event async for event in timed_stream]
@@ -292,12 +305,14 @@ async def test_with_stream_idle_timeout_raises_when_stream_goes_idle() -> None:
     timed_stream = with_stream_idle_timeout(
         _DelayedStream(delays=[0.005, 0.02], values=["a", "b"]),
         idle_timeout_seconds=0.01,
-        timeout_message="idle timeout",
     )
 
     iterator = timed_stream.__aiter__()
     assert await iterator.__anext__() == "a"
-    with pytest.raises(TimeoutError, match="idle timeout"):
+    with pytest.raises(
+        StreamIdleTimeoutError,
+        match="No stream events were received for 0.01 seconds",
+    ):
         await iterator.__anext__()
 
 
@@ -311,7 +326,6 @@ async def test_with_stream_idle_timeout_preserves_get_final_response() -> None:
             final_response=final_response,
         ),
         idle_timeout_seconds=0.01,
-        timeout_message="idle timeout",
     )
 
     observed = [event async for event in timed_stream]
@@ -552,6 +566,25 @@ def test_continuation_planner_non_prefix_forces_create() -> None:
     planned = planner.plan(non_prefix)
     assert planned.event_type == RESPONSES_CREATE_EVENT_TYPE
     assert "previous_response_id" not in planned.arguments
+
+
+def test_continuation_planner_resumes_after_non_prefix_create() -> None:
+    planner = StatefulContinuationResponsesWsPlanner()
+    first_arguments = _build_ws_arguments([_build_input_message("one")])
+    planner.commit(first_arguments, planner.plan(first_arguments), {"id": "resp_1"})
+
+    folded_arguments = _build_ws_arguments([_build_input_message("folded")])
+    folded = planner.plan(folded_arguments)
+    assert "previous_response_id" not in folded.arguments
+    planner.commit(folded_arguments, folded, {"id": "resp_2"})
+
+    extended_arguments = _build_ws_arguments(
+        [_build_input_message("folded"), _build_input_message("next")]
+    )
+    resumed = planner.plan(extended_arguments)
+
+    assert resumed.arguments["previous_response_id"] == "resp_2"
+    assert resumed.arguments["input"] == [_build_input_message("next")]
 
 
 def test_continuation_planner_equal_or_shorter_input_forces_create() -> None:
@@ -1037,6 +1070,8 @@ async def test_responses_llm_close_closes_websocket_manager() -> None:
 class _TransportHarness(ResponsesLLM):
     def __init__(self, **kwargs: Any) -> None:
         self.ws_error: ResponsesWebSocketError | None = None
+        self.sse_errors: list[Exception | None] = []
+        self.sse_texts: list[str | None] = []
         self.sse_calls = 0
         self.ws_calls = 0
         super().__init__(provider=Provider.CODEX_RESPONSES, model="gpt-5.3-codex", **kwargs)
@@ -1053,14 +1088,22 @@ class _TransportHarness(ResponsesLLM):
         model_name: str,
     ) -> tuple[Any, list[str], list[dict[str, Any]]]:
         self.sse_calls += 1
+        error = self.sse_errors.pop(0) if self.sse_errors else None
+        if error is not None:
+            raise error
+        text = self.sse_texts.pop(0) if self.sse_texts else "sse"
         response = SimpleNamespace(
             status="completed",
-            output=[
-                SimpleNamespace(
-                    type="message",
-                    content=[SimpleNamespace(type="output_text", text="sse")],
-                )
-            ],
+            output=(
+                [
+                    SimpleNamespace(
+                        type="message",
+                        content=[SimpleNamespace(type="output_text", text=text)],
+                    )
+                ]
+                if text is not None
+                else []
+            ),
             usage=None,
         )
         return response, [], input_items
@@ -1354,7 +1397,7 @@ async def test_websocket_completion_ws_records_phase_diagnostics() -> None:
     )
     harness._last_transport_used = "websocket"
 
-    diagnostics = harness._websocket_diagnostics_payload()
+    diagnostics = harness._transport_diagnostics_payload()
     phase_timings = diagnostics.get("websocket_phase_ms")
 
     assert isinstance(phase_timings, dict)
@@ -1365,6 +1408,98 @@ async def test_websocket_completion_ws_records_phase_diagnostics() -> None:
     assert "send_request" in phase_timings
     assert "stream_total" in phase_timings
     assert "total" in phase_timings
+    assert diagnostics["stream_timing"] == {
+        "events_received": 0,
+        "first_event_wait_ms": None,
+        "max_inter_event_wait_ms": None,
+        "inter_event_waits_over_10s": 0,
+        "timed_out": False,
+    }
+
+
+def test_successful_sse_stream_timing_is_attached_to_diagnostics_channel() -> None:
+    harness = _TransportHarness(name="transport-harness", transport="sse")
+    harness._last_transport_used = "sse"
+    harness._record_successful_stream_timing(
+        StreamTiming(
+            events_received=3,
+            first_event_wait_seconds=1.25,
+            max_inter_event_wait_seconds=3.5,
+            inter_event_waits_over_threshold=0,
+            timed_out_wait_seconds=None,
+        ),
+        model="gpt-5.3-codex",
+        transport="sse",
+    )
+
+    channels = harness._responses_diagnostics_channels(None)
+
+    assert channels is not None
+    diagnostics_block = channels["fast-agent-provider-diagnostics"][0]
+    assert isinstance(diagnostics_block, TextContent)
+    payload = json.loads(diagnostics_block.text)
+    assert payload == {
+        "transport": "sse",
+        "stream_timing": {
+            "events_received": 3,
+            "first_event_wait_ms": 1250.0,
+            "max_inter_event_wait_ms": 3500.0,
+            "inter_event_waits_over_10s": 0,
+            "timed_out": False,
+        },
+    }
+
+
+def test_successful_stream_warns_once_for_exceptional_inter_event_gap() -> None:
+    harness = _ConnectionLifecycleHarness()
+    timing = StreamTiming(
+        events_received=4,
+        first_event_wait_seconds=1.0,
+        max_inter_event_wait_seconds=35.0,
+        inter_event_waits_over_threshold=1,
+        timed_out_wait_seconds=None,
+    )
+
+    harness._record_successful_stream_timing(
+        timing,
+        model="gpt-5.3-codex",
+        transport="websocket",
+    )
+
+    assert harness._capturing_logger.warning_messages == [
+        "Responses stream observed extended inter-event gap"
+    ]
+    assert harness._capturing_logger.warning_data == [
+        {
+            "model": "gpt-5.3-codex",
+            "transport": "websocket",
+            "stream_timing": {
+                "events_received": 4,
+                "first_event_wait_ms": 1000.0,
+                "max_inter_event_wait_ms": 35000.0,
+                "inter_event_waits_over_10s": 1,
+                "timed_out": False,
+            },
+        }
+    ]
+
+
+def test_slow_first_event_does_not_trigger_inter_event_gap_warning() -> None:
+    harness = _ConnectionLifecycleHarness()
+
+    harness._record_successful_stream_timing(
+        StreamTiming(
+            events_received=2,
+            first_event_wait_seconds=35.0,
+            max_inter_event_wait_seconds=1.0,
+            inter_event_waits_over_threshold=0,
+            timed_out_wait_seconds=None,
+        ),
+        model="gpt-5.3-codex",
+        transport="websocket",
+    )
+
+    assert harness._capturing_logger.warning_messages == []
 
 
 @pytest.mark.asyncio
@@ -1620,6 +1755,127 @@ async def test_auto_transport_falls_back_to_sse_before_stream_start() -> None:
 
 
 @pytest.mark.asyncio
+async def test_empty_responses_completion_retries_once() -> None:
+    harness = _TransportHarness(name="transport-harness", transport="sse")
+    harness.sse_texts = [None, "recovered"]
+    params = RequestParams(model="gpt-5.3-codex")
+
+    result = await harness._responses_completion(
+        input_items=[
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "hello"}],
+            }
+        ],
+        request_params=params,
+    )
+
+    assert harness.sse_calls == 2
+    assert result.content == [TextContent(type="text", text="recovered")]
+
+
+@pytest.mark.asyncio
+async def test_empty_response_retry_failure_uses_configured_retry_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness = _TransportHarness(name="transport-harness", transport="sse")
+    harness.retry_count = 1
+    harness.sse_errors = [None, RuntimeError("transient transport failure"), None]
+    harness.sse_texts = [None, "recovered"]
+    params = RequestParams(model="gpt-5.3-codex")
+
+    async def no_wait(*args: Any, **kwargs: Any) -> None:
+        del args, kwargs
+
+    monkeypatch.setattr(harness, "_wait_before_retry", no_wait)
+
+    result = await harness._execute_with_retry(
+        harness._responses_completion,
+        input_items=[
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "hello"}],
+            }
+        ],
+        request_params=params,
+    )
+
+    assert harness.sse_calls == 3
+    assert result.content == [TextContent(type="text", text="recovered")]
+
+
+@pytest.mark.asyncio
+async def test_retry_rolls_back_stream_and_records_completed_tool_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness = _TransportHarness(name="transport-harness", transport="sse")
+    harness.retry_count = 1
+    calls = 0
+    chunks = []
+    history = [
+        PromptMessageExtended(
+            role="user",
+            tool_results={
+                "call_1": CallToolResult(content=[TextContent(type="text", text="completed")])
+            },
+        )
+    ]
+
+    async def recover(_messages: list[PromptMessageExtended]) -> PromptMessageExtended:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise StreamIdleTimeoutError(0.01, events_received=4)
+        return Prompt.assistant("recovered")
+
+    async def no_wait(*args: Any, **kwargs: Any) -> None:
+        del args, kwargs
+
+    monkeypatch.setattr(harness, "_wait_before_retry", no_wait)
+    harness.add_stream_listener(chunks.append)
+
+    result = await harness._execute_with_retry(recover, history)
+
+    assert calls == 2
+    assert [chunk.event for chunk in chunks] == ["rollback", "commit"]
+    retry_payload = json.loads(result.channels[FAST_AGENT_RETRY][0].text)
+    assert retry_payload["provider_attempts"] == 2
+    assert retry_payload["retries"][0]["reason"] == "stream_idle"
+    assert retry_payload["retries"][0]["stream_events_received"] == 4
+    assert retry_payload["retries"][0]["boundary"] == {
+        "kind": "completed_tool_call",
+        "message_index": 0,
+        "tool_call_ids": ["call_1"],
+    }
+
+
+@pytest.mark.asyncio
+async def test_repeated_empty_responses_completion_returns_error() -> None:
+    harness = _TransportHarness(name="transport-harness", transport="sse")
+    harness.sse_texts = [None, None]
+    params = RequestParams(model="gpt-5.3-codex")
+
+    result = await harness._responses_completion(
+        input_items=[
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "hello"}],
+            }
+        ],
+        request_params=params,
+    )
+
+    assert harness.sse_calls == 2
+    assert result.stop_reason == "error"
+    assert "no assistant content or tool calls after one retry" in result.first_text()
+    assert result.channels is not None
+    assert FAST_AGENT_ERROR_CHANNEL in result.channels
+
+
+@pytest.mark.asyncio
 async def test_auto_transport_does_not_fallback_after_stream_start() -> None:
     harness = _TransportHarness(name="transport-harness", transport="auto")
     harness.ws_error = ResponsesWebSocketError("stream failed", stream_started=True)
@@ -1743,7 +1999,7 @@ async def test_websocket_streaming_timeout_releases_reusable_connection() -> Non
         }
     ]
 
-    with pytest.raises(TimeoutError, match="Streaming was idle for more than"):
+    with pytest.raises(StreamIdleTimeoutError, match="No stream events were received"):
         await harness._responses_completion_ws(
             input_items=input_items,
             request_params=params,
@@ -1752,6 +2008,12 @@ async def test_websocket_streaming_timeout_releases_reusable_connection() -> Non
         )
 
     assert harness._release_manager.release_keep_values == [False]
+    timeout_data = harness._capturing_logger.error_data[-1]
+    assert timeout_data is not None
+    assert timeout_data["transport"] == "websocket"
+    assert timeout_data["stream_timing"]["events_received"] == 0
+    assert timeout_data["stream_timing"]["timed_out"] is True
+    assert timeout_data["stream_timing"]["timed_out_wait_ms"] >= 10.0
 
 
 @pytest.mark.asyncio

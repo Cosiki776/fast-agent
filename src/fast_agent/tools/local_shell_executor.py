@@ -13,7 +13,7 @@ from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
 from shutil import rmtree
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, BinaryIO
 
 from fast_agent.core.logging.logger import Logger
 from fast_agent.home import build_child_environment
@@ -24,7 +24,16 @@ from fast_agent.tools.execution_environment import (
     ShellExecutionOptions,
     ShellExecutionRequest,
     ShellExecutionResult,
+    ShellOutputActivityCallbacks,
     ShellRuntimeInfo,
+)
+from fast_agent.tools.shell_output_spool import (
+    ShellOutputSpoolPaths,
+    ShellOutputSpoolTailer,
+    create_local_output_spool,
+    delete_local_output_spool,
+    open_local_output_spool,
+    read_local_output_chunk,
 )
 from fast_agent.utils.shell_detection import shell_runtime_info
 from fast_agent.utils.text import strip_casefold
@@ -37,6 +46,7 @@ if TYPE_CHECKING:
 _STREAM_READ_CHUNK_SIZE = 4096
 _MAX_PENDING_STREAM_BYTES = 65536
 _IO_DRAIN_TIMEOUT_SECONDS = 2.0
+_PROCESS_TERMINATION_GRACE_SECONDS = 2.0
 _PROCESS_EXIT_POLL_SECONDS = 0.1
 _WATCHDOG_POLL_SECONDS = 1.0
 _asyncio_sleep = asyncio.sleep
@@ -52,6 +62,8 @@ class _ShellProcessPlan:
     shell_path: str | None
     is_windows: bool
     process_kwargs: dict[str, Any]
+    output_spool: ShellOutputSpoolPaths | None = None
+    output_files: tuple[BinaryIO, BinaryIO] | None = None
 
 
 @dataclass(slots=True)
@@ -61,6 +73,7 @@ class _ShellOutputCapture:
     last_output_time: float = field(default_factory=time.monotonic)
     timeout_occurred: bool = False
     exit_code: int = 0
+    retain_output: bool = True
 
     @property
     def result(self) -> ShellExecutionResult:
@@ -187,7 +200,9 @@ class LocalShellExecutor:
                 timeout=timeout,
             )
         options = ShellExecutionOptions(
-            timeout_seconds=self._timeout_seconds if request.timeout is None else request.timeout,
+            timeout_seconds=(self._timeout_seconds if request.timeout is None else request.timeout)
+            if request.terminate_after_idle
+            else None,
             warning_interval_seconds=self._warning_interval_seconds,
         )
         configured_working_dir = (
@@ -197,26 +212,119 @@ class LocalShellExecutor:
         if working_dir_error:
             raise ValueError(working_dir_error)
 
-        plan = self._build_process_plan(configured_working_dir, env=request.env)
-        process = await self._start_shell_process(request.command, plan)
-        output = _ShellOutputCapture()
+        plan = self._build_process_plan(
+            configured_working_dir,
+            env=request.env,
+            detach=request.detach,
+        )
+        try:
+            try:
+                process = await self._start_shell_process(request.command, plan)
+            finally:
+                # Close before any spool deletion: Windows cannot remove a
+                # directory containing open files.
+                if plan.output_files is not None:
+                    for output_file in plan.output_files:
+                        output_file.close()
+        except BaseException:
+            if plan.output_spool is not None:
+                delete_local_output_spool(plan.output_spool)
+            raise
+        if plan.output_spool is not None:
+            request.output_spool_path = plan.output_spool.directory
+        if callbacks is not None:
+            try:
+                await callbacks.on_started(process.pid)
+            except BaseException as exc:
+                if not isinstance(exc, asyncio.CancelledError) or request.terminate_on_cancel:
+                    await self._terminate_process_group(
+                        process,
+                        is_windows=plan.is_windows,
+                        reason=(
+                            "cancelled during startup"
+                            if isinstance(exc, asyncio.CancelledError)
+                            else "start callback failed"
+                        ),
+                    )
+                    if plan.output_spool is not None:
+                        delete_local_output_spool(plan.output_spool)
+                        request.output_spool_path = None
+                raise
+        output = _ShellOutputCapture(retain_output=request.retain_output)
 
-        stdout_task = asyncio.create_task(
-            self._stream_process_output(
-                process.stdout,
-                output=output,
-                callbacks=callbacks,
-                is_stderr=False,
+        if plan.output_spool is not None:
+            activity_callbacks = (
+                callbacks if isinstance(callbacks, ShellOutputActivityCallbacks) else None
             )
-        )
-        stderr_task = asyncio.create_task(
-            self._stream_process_output(
-                process.stderr,
-                output=output,
-                callbacks=callbacks,
-                is_stderr=True,
+
+            async def on_stdout(text: str) -> None:
+                await self._record_stream_output(
+                    text,
+                    output=output,
+                    callbacks=callbacks,
+                    is_stderr=False,
+                )
+
+            async def on_stderr(text: str) -> None:
+                await self._record_stream_output(
+                    text,
+                    output=output,
+                    callbacks=callbacks,
+                    is_stderr=True,
+                )
+
+            async def on_stdout_activity(byte_count: int) -> None:
+                if activity_callbacks is not None:
+                    await activity_callbacks.on_output_activity(
+                        is_stderr=False,
+                        byte_count=byte_count,
+                    )
+
+            async def on_stderr_activity(byte_count: int) -> None:
+                if activity_callbacks is not None:
+                    await activity_callbacks.on_output_activity(
+                        is_stderr=True,
+                        byte_count=byte_count,
+                    )
+
+            async def process_exited() -> bool:
+                return process.returncode is not None
+
+            tailer = ShellOutputSpoolTailer(
+                plan.output_spool,
+                read_chunk=read_local_output_chunk,
+                on_stdout=on_stdout,
+                on_stderr=on_stderr,
+                on_stdout_activity=on_stdout_activity,
+                on_stderr_activity=on_stderr_activity,
             )
-        )
+            output_tasks = [
+                asyncio.create_task(
+                    tailer.tail_until(
+                        process_exited,
+                        poll_interval=_PROCESS_EXIT_POLL_SECONDS,
+                    )
+                )
+            ]
+        else:
+            output_tasks = [
+                asyncio.create_task(
+                    self._stream_process_output(
+                        process.stdout,
+                        output=output,
+                        callbacks=callbacks,
+                        is_stderr=False,
+                    )
+                ),
+                asyncio.create_task(
+                    self._stream_process_output(
+                        process.stderr,
+                        output=output,
+                        callbacks=callbacks,
+                        is_stderr=True,
+                    )
+                ),
+            ]
         watchdog_task = asyncio.create_task(
             self._watch_process_timeout(
                 process,
@@ -230,14 +338,40 @@ class LocalShellExecutor:
         try:
             output.exit_code = await self._wait_for_process_exit(process)
         except asyncio.CancelledError:
-            await self._terminate_cancelled_process(process, is_windows=plan.is_windows)
+            if request.terminate_on_cancel:
+                await self._terminate_process_group(
+                    process,
+                    is_windows=plan.is_windows,
+                    reason="cancelled",
+                )
+                try:
+                    if plan.output_spool is not None:
+                        for task in output_tasks:
+                            await self._cancel_task_if_running(task)
+                    else:
+                        await self._drain_output_tasks(
+                            output_tasks,
+                            timeout_seconds=_IO_DRAIN_TIMEOUT_SECONDS,
+                        )
+                finally:
+                    if plan.output_spool is not None:
+                        delete_local_output_spool(plan.output_spool)
+                        request.output_spool_path = None
+            else:
+                for task in output_tasks:
+                    await self._cancel_task_if_running(task)
             raise
         finally:
             await self._cancel_task_if_running(watchdog_task)
-        drain_timed_out = await self._drain_output_tasks(
-            [stdout_task, stderr_task],
-            timeout_seconds=_IO_DRAIN_TIMEOUT_SECONDS,
-        )
+        try:
+            drain_timed_out = await self._drain_output_tasks(
+                output_tasks,
+                timeout_seconds=_IO_DRAIN_TIMEOUT_SECONDS,
+            )
+        finally:
+            if plan.output_spool is not None:
+                delete_local_output_spool(plan.output_spool)
+                request.output_spool_path = None
         return ShellExecution(
             result=output.result,
             options=options,
@@ -250,6 +384,7 @@ class LocalShellExecutor:
         configured_working_dir: Path,
         *,
         env: Mapping[str, str] | None = None,
+        detach: bool = False,
     ) -> _ShellProcessPlan:
         working_dir = self.resolve_working_directory(configured_working_dir)
         runtime_details = self.runtime_info()
@@ -264,9 +399,18 @@ class LocalShellExecutor:
             child_env.update(self._default_env)
         if env is not None:
             child_env.update(env)
+        output_spool = create_local_output_spool() if detach else None
+        try:
+            output_files = (
+                open_local_output_spool(output_spool) if output_spool is not None else None
+            )
+        except BaseException:
+            if output_spool is not None:
+                delete_local_output_spool(output_spool)
+            raise
         process_kwargs: dict[str, Any] = {
-            "stdout": asyncio.subprocess.PIPE,
-            "stderr": asyncio.subprocess.PIPE,
+            "stdout": (output_files[0] if output_files is not None else asyncio.subprocess.PIPE),
+            "stderr": (output_files[1] if output_files is not None else asyncio.subprocess.PIPE),
             "cwd": working_dir,
             "env": child_env,
         }
@@ -282,6 +426,8 @@ class LocalShellExecutor:
             shell_path=shell_path,
             is_windows=is_windows,
             process_kwargs=process_kwargs,
+            output_spool=output_spool,
+            output_files=output_files,
         )
 
     async def _start_shell_process(
@@ -363,11 +509,13 @@ class LocalShellExecutor:
         is_stderr: bool,
     ) -> None:
         if is_stderr:
-            output.stderr_segments.append(text)
+            if output.retain_output:
+                output.stderr_segments.append(text)
             if callbacks is not None:
                 await callbacks.on_stderr(text)
         else:
-            output.stdout_segments.append(text)
+            if output.retain_output:
+                output.stdout_segments.append(text)
             if callbacks is not None:
                 await callbacks.on_stdout(text)
         output.last_output_time = time.monotonic()
@@ -415,18 +563,24 @@ class LocalShellExecutor:
                 continue
 
             output.timeout_occurred = True
-            self._logger.debug("Watchdog: timeout exceeded, terminating process group")
+            self._logger.debug("Watchdog: timeout exceeded")
             if callbacks is not None:
                 await callbacks.on_timeout()
-            await self._terminate_timed_out_process(process, is_windows=is_windows)
+            await self._terminate_process_group(
+                process,
+                is_windows=is_windows,
+                reason="timeout",
+            )
             return
 
-    async def _terminate_timed_out_process(
+    async def _terminate_process_group(
         self,
         process: asyncio.subprocess.Process,
         *,
         is_windows: bool,
+        reason: str,
     ) -> None:
+        self._logger.debug(f"Terminating process group ({reason})")
         try:
             if is_windows:
                 await self._terminate_windows_process(process)
@@ -441,21 +595,13 @@ class LocalShellExecutor:
             except Exception:
                 return
 
-    async def _terminate_cancelled_process(
-        self,
-        process: asyncio.subprocess.Process,
-        *,
-        is_windows: bool,
-    ) -> None:
-        self._logger.debug("Shell execution cancelled, terminating process group")
-        await self._terminate_timed_out_process(process, is_windows=is_windows)
-
     async def _terminate_windows_process(self, process: asyncio.subprocess.Process) -> None:
         try:
             ctrl_break = getattr(signal, "CTRL_BREAK_EVENT", None)
             if ctrl_break is not None:
                 process.send_signal(ctrl_break)
-            await asyncio.sleep(2)
+                if await self._wait_for_termination(process):
+                    return
         except AttributeError:
             self._logger.debug("Watchdog: CTRL_BREAK_EVENT unsupported, skipping")
         except ValueError:
@@ -465,15 +611,30 @@ class LocalShellExecutor:
 
         if process.returncode is None:
             process.terminate()
-            await asyncio.sleep(2)
+            if await self._wait_for_termination(process):
+                return
         if process.returncode is None:
             process.kill()
+            await process.wait()
 
     async def _terminate_unix_process(self, process: asyncio.subprocess.Process) -> None:
         os.killpg(process.pid, signal.SIGTERM)
-        await asyncio.sleep(2)
+        if await self._wait_for_termination(process):
+            return
         if process.returncode is None:
             os.killpg(process.pid, signal.SIGKILL)
+            await process.wait()
+
+    @staticmethod
+    async def _wait_for_termination(process: asyncio.subprocess.Process) -> bool:
+        try:
+            await asyncio.wait_for(
+                process.wait(),
+                timeout=_PROCESS_TERMINATION_GRACE_SECONDS,
+            )
+        except TimeoutError:
+            return False
+        return True
 
     async def _cancel_task_if_running(self, task: asyncio.Task[None] | None) -> None:
         if task is None or task.done():

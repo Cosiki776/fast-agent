@@ -11,7 +11,13 @@ from rich.live import Live
 from rich.text import Text
 
 from fast_agent.event_progress import ProgressAction, ProgressEvent
-from fast_agent.ui.rich_progress import RichProgressDisplay
+from fast_agent.ui.progress.display import (
+    DynamicDetailsColumn,
+    RichProgressDisplay,
+    SpinnerDescriptionColumn,
+    _format_compacting_track,
+)
+from fast_agent.utils.time import format_process_elapsed
 
 
 def _make_event(
@@ -49,6 +55,11 @@ def _task_fields(display: RichProgressDisplay, task_name: str) -> dict[str, Any]
         if task.id == task_id:
             return task.fields
     raise AssertionError(f"Task not found for {task_name}")
+
+
+def test_compacting_track_drains_by_braille_row_then_repeats() -> None:
+    frames = [_format_compacting_track((index + 0.1) * 0.18) for index in range(6)]
+    assert frames == ["⣿⣿⣿", "⣶⣶⣶", "⣤⣤⣤", "⣀⣀⣀", "   ", "⣿⣿⣿"]
 
 
 class TestStopPreventsResume:
@@ -404,6 +415,313 @@ class TestAggregatorInitializedVisibility:
 
         display.stop()
 
+    def test_poll_process_uses_dense_braille_spinner(self) -> None:
+        display = _make_display()
+        event = _make_event(
+            action=ProgressAction.CALLING_TOOL,
+            correlation_id="tool-call-poll",
+            tool_name="poll_process",
+            details="pid 4321 · ≤30s",
+        )
+
+        description = display._description_for_event(event)
+
+        assert "Monitoring" in description
+        spinner = display._description_spinner.spinner
+        assert spinner.name == "braille_dense"
+        assert "⢸⡇ " in spinner.frames
+
+    def test_process_poll_countdown_track_replaces_pulse_spinner(self) -> None:
+        display = RichProgressDisplay(
+            console=Console(file=open("/dev/null", "w"), force_terminal=True),
+            default_agent_name="test-agent",
+        )
+        display.start()
+        display.update(
+            _make_event(
+                action=ProgressAction.CALLING_TOOL,
+                correlation_id="call-poll-countdown",
+                tool_name="poll_process",
+                details="process-4",
+                process_id="process-4",
+                process_elapsed_seconds=10,
+                process_wait_seconds=30,
+            )
+        )
+        task_id = display._taskmap["test-agent::call-poll-countdown"]
+        task = next(task for task in display._progress.tasks if task.id == task_id)
+        assert task.start_time is not None
+        task.start_time -= 10  # 10s into a 30s wait → ~2/3 remaining track
+
+        column = SpinnerDescriptionColumn(spinner_name="braille_dense")
+        rendered = column.render(task)
+        assert "Monitoring" in rendered.plain
+        # The countdown immediately follows the compact monitoring label.
+        prefix = "▎◀ Monitoring "
+        assert rendered.plain.startswith(prefix)
+        assert len(rendered.plain) == len(prefix) + 3
+        display.stop()
+
+    def test_process_poll_heartbeats_toggle_next_dot_blink(self) -> None:
+        display = _make_display()
+        event = _make_event(
+            action=ProgressAction.CALLING_TOOL,
+            correlation_id="call-poll-blink",
+            tool_name="poll_process",
+            process_wait_seconds=50,
+        )
+
+        display.update(event)
+        fields = _task_fields(display, "test-agent::call-poll-blink")
+        assert fields["process_poll_blink_next"] is False
+
+        display.update(event)
+        fields = _task_fields(display, "test-agent::call-poll-blink")
+        assert fields["process_poll_blink_next"] is True
+
+        display.update(event)
+        fields = _task_fields(display, "test-agent::call-poll-blink")
+        assert fields["process_poll_blink_next"] is False
+
+    def test_process_poll_completion_snaps_countdown_empty_before_drop(self) -> None:
+        display = RichProgressDisplay(
+            console=Console(file=open("/dev/null", "w"), force_terminal=True),
+            default_agent_name="test-agent",
+        )
+        display.start()
+        display.update(
+            _make_event(
+                action=ProgressAction.CALLING_TOOL,
+                correlation_id="call-poll-finish",
+                tool_name="poll_process",
+                details="process-4",
+                process_id="process-4",
+                process_elapsed_seconds=5,
+                process_wait_seconds=30,
+            )
+        )
+        task_id = display._taskmap["test-agent::call-poll-finish"]
+        task = next(task for task in display._progress.tasks if task.id == task_id)
+        assert task.start_time is not None
+        task.start_time -= 10
+
+        mid = SpinnerDescriptionColumn(spinner_name="braille_dense").render(task)
+        assert "Monitoring" in mid.plain
+        assert not mid.plain.endswith("   ")
+
+        display.update(
+            _make_event(
+                action=ProgressAction.TOOL_PROGRESS,
+                correlation_id="call-poll-finish",
+                tool_name="poll_process",
+                tool_state="completed",
+                tool_terminal=True,
+                process_yield_reason="deadline",
+            )
+        )
+        # Row is held briefly with an empty track before drop.
+        assert "test-agent::call-poll-finish" in display._taskmap
+        finished = next(task for task in display._progress.tasks if task.id == task_id)
+        empty = SpinnerDescriptionColumn(spinner_name="braille_dense").render(finished)
+        assert "Monitoring" in empty.plain
+        assert empty.plain.endswith("   ")
+        assert len(empty.plain) == len("▎◀ Monitoring ") + 3
+        time.sleep(0.85)
+        assert "test-agent::call-poll-finish" not in display._taskmap
+        display.stop()
+
+    def test_process_poll_early_completion_drops_without_fake_empty_frame(self) -> None:
+        display = RichProgressDisplay(
+            console=Console(file=open("/dev/null", "w"), force_terminal=True),
+            default_agent_name="test-agent",
+        )
+        display.start()
+        display.update(
+            _make_event(
+                action=ProgressAction.CALLING_TOOL,
+                correlation_id="call-poll-early",
+                tool_name="poll_process",
+                process_id="process-4",
+                process_wait_seconds=30,
+            )
+        )
+        display.update(
+            _make_event(
+                action=ProgressAction.TOOL_PROGRESS,
+                correlation_id="call-poll-early",
+                tool_name="poll_process",
+                tool_state="completed",
+                tool_terminal=True,
+                process_yield_reason="completion",
+            )
+        )
+
+        assert "test-agent::call-poll-early" not in display._taskmap
+        display.stop()
+
+    def test_process_poll_refresh_keeps_countdown_start_time(self) -> None:
+        display = RichProgressDisplay(
+            console=Console(file=open("/dev/null", "w"), force_terminal=True),
+            default_agent_name="test-agent",
+        )
+        display.start()
+        event = _make_event(
+            action=ProgressAction.CALLING_TOOL,
+            correlation_id="call-poll-stable",
+            tool_name="poll_process",
+            details="process-4",
+            process_id="process-4",
+            process_elapsed_seconds=0,
+            process_wait_seconds=30,
+        )
+        display.update(event)
+        task_id = display._taskmap["test-agent::call-poll-stable"]
+        task = next(task for task in display._progress.tasks if task.id == task_id)
+        assert task.start_time is not None
+        original_start = task.start_time
+
+        display.update(
+            event.model_copy(
+                update={
+                    "process_elapsed_seconds": 5,
+                    "process_has_observed_output": True,
+                    "process_seconds_since_last_output": 1,
+                }
+            )
+        )
+        refreshed = next(task for task in display._progress.tasks if task.id == task_id)
+        assert refreshed.start_time == original_start
+        display.stop()
+
+    def test_process_elapsed_time_ticks_during_rendering(self) -> None:
+        display = RichProgressDisplay(
+            console=Console(file=open("/dev/null", "w"), force_terminal=True, width=120),
+            default_agent_name="test-agent",
+        )
+        display.start()
+        display.update(
+            _make_event(
+                action=ProgressAction.CALLING_TOOL,
+                correlation_id="call_abcdef0123456789",
+                tool_name="poll_process",
+                details="process-4",
+                process_id="process-4",
+                process_elapsed_seconds=65,
+                process_command="uv run worker.py",
+                process_wait_seconds=30,
+                process_has_observed_output=True,
+                process_seconds_since_last_output=4,
+                process_total_output_bytes=12_500,
+                process_seconds_since_last_stdout=4,
+                process_stdout_bytes=12_000,
+                process_stderr_bytes=500,
+            )
+        )
+        task_id = display._taskmap["test-agent::call_abcdef0123456789"]
+        task = next(task for task in display._progress.tasks if task.id == task_id)
+        assert task.fields["target"] == "process-4"
+        assert task.start_time is not None
+        task.start_time -= 5  # local tick only; process baselines stay fixed
+
+        rendered = DynamicDetailsColumn().render(task)
+        # 65s base + 5s local tick; 4s-old output ages into the warm window.
+        assert rendered.plain == "out  9s · err   — · time 1m10s · size 12.5KB · uv run worker.py"
+        assert any(str(span.style) == "green" for span in rendered.spans)
+        display.stop()
+
+    def test_process_output_progress_refreshes_live_poll_baselines(self) -> None:
+        display = RichProgressDisplay(
+            console=Console(file=open("/dev/null", "w"), force_terminal=True),
+            default_agent_name="test-agent",
+        )
+        display.start()
+        initial = _make_event(
+            action=ProgressAction.CALLING_TOOL,
+            correlation_id="call-poll",
+            tool_name="poll_process",
+            details="process-4",
+            process_id="process-4",
+            process_elapsed_seconds=65,
+            process_command="uv run worker.py",
+            process_wait_seconds=30,
+            process_has_observed_output=False,
+            process_seconds_since_last_output=65,
+            process_total_output_bytes=0,
+        )
+        display.update(initial)
+        display.update(
+            initial.model_copy(
+                update={
+                    "tool_event": "progress",
+                    "process_elapsed_seconds": 70,
+                    "process_wait_seconds": 25,
+                    "process_has_observed_output": True,
+                    "process_seconds_since_last_output": 0,
+                    "process_total_output_bytes": 25_000,
+                }
+            )
+        )
+        task_id = display._taskmap["test-agent::call-poll"]
+        task = next(task for task in display._progress.tasks if task.id == task_id)
+
+        rendered = DynamicDetailsColumn().render(task)
+        assert rendered.plain == "out   — · err   — · time 1m10s · size 25.0KB · uv run worker.py"
+        display.stop()
+
+    def test_process_output_activity_fades_then_goes_quiet(self) -> None:
+        display = RichProgressDisplay(
+            console=Console(file=open("/dev/null", "w"), force_terminal=True),
+            default_agent_name="test-agent",
+        )
+        display.start()
+        display.update(
+            _make_event(
+                action=ProgressAction.CALLING_TOOL,
+                correlation_id="call-poll-quiet",
+                tool_name="poll_process",
+                details="process-4",
+                process_id="process-4",
+                process_elapsed_seconds=90,
+                process_has_observed_output=True,
+                process_seconds_since_last_output=12,
+                process_total_output_bytes=12_500,
+            )
+        )
+        task_id = display._taskmap["test-agent::call-poll-quiet"]
+        task = next(task for task in display._progress.tasks if task.id == task_id)
+
+        warm = DynamicDetailsColumn().render(task)
+        assert warm.plain == "out   — · err   — · time 1m30s · size 12.5KB"
+
+        task.fields["process_seconds_since_last_output"] = 90
+        quiet = DynamicDetailsColumn().render(task)
+        assert quiet.plain == "out   — · err   — · time 1m30s · size 12.5KB"
+        display.stop()
+
+    def test_poll_process_keeps_non_default_agent_name(self) -> None:
+        display = RichProgressDisplay(default_agent_name="default-agent")
+        event = _make_event(
+            action=ProgressAction.CALLING_TOOL,
+            agent_name="reviewer",
+            target="reviewer",
+            correlation_id="tool-call-poll",
+            tool_name="poll_process",
+            details="process-4",
+        )
+
+        update = display._update_kwargs_for_event(
+            event,
+            task_name="reviewer::tool-call-poll",
+            is_correlated_tool_event=True,
+        )
+
+        assert update["target"] == "reviewer"
+
+    def test_process_elapsed_uses_aligned_minutes_and_seconds(self) -> None:
+        assert format_process_elapsed(49) == "0m49s"
+        assert format_process_elapsed(600) == "10m00s"
+        assert format_process_elapsed(3700) == "1h01m"
+
     def test_full_progress_without_terminal_state_keeps_row(self) -> None:
         display = _make_display()
         display.start()
@@ -710,6 +1028,18 @@ class TestFinishedEventHandlesNoneElapsed:
 
 class TestAgentLifecycleRows:
     """Startup lifecycle rows should not linger in the progress board."""
+
+    def test_resource_read_completion_clears_reading_row(self) -> None:
+        display = _make_display()
+        display.start()
+
+        display.update(_make_event(action=ProgressAction.READING_RESOURCE))
+        assert "test-agent" in display._taskmap
+
+        display.update(_make_event(action=ProgressAction.RESOURCE_READ))
+        assert "test-agent" not in display._taskmap
+
+        display.stop()
 
     def test_ready_event_row_is_cleared(self) -> None:
         display = _make_display()

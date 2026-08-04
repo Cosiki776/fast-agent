@@ -17,6 +17,7 @@ anthropic:
   base_url: "https://api.anthropic.com/v1" # Default, only include if required
   cache_mode: "auto" # Options: off, prompt, auto (default: auto)
   cache_ttl: "5m" # Options: 5m, 1h (default: 5m)
+  cache_diagnostics: false # First-party Anthropic cache-miss diagnosis (debug only)
   web_search:
     enabled: false
     # max_uses: 3
@@ -56,12 +57,24 @@ The `cache_mode` setting controls how prompt caching is applied:
 
 - `off`: No caching, even if global `prompt_caching` is enabled
 - `prompt`: Caches tools, system prompt, and template content
-- `auto`: Same as `prompt` (default)
+- `auto`: Also advances cache checkpoints through recent conversation turns (default)
 
 The `cache_ttl` setting controls how long cached content persists:
 
 - `5m`: Standard 5-minute cache (default)
 - `1h`: Extended 1-hour cache (additional cost)
+
+The TTL is a user policy choice. A 5-minute cache has a lower write premium and
+usually pays off after one future read. A 1-hour cache survives longer gaps but
+has a higher write premium and generally needs two future reads to pay off.
+Anthropic silently skips cache writes when the marked prefix is below the
+model's minimum cacheable size; check the cache creation/read usage fields
+before treating an early request as a cache miss.
+
+Set `cache_diagnostics: true` only while debugging against the first-party
+Anthropic API. It enables Anthropic's cache-diagnosis beta and records the
+provider's cache-miss reason in the `fast-agent-provider-diagnostics` response
+channel. It is disabled by default and is not sent by Anthropic-on-Vertex.
 
 **Reasoning + Structured Outputs:**
 
@@ -69,15 +82,18 @@ Claude reasoning support depends on the model family:
 
 | Model family | fast-agent aliases | Reasoning mode | Effort values | Task budget |
 | --- | --- | --- | --- | --- |
-| Claude Opus 4.8 | `opus`, `opus48` | adaptive | `auto`, `low`, `medium`, `high`, `xhigh`, `max`, `off` | supported |
+| Claude Opus 5 | `opus`, `opus5` | adaptive, on by default | `auto`, `low`, `medium`, `high`, `xhigh`, `max`, `off` | supported |
+| Claude Opus 4.8 | `opus4`, `opus48` | adaptive | `auto`, `low`, `medium`, `high`, `xhigh`, `max`, `off` | supported |
 | Claude Opus 4.7 | `opus47` | adaptive | `auto`, `low`, `medium`, `high`, `xhigh`, `max`, `off` | supported |
 | Claude Opus 4.6 | `opus46` | adaptive | `auto`, `low`, `medium`, `high`, `max`, `off` | not supported |
 | Claude Sonnet 5 | `sonnet`, `sonnet5` | adaptive | `auto`, `low`, `medium`, `high`, `xhigh`, `max`, `off` | not supported |
 | Claude Sonnet 4.6 | `sonnet46` | adaptive | `auto`, `low`, `medium`, `high`, `max`, `off` | not supported |
 | Older Claude 4.x / Haiku | `haiku`, pinned older IDs | token budget | `1024+` token budgets, or preset aliases | not supported |
 
-Adaptive models use `thinking: {"type": "adaptive"}` under the hood. Use effort levels
-(`low`, `medium`, `high`, `xhigh` where supported, `max`) or `auto` with `anthropic.reasoning`:
+Adaptive models that require an explicit setting use `thinking: {"type": "adaptive"}` under the
+hood. Opus 5 has adaptive thinking on by default, so **fast-agent** omits the field for `auto`.
+Use effort levels (`low`, `medium`, `high`, `xhigh` where supported, `max`) or `auto` with
+`anthropic.reasoning`:
 
 ```yaml
 anthropic:
@@ -159,6 +175,7 @@ Supported values are `on`/`off` (also accepts `true`/`false`, `1`/`0`).
 
 Version policy is model-aware:
 
+- Claude Opus 5 supports `web_search_20260209` but does not support `web_fetch`.
 - Claude 4.6 models use `web_search_20260209` and `web_fetch_20260209`
   (with required beta header `code-execution-web-tools-2026-02-09`).
 - Other supported Anthropic models use legacy versions

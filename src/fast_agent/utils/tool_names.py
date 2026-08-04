@@ -6,7 +6,21 @@ from fast_agent.tools.filesystem_tool_definitions import READ_TEXT_FILE_TOOL_NAM
 from fast_agent.utils.action_normalization import normalize_action_token
 
 EXECUTE_TOOL_NAME = "execute"
-SHELL_EXECUTION_TOOL_NAMES = frozenset({EXECUTE_TOOL_NAME, "bash", "shell"})
+POLL_PROCESS_TOOL_NAME = "poll_process"
+TERMINATE_PROCESS_TOOL_NAME = "terminate_process"
+BASH_TOOL_NAME = "bash"
+PROCESS_TOOL_NAME = "process"
+SHELL_EXECUTION_TOOL_NAMES = frozenset(
+    {
+        EXECUTE_TOOL_NAME,
+        POLL_PROCESS_TOOL_NAME,
+        TERMINATE_PROCESS_TOOL_NAME,
+        BASH_TOOL_NAME.casefold(),
+        PROCESS_TOOL_NAME.casefold(),
+        "bash",
+        "shell",
+    }
+)
 SHELL_BUILTIN_TOOL_NAMES = frozenset(
     {
         "bash",

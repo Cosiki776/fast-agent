@@ -23,6 +23,7 @@ from fast_agent.cli.runtime.agent_setup import (
     _cli_attachment_token,
     _enable_atif_child_capture,
     _export_parallel_atif_trajectory,
+    _export_requested_outputs,
     _export_result_histories,
     _find_last_assistant_text,
     _resume_session_if_requested,
@@ -600,6 +601,21 @@ def test_initial_harness_session_id_uses_explicit_resume_session(tmp_path: Path)
     assert initial_harness_session_id(request) == "2607032031-AiS7lt"
 
 
+def test_initial_harness_session_id_preserves_concurrent_empty_session(tmp_path: Path) -> None:
+    from fast_agent.session import SessionManager
+
+    manager = SessionManager(home_override=tmp_path)
+    concurrent = manager.create_session_with_id("2607032031-Empty1")
+    request = _make_request(result_file=None, message=None)
+    request.home = tmp_path
+
+    session_id = initial_harness_session_id(request)
+
+    assert session_id != concurrent.info.name
+    assert concurrent.directory.exists()
+    assert not (tmp_path / "sessions" / session_id).exists()
+
+
 @pytest.mark.parametrize("resume", [RESUME_LATEST_SENTINEL, "latest"])
 def test_initial_harness_session_id_uses_latest_resume_alias(
     tmp_path: Path,
@@ -956,6 +972,135 @@ async def test_run_cli_flow_writes_atif_input_when_one_shot_raises(tmp_path: Pat
 
 
 @pytest.mark.asyncio
+async def test_run_cli_flow_writes_atif_when_result_export_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    agent = _NonPersistentMessageAgent("agent", "done")
+    app = _DummyAgentApp(["agent"])
+    app._agents["agent"] = agent
+    result_output = tmp_path / "result.json"
+    trajectory_output = tmp_path / "trajectory.json"
+
+    async def fail_result_export(*args: object, **kwargs: object) -> None:
+        raise typer.Exit(1)
+
+    monkeypatch.setattr(
+        "fast_agent.cli.runtime.agent_setup._export_result_histories",
+        fail_result_export,
+    )
+
+    with pytest.raises(typer.Exit):
+        await _run_cli_flow(
+            app,
+            _make_request(
+                result_file=str(result_output),
+                message="hello",
+                trajectory_output=trajectory_output,
+            ),
+        )
+
+    payload = json.loads(trajectory_output.read_text(encoding="utf-8"))
+    assert payload["schema_version"] == "ATIF-v1.7"
+    assert payload["steps"][2]["message"] == "done"
+
+
+@pytest.mark.asyncio
+async def test_run_cli_flow_writes_result_when_atif_export_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    agent = _NonPersistentMessageAgent("agent", "done")
+    app = _DummyAgentApp(["agent"])
+    app._agents["agent"] = agent
+    result_output = tmp_path / "result.json"
+
+    async def fail_atif_export(*args: object, **kwargs: object) -> None:
+        raise RuntimeError("atif export failed")
+
+    monkeypatch.setattr(
+        "fast_agent.cli.runtime.agent_setup._export_live_atif_trajectory",
+        fail_atif_export,
+    )
+
+    with pytest.raises(RuntimeError, match="atif export failed"):
+        await _run_cli_flow(
+            app,
+            _make_request(
+                result_file=str(result_output),
+                message="hello",
+                trajectory_output=tmp_path / "trajectory.json",
+            ),
+        )
+
+    exported = load_messages(str(result_output))
+    assert [message.role for message in exported] == ["user", "assistant"]
+    assert exported[1].last_text() == "done"
+
+
+@pytest.mark.asyncio
+async def test_requested_output_cancellation_stops_remaining_exports(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    atif_attempted = False
+
+    async def cancel_result_export(*args: object, **kwargs: object) -> None:
+        raise asyncio.CancelledError
+
+    async def record_atif_export(*args: object, **kwargs: object) -> None:
+        nonlocal atif_attempted
+        atif_attempted = True
+
+    monkeypatch.setattr(
+        "fast_agent.cli.runtime.agent_setup._export_result_histories",
+        cancel_result_export,
+    )
+    monkeypatch.setattr(
+        "fast_agent.cli.runtime.agent_setup._export_live_atif_trajectory",
+        record_atif_export,
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await _export_requested_outputs(
+            SimpleNamespace(),
+            _make_request(result_file=None),
+            transient_messages_by_agent=None,
+            session_manager=None,
+            harness_session=None,
+        )
+
+    assert not atif_attempted
+
+
+@pytest.mark.asyncio
+async def test_failed_run_preserves_primary_error_when_atif_export_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    agent = _FailingMessageAgent("agent")
+    app = _DummyAgentApp(["agent"])
+    app._agents["agent"] = agent
+
+    async def fail_atif_export(*args: object, **kwargs: object) -> None:
+        raise OSError("write failed")
+
+    monkeypatch.setattr(
+        "fast_agent.cli.runtime.agent_setup._export_failed_one_shot_atif",
+        fail_atif_export,
+    )
+
+    with pytest.raises(RuntimeError, match="provider unavailable"):
+        await _run_cli_flow(
+            app,
+            _make_request(
+                result_file=None,
+                message="hello",
+                trajectory_output=tmp_path / "trajectory.json",
+            ),
+        )
+
+
+@pytest.mark.asyncio
 async def test_run_cli_flow_writes_partial_atif_when_cancelled(tmp_path: Path) -> None:
     agent = _FailingMessageAgent("agent", asyncio.CancelledError())
     app = _DummyAgentApp(["agent"])
@@ -984,9 +1129,7 @@ async def test_parallel_atif_export_embeds_each_model_branch(tmp_path: Path) -> 
     request = _make_request(result_file=None, trajectory_output=output)
     messages = {
         name: [
-            PromptMessageExtended(
-                role="user", content=[TextContent(type="text", text="compare")]
-            ),
+            PromptMessageExtended(role="user", content=[TextContent(type="text", text="compare")]),
             PromptMessageExtended(
                 role="assistant", content=[TextContent(type="text", text=f"from {name}")]
             ),
@@ -1006,7 +1149,9 @@ async def test_parallel_atif_export_embeds_each_model_branch(tmp_path: Path) -> 
     payload = json.loads(output.read_text(encoding="utf-8"))
     assert payload["steps"][1]["llm_call_count"] == 0
     assert len(payload["steps"][1]["observation"]["results"]) == 2
-    assert [child["agent"]["extra"]["target_agent"] for child in payload["subagent_trajectories"]] == [
+    assert [
+        child["agent"]["extra"]["target_agent"] for child in payload["subagent_trajectories"]
+    ] == [
         "model-a",
         "model-b",
     ]

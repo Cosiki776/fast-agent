@@ -104,7 +104,7 @@ async def test_acp_prompt_saves_session_history(
     session_meta_path = session_dir / "session.json"
     assert session_meta_path.exists()
     metadata = json.loads(session_meta_path.read_text())
-    assert metadata["schema_version"] == 2
+    assert metadata["schema_version"] == 3
     active_agent = metadata["continuation"]["active_agent"]
     assert isinstance(active_agent, str)
     assert active_agent
@@ -190,8 +190,7 @@ async def test_acp_prompt_saves_session_history_in_configured_home(
 
     config_path = tmp_path / "fastagent.config.yaml"
     config_path.write_text(
-        (TEST_DIR / "fastagent.config.yaml").read_text()
-        + '\nhome: ".custom-fast-agent"\n'
+        (TEST_DIR / "fastagent.config.yaml").read_text() + '\nhome: ".custom-fast-agent"\n'
     )
 
     cmd = [

@@ -26,8 +26,7 @@ from fast_agent.ui.display_suppression import (
     display_status_enabled,
     display_tools_enabled,
 )
-from fast_agent.ui.markdown_helpers import prepare_markdown_content
-from fast_agent.ui.markdown_renderables import build_markdown_renderable
+from fast_agent.ui.markdown import build_markdown_renderable, prepare_markdown_content
 from fast_agent.ui.mcp_ui_utils import UILink
 from fast_agent.ui.mermaid_utils import (
     MermaidDiagram,
@@ -37,6 +36,10 @@ from fast_agent.ui.mermaid_utils import (
 )
 from fast_agent.ui.message_primitives import MESSAGE_CONFIGS, MessageType
 from fast_agent.ui.message_styles import A3MessageStyle
+from fast_agent.ui.progress.process_poll import (
+    ProcessMonitorStats,
+    render_process_monitor_stats,
+)
 from fast_agent.ui.shell_output_truncation import format_shell_output_line_count
 from fast_agent.ui.streaming import (
     NullStreamingHandle as _NullStreamingHandle,
@@ -47,7 +50,7 @@ from fast_agent.ui.streaming import (
 from fast_agent.ui.streaming import (
     StreamingMessageHandle as _StreamingMessageHandle,
 )
-from fast_agent.ui.streaming_preferences import (
+from fast_agent.ui.streaming.preferences import (
     StreamingPreferences,
     resolve_streaming_preferences,
 )
@@ -363,6 +366,85 @@ class ConsoleDisplay:
         console.console.print(line)
         for _ in range(self._style.shell_exit_spacing_after):
             console.console.print()
+
+    def show_managed_process_status(
+        self,
+        *,
+        process_id: str,
+        status: str,
+        reason: str | None,
+        elapsed_seconds: float,
+        os_process_id: int | None,
+    ) -> None:
+        """Display a compact, nonduplicating managed-process lifecycle line."""
+        detail_parts = [status]
+        if reason == "background":
+            detail_parts.append("background")
+        elif reason == "idle":
+            detail_parts.append("idle yield")
+        elif reason == "foreground":
+            detail_parts.append("foreground yield")
+        detail_parts.append(self._format_elapsed(elapsed_seconds))
+        if os_process_id is not None:
+            detail_parts.append(f"pid {os_process_id}")
+
+        line = Text("▎", style="dim")
+        line.append("▶ ", style="yellow")
+        line.append(process_id, style="bold")
+        line.append(" ")
+        line.append(" • ".join(detail_parts), style="dim")
+        console.console.print()
+        console.console.print(line)
+        for _ in range(self._style.shell_exit_spacing_after):
+            console.console.print()
+
+    def show_managed_process_poll(
+        self,
+        *,
+        name: str | None,
+        process_id: str,
+        command: str | None,
+        elapsed_seconds: float | None,
+        wait_sec: int | None,
+        has_observed_output: bool | None,
+        seconds_since_last_output: float | None,
+        total_output_bytes: int | None,
+        seconds_since_last_stdout: float | None = None,
+        seconds_since_last_stderr: float | None = None,
+        stdout_bytes: int | None = None,
+        stderr_bytes: int | None = None,
+        tool_call_id: str | None = None,
+    ) -> None:
+        """Display a one-line poll heartbeat when live progress is disabled."""
+        del wait_sec  # retained for call-site compatibility; poll countdown is live-only
+        line = Text("▎", style="magenta")
+        line.append("◀ ", style="dim magenta")
+        if name:
+            line.append(name, style="magenta")
+            line.append(" ")
+        line.append("monitoring", style="bold magenta")
+        line.append(" · ", style="dim")
+        line.append(process_id, style="bold")
+        stdout_age = seconds_since_last_stdout
+        stderr_age = seconds_since_last_stderr
+        line.append(" · ", style="dim")
+        line.append_text(
+            render_process_monitor_stats(
+                ProcessMonitorStats(
+                    elapsed_seconds=elapsed_seconds,
+                    stdout_age_seconds=stdout_age,
+                    stderr_age_seconds=stderr_age,
+                    stdout_bytes=stdout_bytes,
+                    stderr_bytes=stderr_bytes,
+                    total_output_bytes=total_output_bytes,
+                )
+            )
+        )
+        if command:
+            line.append(f" · {command}", style="dim")
+        if formatted_id := format_tool_call_id(tool_call_id):
+            line.append(f" · id: {formatted_id}", style="dim")
+        console.console.print(line)
 
     def _format_header_line(
         self,
@@ -1060,7 +1142,7 @@ class ConsoleDisplay:
         cursor_suffix: str = "",
         close_incomplete_fences: bool = False,
     ) -> RenderableType:
-        from fast_agent.ui.markdown_renderables import build_markdown_renderable
+        from fast_agent.ui.markdown import build_markdown_renderable
 
         return build_markdown_renderable(
             text,
@@ -1629,11 +1711,8 @@ class ConsoleDisplay:
         accumulator = agent.usage_accumulator
         if not accumulator:
             return 0, 0
-        summary = accumulator.get_summary()
-        tokens = summary.get("cumulative_input_tokens", 0) + summary.get(
-            "cumulative_output_tokens", 0
-        )
-        return tokens, summary.get("cumulative_tool_calls", 0)
+        summary = accumulator.summary
+        return summary.total or 0, summary.tool_calls
 
     @classmethod
     def _parallel_agent_result(cls, agent: Any) -> ParallelAgentDisplayResult | None:

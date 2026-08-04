@@ -216,6 +216,26 @@ def test_model_query_temperature():
     assert config.temperature == 0.35
 
 
+def test_model_query_max_tokens() -> None:
+    config = ModelFactory.parse_model_string("zai/glm-5.2?reasoning=max&max_tokens=48000")
+
+    assert config.provider == Provider.ZAI
+    assert config.model_name == "glm-5.2"
+    assert config.max_tokens == 48_000
+
+
+def test_model_query_max_tokens_aliases_preserve_url_order() -> None:
+    config = ModelFactory.parse_model_string("zai/glm-5.2?maxTokens=32000&max_tokens=48000")
+
+    assert config.max_tokens == 48_000
+
+
+@pytest.mark.parametrize("value", ["", "0", "-1", "1.5", "many"])
+def test_invalid_max_tokens_query(value: str) -> None:
+    with pytest.raises(ModelConfigError, match="Invalid max_tokens query value"):
+        ModelFactory.parse_model_string(f"zai/glm-5.2?max_tokens={value}")
+
+
 def test_model_query_temp_alias():
     config = ModelFactory.parse_model_string("gpt-5?temp=0.2")
     assert config.temperature == 0.2
@@ -386,6 +406,28 @@ def test_model_query_transport_websocket_alias():
     assert config.transport == "websocket"
 
 
+def test_codexplan_resolves_validated_process_poll_folding() -> None:
+    resolved = ModelFactory.resolve_model_spec("codexplan")
+
+    assert resolved.model_params is not None
+    assert resolved.model_params.managed_process_poll_folding is True
+
+
+@pytest.mark.parametrize("provider", ["responses", "codexresponses"])
+@pytest.mark.parametrize(
+    "reasoning",
+    ["none", "low", "medium", "high", "xhigh", "max"],
+)
+def test_gpt5_poll_folding_is_independent_of_reasoning_level(
+    provider: str,
+    reasoning: str,
+) -> None:
+    resolved = ModelFactory.resolve_model_spec(f"{provider}.gpt-5.6?reasoning={reasoning}")
+
+    assert resolved.model_params is not None
+    assert resolved.model_params.managed_process_poll_folding is True
+
+
 def test_model_query_transport_normalizes_case_and_spacing():
     config = ModelFactory.parse_model_string("codexplan?transport=%20WS%20")
     assert config.transport == "websocket"
@@ -416,6 +458,26 @@ def test_model_query_service_tier_normalizes_case_and_spacing():
 def test_invalid_service_tier_query():
     with pytest.raises(ModelConfigError, match="service_tier query value: 'turbo'"):
         ModelFactory.parse_model_string("responses.gpt-5-mini?service_tier=%20TURBO%20")
+
+
+def test_model_query_streaming_timeout() -> None:
+    config = ModelFactory.parse_model_string("responses.gpt-5-mini?streaming_timeout=45.5")
+
+    assert config.streaming_timeout == 45.5
+    assert config.streaming_timeout_configured is True
+
+
+def test_model_query_streaming_timeout_none_disables_enforcement() -> None:
+    config = ModelFactory.parse_model_string("responses.gpt-5-mini?streaming_timeout=%20NONE%20")
+
+    assert config.streaming_timeout is None
+    assert config.streaming_timeout_configured is True
+
+
+@pytest.mark.parametrize("value", ["", "0", "-1", "nan", "inf", "true", "soon"])
+def test_invalid_streaming_timeout_query(value: str) -> None:
+    with pytest.raises(ModelConfigError, match="Invalid streaming_timeout query value"):
+        ModelFactory.parse_model_string(f"responses.gpt-5-mini?streaming_timeout={value}")
 
 
 def test_codexresponses_fast_service_tier_query() -> None:
@@ -621,6 +683,43 @@ def test_factory_service_tier_query_respects_explicit_none_request_params() -> N
     assert llm.default_request_params.service_tier is None
 
 
+def test_factory_applies_model_streaming_timeout_default() -> None:
+    factory = ModelFactory.create_factory("responses.gpt-5?streaming_timeout=45.5")
+    llm = factory(LlmAgent(AgentConfig(name="Test Agent")))
+
+    assert llm.default_request_params.streaming_timeout == 45.5
+
+
+def test_factory_model_streaming_timeout_none_disables_enforcement() -> None:
+    factory = ModelFactory.create_factory("responses.gpt-5?streaming_timeout=none")
+    llm = factory(LlmAgent(AgentConfig(name="Test Agent")))
+
+    assert llm.default_request_params.streaming_timeout is None
+
+
+@pytest.mark.parametrize("request_timeout", [10.0, None])
+def test_factory_request_streaming_timeout_overrides_model_default(
+    request_timeout: float | None,
+) -> None:
+    factory = ModelFactory.create_factory("responses.gpt-5?streaming_timeout=45.5")
+    llm = factory(
+        LlmAgent(AgentConfig(name="Test Agent")),
+        request_params=RequestParams(streaming_timeout=request_timeout),
+    )
+
+    assert llm.default_request_params.streaming_timeout == request_timeout
+
+
+def test_model_streaming_timeout_query_overrides_preset_default() -> None:
+    config = ModelFactory.parse_model_string(
+        "timed?streaming_timeout=none",
+        presets={"timed": "responses.gpt-5?streaming_timeout=45.5"},
+    )
+
+    assert config.streaming_timeout is None
+    assert config.streaming_timeout_configured is True
+
+
 def test_factory_codexresponses_explicit_flex_request_params_rejected() -> None:
     factory = ModelFactory.create_factory("codexresponses.gpt-5.4")
 
@@ -753,6 +852,13 @@ def test_builtin_glm_alias_uses_glm_52_default() -> None:
     assert legacy.model_name == "zai-org/GLM-5:novita"
 
 
+def test_zaiglm_alias_uses_native_zai_provider() -> None:
+    config = ModelFactory.parse_model_string("zaiglm")
+
+    assert config.provider == Provider.ZAI
+    assert config.model_name == "glm-5.2"
+
+
 def test_opus_alias_resolves_to_current_catalog_model():
     opus_entry = next(
         entry
@@ -775,7 +881,11 @@ def test_claude_alias_resolves_to_sonnet_46():
 
     config = ModelFactory.parse_model_string("opus4")
     assert config.provider == Provider.ANTHROPIC
-    assert config.model_name == ModelFactory.parse_model_string("opus").model_name
+    assert config.model_name == "claude-opus-4-8"
+
+    config = ModelFactory.parse_model_string("opus5")
+    assert config.provider == Provider.ANTHROPIC
+    assert config.model_name == "claude-opus-5"
 
     config = ModelFactory.parse_model_string("opus46")
     assert config.provider == Provider.ANTHROPIC
@@ -784,6 +894,10 @@ def test_claude_alias_resolves_to_sonnet_46():
     config = ModelFactory.parse_model_string("opus47")
     assert config.provider == Provider.ANTHROPIC
     assert config.model_name == "claude-opus-4-7"
+
+    config = ModelFactory.parse_model_string("opus48")
+    assert config.provider == Provider.ANTHROPIC
+    assert config.model_name == "claude-opus-4-8"
 
     config = ModelFactory.parse_model_string("fable")
     assert config.provider == Provider.ANTHROPIC
@@ -819,10 +933,10 @@ def test_gemini35_flash_aliases_resolve_to_current_google_flash(alias: str):
     assert config.model_name == "gemini-3.5-flash"
 
 
-def test_deepseek_alias_resolves_to_direct_deepseek_v4_pro():
+def test_deepseek_alias_resolves_to_deepseek_responses_model():
     config = ModelFactory.parse_model_string("deepseek")
     assert config.provider == Provider.DEEPSEEK
-    assert config.model_name == "deepseek-v4-pro"
+    assert config.model_name == "deepseek-v4-flash"
 
 
 def test_deepseek_hf_aliases_resolve_to_hf_deepseek_v4_pro():
@@ -832,23 +946,29 @@ def test_deepseek_hf_aliases_resolve_to_hf_deepseek_v4_pro():
         assert config.model_name == "deepseek-ai/DeepSeek-V4-Pro:together"
 
 
-def test_deepseek_direct_aliases_resolve_to_official_provider():
-    config = ModelFactory.parse_model_string("deepseek-v4-pro")
-    assert config.provider == Provider.DEEPSEEK
-    assert config.model_name == "deepseek-v4-pro"
-
-    for alias in ("deepseek4", "deepseek4pro", "deepseekv4pro"):
-        config = ModelFactory.parse_model_string(alias)
-        assert config.provider == Provider.DEEPSEEK
-        assert config.model_name == "deepseek-v4-pro"
-
-    config = ModelFactory.parse_model_string("deepseek4flash")
+def test_deepseek_responses_model_resolves_to_official_provider():
+    config = ModelFactory.parse_model_string("deepseek-v4-flash")
     assert config.provider == Provider.DEEPSEEK
     assert config.model_name == "deepseek-v4-flash"
 
-    config = ModelFactory.parse_model_string("deepseek4pro-direct")
-    assert config.provider == Provider.DEEPSEEK
-    assert config.model_name == "deepseek-v4-pro"
+
+@pytest.mark.parametrize(
+    "legacy_model",
+    (
+        "deepseek4",
+        "deepseek4pro",
+        "deepseekv4pro",
+        "deepseek-direct",
+        "deepseek4flash",
+        "deepseek4pro-direct",
+        "deepseek-reasoner",
+        "deepseek-v4-pro",
+        "deepseek-chat",
+    ),
+)
+def test_legacy_native_deepseek_models_are_rejected(legacy_model: str):
+    with pytest.raises(ModelConfigError, match="Unknown model or provider"):
+        ModelFactory.parse_model_string(legacy_model)
 
 
 def test_hf_routed_gpt_oss_alias_resolves_model_metadata():
@@ -1090,6 +1210,22 @@ def test_factory_passes_temperature_query_to_request_params():
     agent = LlmAgent(AgentConfig(name="test"))
     llm = factory(agent)
     assert llm.default_request_params.temperature == 0.42
+
+
+def test_factory_passes_max_tokens_query_to_request_params() -> None:
+    factory = ModelFactory.create_factory("zai/glm-5.2?reasoning=max&max_tokens=48000")
+    agent = LlmAgent(AgentConfig(name="test"))
+    llm = factory(agent)
+
+    assert llm.default_request_params.maxTokens == 48_000
+
+
+def test_factory_max_tokens_query_overrides_explicit_request_params() -> None:
+    factory = ModelFactory.create_factory("zai/glm-5.2?reasoning=max&max_tokens=48000")
+    agent = LlmAgent(AgentConfig(name="test"))
+    llm = factory(agent, request_params=RequestParams(maxTokens=16_000))
+
+    assert llm.default_request_params.maxTokens == 48_000
 
 
 def test_model_sampling_query_aliases_preserve_url_order() -> None:

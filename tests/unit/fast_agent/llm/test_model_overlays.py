@@ -29,12 +29,14 @@ from fast_agent.agents.llm_agent import LlmAgent
 from fast_agent.llm.model_database import ModelDatabase
 from fast_agent.llm.model_factory import ModelFactory
 from fast_agent.llm.model_overlays import (
+    ModelOverlayDefaults,
     build_model_overlay_manifest_from_database,
     load_model_overlay_registry,
 )
 from fast_agent.llm.model_selection import ModelSelectionCatalog
 from fast_agent.llm.provider.openai.openresponses import OpenResponsesLLM
 from fast_agent.llm.provider_types import Provider
+from fast_agent.types import RequestParams
 from fast_agent.ui.model_picker_common import build_snapshot
 
 
@@ -88,6 +90,12 @@ def test_export_preserves_explicit_provider_for_namespaced_model() -> None:
     assert manifest.model == "moonshotai/kimi-k2"
 
 
+def test_export_preserves_managed_process_poll_folding_policy() -> None:
+    manifest = build_model_overlay_manifest_from_database("xai.grok-4.5")
+
+    assert manifest.metadata.managed_process_poll_folding is True
+
+
 def test_export_preserves_explicit_provider_over_catalog_default() -> None:
     manifest = build_model_overlay_manifest_from_database("openrouter.gpt-4o")
 
@@ -132,6 +140,58 @@ def test_export_preserves_bare_hf_namespace_that_matches_provider() -> None:
 
     assert manifest.provider == Provider.HUGGINGFACE
     assert manifest.model == "openai/gpt-oss-120b"
+
+
+def test_overlay_configures_process_poll_default_wait(tmp_path: Path) -> None:
+    home = tmp_path / ".fast-agent"
+    _write_overlay(
+        home,
+        "poll-wait.yaml",
+        """
+name: poll-wait
+provider: openresponses
+model: overlay-tests/Poll-Wait
+connection:
+  base_url: http://localhost:8080/v1
+  auth: none
+metadata:
+  context_window: 65536
+  max_output_tokens: 4096
+  process_poll_default_wait_seconds: 30
+""".strip(),
+    )
+
+    with _isolated_overlay_environment(home, cleanup_base=tmp_path):
+        resolved = ModelFactory.resolve_model_spec("poll-wait")
+
+    assert resolved.model_params is not None
+    assert resolved.model_params.process_poll_default_wait_seconds == 30
+
+
+def test_overlay_configures_shell_output_byte_limit(tmp_path: Path) -> None:
+    home = tmp_path / ".fast-agent"
+    _write_overlay(
+        home,
+        "shell-output.yaml",
+        """
+name: shell-output
+provider: openresponses
+model: overlay-tests/Shell-Output
+connection:
+  base_url: http://localhost:8080/v1
+  auth: none
+metadata:
+  context_window: 65536
+  max_output_tokens: 4096
+  shell_output_byte_limit: 12000
+""".strip(),
+    )
+
+    with _isolated_overlay_environment(home, cleanup_base=tmp_path):
+        resolved = ModelFactory.resolve_model_spec("shell-output")
+
+    assert resolved.model_params is not None
+    assert resolved.model_params.shell_output_byte_limit == 12_000
 
 
 def test_same_provider_overlays_create_distinct_openresponses_clients(tmp_path: Path) -> None:
@@ -262,6 +322,72 @@ metadata:
         )
         assert picker_entry.local is True
         assert picker_entry.description == "Local picker entry"
+
+
+def test_overlay_streaming_timeout_is_a_request_default(tmp_path: Path) -> None:
+    home = tmp_path / ".fast-agent"
+    _write_overlay(
+        home,
+        "stream-timeout.yaml",
+        """
+name: stream-timeout
+provider: openresponses
+model: overlay-tests/Stream-Timeout
+connection:
+  base_url: http://localhost:8080/v1
+  auth: none
+defaults:
+  streaming_timeout: 45.5
+""".strip(),
+    )
+
+    with _isolated_overlay_environment(home, cleanup_base=tmp_path):
+        presets = ModelFactory.get_runtime_presets()
+        assert presets["stream-timeout"] == (
+            "openresponses.overlay-tests/Stream-Timeout?streaming_timeout=45.5"
+        )
+
+        default_llm = ModelFactory.create_factory("stream-timeout")(
+            LlmAgent(AgentConfig(name="default"))
+        )
+        overridden_llm = ModelFactory.create_factory("stream-timeout")(
+            LlmAgent(AgentConfig(name="override")),
+            request_params=RequestParams(streaming_timeout=None),
+        )
+
+    assert default_llm.default_request_params.streaming_timeout == 45.5
+    assert overridden_llm.default_request_params.streaming_timeout is None
+
+
+def test_overlay_streaming_timeout_none_disables_enforcement(tmp_path: Path) -> None:
+    home = tmp_path / ".fast-agent"
+    _write_overlay(
+        home,
+        "no-stream-timeout.yaml",
+        """
+name: no-stream-timeout
+provider: openresponses
+model: overlay-tests/No-Stream-Timeout
+connection:
+  base_url: http://localhost:8080/v1
+  auth: none
+defaults:
+  streaming_timeout: none
+""".strip(),
+    )
+
+    with _isolated_overlay_environment(home, cleanup_base=tmp_path):
+        llm = ModelFactory.create_factory("no-stream-timeout")(
+            LlmAgent(AgentConfig(name="disabled"))
+        )
+
+    assert llm.default_request_params.streaming_timeout is None
+
+
+@pytest.mark.parametrize("value", [0, -1, float("nan"), float("inf"), True, "soon"])
+def test_overlay_rejects_invalid_streaming_timeout(value: object) -> None:
+    with pytest.raises(ValueError, match="streaming_timeout"):
+        ModelOverlayDefaults.model_validate({"streaming_timeout": value})
 
 
 def test_same_wire_model_overlays_keep_distinct_resolved_metadata(tmp_path: Path) -> None:

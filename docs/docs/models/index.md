@@ -9,7 +9,7 @@ social:
 
 **`fast-agent`** has native support for **OpenAI Responses** and **Chat Completions**, **Anthropic Messages**, **Google GenAI** and **Amazon Bedrock** APIs. 
 
-OpenAI Codex users can use their subscription with **`fast-agent`**, using their existing installation or logging in with `fast-agent auth codexplan`. 
+OpenAI Codex users can use their subscription with **`fast-agent`**, using their existing installation or logging in with `fast-agent auth login codex`.
 
 Chat Completions models are also available via **Microsoft Azure**, and supported Anthropic models are available on **Google Vertex**.
 
@@ -81,7 +81,7 @@ Start with the native providers for common use, or use additional providers for 
 | Provider family      | Start with                                               | Main features                                                                                                                                   |
 | -------------------- | -------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
 | OpenAI Responses     | `gpt55`, `gpt54`, `gpt52`, `gpt-5-mini`, `codex`         | GPT-5 class models, reasoning, text verbosity, structured outputs, `web_search`, SSE/WebSocket transports, service tiers, connectors            |
-| Anthropic            | `fable`, `sonnet`, `opus`, `opus48`, `opus47`, `haiku`   | Claude 4.x, prompt caching, adaptive reasoning/effort, structured outputs, `web_search`, `web_fetch`, long context, task budget where supported |
+| Anthropic            | `fable`, `sonnet`, `opus`, `opus5`, `opus48`, `haiku`    | Claude 4.x/5, prompt caching, adaptive reasoning/effort, structured outputs, `web_search`, `web_fetch` where supported, long context, task budget |
 | Google               | `gemini`, `gemini35flash`                                | Gemini native API, structured outputs, thinking controls, text/image/PDF/audio/video input, YouTube links through media attachments             |
 | xAI / Grok           | `grok43`, `grok45`, `grok-4.3`, `grok-4.5`               | Grok models, reasoning controls, `web_search`, `x_search`, SSE/WebSocket transports                                                             |
 | Hugging Face         | `kimi`, `kimi26instant`, `deepseek-hf`, `glm`, `minimax` | Hugging Face Inference Providers routing, curated aliases, and HF MCP authentication                                                            |
@@ -118,7 +118,8 @@ fast-agent --model sonnet
 fast-agent --model "sonnet?reasoning=4096"
 fast-agent --model "opus?reasoning=auto"
 fast-agent --model "opus?reasoning=xhigh"
-fast-agent --model "opus?web_search=on&web_fetch=on"
+fast-agent --model "opus?web_search=on"
+fast-agent --model "opus48?web_search=on&web_fetch=on"
 fast-agent --model "opus?task_budget=128k"
 ```
 
@@ -133,8 +134,9 @@ Useful query parameters and config:
 - `anthropic.cache_mode: auto|prompt|off`
 - `anthropic.cache_ttl: 5m|1h`
 
-`opus` currently resolves to `claude-opus-4-8`; use `opus47` or `opus46` when you need to pin an
-older Opus generation. Claude Opus 4.7+ uses adaptive reasoning rather than fixed thinking budgets:
+`opus` and `opus5` resolve to `claude-opus-5`; use `opus48`, `opus47`, or `opus46` to pin an older
+Opus generation. Opus 5 does not support `web_fetch`, so use `web_search` alone or pin `opus48`
+when fetch is required. Claude Opus 4.7+ uses adaptive reasoning rather than fixed thinking budgets:
 `reasoning=auto` lets the model choose, effort levels tune depth and token spend, and `task_budget`
 sets a model-visible budget for a whole agentic loop. `task_budget` is separate from `max_tokens`,
 which remains the enforced per-response ceiling.
@@ -209,14 +211,16 @@ provider.model_name[?reasoning=value][&query=value...]
 - **model_name**: the model or deployment name
 - **query parameters**: provider/model-specific overrides such as `reasoning`, `structured`,
   `context`, `transport`, `service_tier`, `temperature` (`temp` alias), `web_search`,
-  `web_fetch`, `x_search`, and `task_budget`
+  `web_fetch`, `x_search`, `task_budget`, `max_tokens`, and `streaming_timeout`
 
 Examples:
 
 - `responses.gpt-5.5?reasoning=medium`
+- `responses.gpt-5.5?streaming_timeout=300`
 - `responses.gpt-5.5?web_search=on`
 - `sonnet?reasoning=4096`
-- `opus?web_search=on&web_fetch=on`
+- `opus?web_search=on`
+- `opus48?web_search=on&web_fetch=on`
 - `gemini3?reasoning=auto`
 - `xai.grok-4.3?x_search=on`
 - `kimi26instant`
@@ -248,6 +252,28 @@ You can also set reasoning directly in the model string query. This is especiall
 - `xai.grok-4.3?reasoning=none`
 
 Reasoning, Verbosity and Task Budget settings are also available from the `/model` command, or by using ++f6++ or ++f7++ keys.
+
+### Stream idle timeout
+
+Set the maximum time between provider stream events with `streaming_timeout`:
+
+- `responses.gpt-5.5?streaming_timeout=300` waits up to 300 seconds between events.
+- `responses.gpt-5.5?streaming_timeout=none` disables stream-idle enforcement.
+
+The value must be a positive, finite number of seconds or `none`. An explicit
+request-level `RequestParams(streaming_timeout=...)` value takes precedence over the model-string
+default.
+
+### Output token limit
+
+Set the positive per-response output-token limit with `max_tokens`:
+
+- `zai/glm-5.2?reasoning=max&max_tokens=48000`
+- `responses.gpt-5.5?max_tokens=64000`
+
+The model-string value overrides the model metadata default and an explicit
+`RequestParams(maxTokens=...)` value. Providers normalize it to their wire-level request field;
+for native Z.ai Chat Completions this is `max_tokens`.
 
 ### Temperature and sampling
 

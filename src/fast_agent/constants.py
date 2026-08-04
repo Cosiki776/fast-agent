@@ -35,7 +35,10 @@ FAST_AGENT_URL_ELICITATION_CHANNEL = "fast-agent-url-elicitation"
 FAST_AGENT_TIMING = "fast-agent-timing"
 FAST_AGENT_TOOL_METADATA = "fast-agent-tool-metadata"
 FAST_AGENT_TOOL_TIMING = "fast-agent-tool-timing"
+FAST_AGENT_SHELL_PROCESS_METADATA = "fast-agent-shell-process-metadata"
+FAST_AGENT_PROCESS_POLL_FOLD = "fast-agent-process-poll-fold"
 FAST_AGENT_USAGE = "fast-agent-usage"
+FAST_AGENT_RETRY = "fast-agent-retry"
 FAST_AGENT_SYNTHETIC_FINAL_CHANNEL = "fast-agent-synthetic-final"
 FAST_AGENT_PENDING_MEDIA_ATTACHMENTS = "fast-agent-pending-media-attachments"
 """Content blocks staged by attach_media for injection as user input on the next LLM call."""
@@ -52,13 +55,13 @@ def should_parallelize_tool_calls(tool_call_count: int) -> bool:
 
 
 # should we have MAX_TOOL_CALLS instead to constrain by number of tools rather than turns...?
-DEFAULT_MAX_ITERATIONS = 199
+DEFAULT_MAX_ITERATIONS = 9999
 """Maximum number of User/Assistant turns to take"""
 
 DEFAULT_STREAMING_TIMEOUT = 120.0
 """Default idle timeout in seconds between provider streaming events."""
 
-DEFAULT_TERMINAL_OUTPUT_BYTE_LIMIT = 8192
+DEFAULT_TERMINAL_OUTPUT_BYTE_LIMIT = 16_000
 """Baseline byte limit for ACP terminal output when no model info exists."""
 
 TERMINAL_OUTPUT_TOKEN_RATIO = 0.83
@@ -76,6 +79,9 @@ MAX_TERMINAL_OUTPUT_TOKEN_LIMIT = 10_000
 
 MAX_TERMINAL_OUTPUT_BYTE_LIMIT = int(MAX_TERMINAL_OUTPUT_TOKEN_LIMIT * TERMINAL_BYTES_PER_TOKEN)
 """Hard cap on default ACP terminal output (~10k tokens with TERMINAL_BYTES_PER_TOKEN=3.3)."""
+
+MAX_MANAGED_SHELL_PROCESSES = 32
+"""Maximum number of retained managed shell process records per runtime."""
 
 DEFAULT_AGENT_INSTRUCTION = """You are a helpful AI Agent.
 
@@ -116,6 +122,9 @@ FAST_AGENT_SHELL_CHILD_ENV = "FAST_AGENT_SHELL_CHILD"
 FAST_AGENT_RUNTIME_HOME = "FAST_AGENT_RUNTIME_HOME"
 """Resolved active fast-agent home exported to shell commands and automation."""
 
+FAST_AGENT_AUTH_FILE = "FAST_AGENT_AUTH_FILE"
+"""Explicit portable provider credential file."""
+
 
 @dataclass(frozen=True)
 class DocumentedEnvVar:
@@ -133,6 +142,12 @@ DOCUMENTED_ENV_VARS = (
         value=FAST_AGENT_SHELL_CHILD_ENV,
         purpose="Set to `1` in child shells opened from the TUI with `!`.",
         surface="tui",
+    ),
+    DocumentedEnvVar(
+        symbol="FAST_AGENT_AUTH_FILE",
+        value=FAST_AGENT_AUTH_FILE,
+        purpose="Explicit portable provider OAuth credential file.",
+        surface="auth",
     ),
     DocumentedEnvVar(
         symbol="FAST_AGENT_RUNTIME_HOME",

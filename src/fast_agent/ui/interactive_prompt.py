@@ -86,6 +86,7 @@ _MCP_RUNTIME_HANDLERS_COMPAT = mcp_runtime_handlers
 SendFunc = Callable[[str | PromptMessage | PromptMessageExtended, str], Awaitable[str]]
 type PromptLoopResult = str | ShellExecutionResult
 
+
 @runtime_checkable
 class DisplayCapable(Protocol):
     @property
@@ -452,6 +453,9 @@ class InteractivePrompt:
 
         if status == "history_empty":
             return "History was already empty."
+
+        if status == "appended_completed_tool_result":
+            return "Preserved the completed tool result for the interrupted follow-up request."
 
         if status == "appended_interrupted_tool_result":
             return (

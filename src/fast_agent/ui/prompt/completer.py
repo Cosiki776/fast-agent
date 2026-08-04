@@ -317,6 +317,7 @@ class AgentCompleter(Completer):
             "usage": "Show current usage statistics",
             "markdown": "Show last assistant message without markdown formatting",
             "environment": "List configured execution environments",
+            "process": "Show active shell processes (/process --history for finished)",
             "resume": "Resume the last session or specified session id",
             "session": "Manage sessions (/session list|new|resume|title|fork|delete|pin|unpin|export)",
             "card": "Load an AgentCard (add --tool to attach/remove as tool)",
@@ -780,7 +781,7 @@ class AgentCompleter(Completer):
         manager = self.session_manager or get_session_manager()
         current_session = manager.current_session
         current_session_id = current_session.info.name if current_session is not None else None
-        sessions = apply_session_window(manager.list_sessions())
+        sessions = apply_session_window(manager.list_sessions(include_empty=False))
         for session_info in sessions:
             session_id = session_info.name
             if not include_current and session_id == current_session_id:
@@ -1464,8 +1465,7 @@ class AgentCompleter(Completer):
             return []
         result = await agent.list_tools()
         return [
-            (tool.name, tool.description or "View complete JSON schema")
-            for tool in result.tools
+            (tool.name, tool.description or "View complete JSON schema") for tool in result.tools
         ]
 
     @staticmethod

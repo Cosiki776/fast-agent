@@ -31,6 +31,11 @@ from fast_agent.tools.skill_reader import READ_SKILL_TOOL_NAME
 from fast_agent.types import PromptMessageExtended
 from fast_agent.types.llm_stop_reason import LlmStopReason
 from fast_agent.ui.console_display import ConsoleDisplay
+from fast_agent.utils.tool_names import (
+    BASH_TOOL_NAME,
+    EXECUTE_TOOL_NAME,
+    PROCESS_TOOL_NAME,
+)
 
 
 class _DisplayCall(TypedDict):
@@ -89,6 +94,11 @@ def test_shell_edit_tool_flags_follow_mode_contract() -> None:
         apply_patch=False,
         edit_file=True,
     )
+    assert ShellEditToolFlags.from_mode(ShellEditToolMode.EDIT_FILE) == ShellEditToolFlags(
+        write_text_file=False,
+        apply_patch=False,
+        edit_file=True,
+    )
     assert ShellEditToolFlags.from_mode(ShellEditToolMode.APPLY_PATCH) == ShellEditToolFlags(
         write_text_file=False,
         apply_patch=True,
@@ -119,7 +129,8 @@ class StubLLM:
     def __init__(self, model_name: str) -> None:
         self.model_name = model_name
         self.resolved_model = SimpleNamespace(
-            max_output_tokens=ModelDatabase.get_max_output_tokens(model_name)
+            max_output_tokens=ModelDatabase.get_max_output_tokens(model_name),
+            model_params=ModelDatabase.get_model_params(model_name),
         )
         self.instruction = ""
         self.default_request_params = RequestParams()
@@ -323,7 +334,7 @@ async def test_shell_and_card_tools_are_both_highlighted() -> None:
         content=[TextContent(type="text", text="response")],
         tool_calls={
             "shell": CallToolRequest(
-                params=CallToolRequestParams(name="execute", arguments={"command": "pwd"})
+                params=CallToolRequestParams(name="bash", arguments={"command": "pwd"})
             ),
             "lsp": CallToolRequest(
                 params=CallToolRequestParams(
@@ -339,7 +350,7 @@ async def test_shell_and_card_tools_are_both_highlighted() -> None:
     call = capture_display.calls[-1]
     bottom_items = _bottom_items(call)
     assert call["highlight_indexes"] == [
-        bottom_items.index("bash"),
+        0,
         bottom_items.index("card_tools"),
     ]
 
@@ -409,6 +420,30 @@ async def test_shell_output_limit_refreshes_after_llm_attach() -> None:
 
 
 @pytest.mark.asyncio
+async def test_attach_media_auto_enables_after_anthropic_llm_attach() -> None:
+    config = AgentConfig(
+        name="test",
+        instruction="Instruction",
+        servers=[],
+        shell=True,
+        model="sonnet",
+    )
+    agent = McpAgent(config=config, context=Context())
+
+    initial_tool_names = {tool.name for tool in (await agent.list_tools()).tools}
+    assert "attach_media" not in initial_tool_names
+
+    await agent.attach_llm(_stub_llm_factory("claude-sonnet-5"), model="sonnet")
+
+    attached_tool_names = {tool.name for tool in (await agent.list_tools()).tools}
+    assert "attach_media" in attached_tool_names
+    assert "write_text_file" not in attached_tool_names
+    assert "edit_file" in attached_tool_names
+
+    await agent._aggregator.close()
+
+
+@pytest.mark.asyncio
 async def test_shell_output_limit_falls_back_when_llm_has_no_resolved_model() -> None:
     config = AgentConfig(name="test", instruction="Instruction", servers=[], shell=True)
     agent = McpAgent(config=config, context=Context())
@@ -433,7 +468,8 @@ async def test_shell_can_include_local_read_text_file_when_enabled(tmp_path: Pat
     agent = McpAgent(config=config, context=Context(config=settings))
 
     tool_names = {tool.name for tool in (await agent.list_tools()).tools}
-    assert "execute" in tool_names
+    assert "bash" in tool_names
+    assert "process" in tool_names
     assert "read_text_file" in tool_names
     assert "write_text_file" in tool_names
     assert "edit_file" in tool_names
@@ -706,7 +742,8 @@ async def test_local_read_text_file_option_is_enabled_by_default() -> None:
     agent = McpAgent(config=config, context=Context())
 
     tool_names = {tool.name for tool in (await agent.list_tools()).tools}
-    assert "execute" in tool_names
+    assert "bash" in tool_names
+    assert "process" in tool_names
     assert "read_text_file" in tool_names
     assert "write_text_file" in tool_names
     assert "edit_file" in tool_names
@@ -758,6 +795,41 @@ async def test_write_text_file_auto_mode_keeps_write_and_edit_for_pre_52_gpt5_mo
     tool_names = {tool.name for tool in (await agent.list_tools()).tools}
     assert "read_text_file" in tool_names
     assert "write_text_file" in tool_names
+    assert "edit_file" in tool_names
+    assert "apply_patch" not in tool_names
+
+    await agent._aggregator.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "model_name",
+    [
+        "sonnet",
+        "claude-3-5-haiku",
+        "claude-haiku-4-5",
+        "claude-sonnet-5",
+        "claude-opus-4-8",
+        "claude-fable-5",
+        "anthropic-vertex.claude-sonnet-4-6",
+        "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+    ],
+)
+async def test_write_text_file_auto_mode_uses_edit_only_for_anthropic_series_models(
+    model_name: str,
+) -> None:
+    config = AgentConfig(
+        name="test",
+        instruction="Instruction",
+        servers=[],
+        shell=True,
+        model=model_name,
+    )
+    agent = McpAgent(config=config, context=Context())
+
+    tool_names = {tool.name for tool in (await agent.list_tools()).tools}
+    assert "read_text_file" in tool_names
+    assert "write_text_file" not in tool_names
     assert "edit_file" in tool_names
     assert "apply_patch" not in tool_names
 
@@ -835,6 +907,134 @@ async def test_write_text_file_mode_on_enables_tool_for_codex_models() -> None:
     assert "write_text_file" in tool_names
     assert "edit_file" in tool_names
     assert "apply_patch" not in tool_names
+
+    await agent._aggregator.close()
+
+
+@pytest.mark.asyncio
+async def test_write_text_file_mode_on_restores_tool_for_anthropic_models() -> None:
+    settings = Settings(shell_execution=ShellSettings(write_text_file_mode="on"))
+    config = AgentConfig(
+        name="test",
+        instruction="Instruction",
+        servers=[],
+        shell=True,
+        model="sonnet",
+    )
+    agent = McpAgent(config=config, context=Context(config=settings))
+
+    tool_names = {tool.name for tool in (await agent.list_tools()).tools}
+    assert "write_text_file" in tool_names
+    assert "edit_file" in tool_names
+    assert "apply_patch" not in tool_names
+
+    await agent._aggregator.close()
+
+
+@pytest.mark.asyncio
+async def test_default_shell_profile_exposes_facades_with_file_tools() -> None:
+    settings = Settings()
+    config = AgentConfig(
+        name="test",
+        instruction="Instruction",
+        servers=[],
+        shell=True,
+        model="sonnet",
+    )
+    agent = McpAgent(config=config, context=Context(config=settings))
+
+    tool_names = {tool.name for tool in (await agent.list_tools()).tools}
+    assert "bash" in tool_names
+    assert "process" in tool_names
+    assert "execute" not in tool_names
+    assert "poll_process" not in tool_names
+    assert "terminate_process" not in tool_names
+    assert "read_text_file" in tool_names
+    assert "edit_file" in tool_names
+
+    await agent._aggregator.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("model", "expects_extended_guidance"),
+    [
+        ("gpt-5.6-luna", True),
+        ("openai/gpt-5.6-sol", True),
+        ("deepseek.deepseek-v4-flash", False),
+        ("sonnet", False),
+    ],
+)
+async def test_minimal_shell_extended_guidance_is_gpt56_specific(
+    model: str,
+    expects_extended_guidance: bool,
+) -> None:
+    config = AgentConfig(
+        name="test",
+        instruction="Instruction",
+        servers=[],
+        shell=True,
+        model=model,
+    )
+    agent = McpAgent(config=config, context=Context(config=Settings()))
+
+    tools = {tool.name: tool for tool in (await agent.list_tools()).tools}
+    bash_description = tools["bash"].description or ""
+    process_description = tools["process"].description or ""
+
+    assert ("task-relevant verification" in bash_description) is expects_extended_guidance
+    assert (
+        "before relying on its result or ending the task" in process_description
+    ) is expects_extended_guidance
+
+    await agent._aggregator.close()
+
+
+@pytest.mark.asyncio
+async def test_minimal_process_planned_metadata_matches_runtime_dispatch() -> None:
+    settings = Settings()
+    config = AgentConfig(
+        name="test",
+        instruction="Instruction",
+        servers=[],
+        shell=True,
+    )
+    agent = McpAgent(config=config, context=Context(config=settings))
+
+    bash_metadata = agent._metadata_for_planned_tool(
+        tool_name="bash",
+        tool_args={"command": "service", "run_in_background": True},
+        local_tool=None,
+        is_external_runtime_tool=False,
+        is_filesystem_runtime_tool=False,
+        route_to_namespaced_candidate=False,
+    )
+    assert bash_metadata is not None
+    assert bash_metadata["background"] is True
+    assert bash_metadata["lifecycle"] == "persistent"
+
+    status_metadata = agent._metadata_for_planned_tool(
+        tool_name="process",
+        tool_args={"process_id": "process-1", "action": "status"},
+        local_tool=None,
+        is_external_runtime_tool=False,
+        is_filesystem_runtime_tool=False,
+        route_to_namespaced_candidate=False,
+    )
+    assert status_metadata is not None
+    assert status_metadata["action"] == "poll"
+    assert status_metadata["wait_sec"] == 0
+
+    stop_metadata = agent._metadata_for_planned_tool(
+        tool_name="process",
+        tool_args={"process_id": "process-1", "action": "stop"},
+        local_tool=None,
+        is_external_runtime_tool=False,
+        is_filesystem_runtime_tool=False,
+        route_to_namespaced_candidate=False,
+    )
+    assert stop_metadata is not None
+    assert stop_metadata["action"] == "terminate"
 
     await agent._aggregator.close()
 
@@ -1397,7 +1597,7 @@ async def test_shell_tool_use_turn_hides_bottom_bar_and_mentions_shell_access() 
     tool_calls = {
         "1": CallToolRequest(
             params=CallToolRequestParams(
-                name="execute",
+                name="bash",
                 arguments={"command": "pwd"},
             )
         )
@@ -1456,6 +1656,138 @@ async def test_read_text_file_tool_use_turn_hides_bottom_bar_without_extra_messa
 
 
 @pytest.mark.asyncio
+async def test_grok_catalog_shell_output_limit_applies_when_setting_is_omitted() -> None:
+    settings = Settings(shell_execution=ShellSettings())
+    config = AgentConfig(
+        name="test",
+        instruction="Instruction",
+        servers=[],
+        shell=True,
+        model="xai/grok-4.5?reasoning=high",
+    )
+    agent = McpAgent(config=config, context=Context(config=settings))
+
+    shell_runtime = agent.shell_runtime
+    assert shell_runtime is not None
+    assert shell_runtime.output_byte_limit == 16_000
+
+    await agent._aggregator.close()
+
+
+@pytest.mark.asyncio
+async def test_grok_uses_minimal_process_default_and_preserves_native_override() -> None:
+    minimal_agent = McpAgent(
+        config=AgentConfig(
+            name="minimal",
+            instruction="Instruction",
+            servers=[],
+            shell=True,
+            model="xai/grok-4.5?reasoning=high",
+        ),
+        context=Context(config=Settings(shell_execution=ShellSettings())),
+    )
+    minimal_runtime = minimal_agent.shell_runtime
+    assert minimal_runtime is not None
+    assert {tool.name for tool in minimal_runtime.tools} == {
+        BASH_TOOL_NAME,
+        PROCESS_TOOL_NAME,
+    }
+
+    native_agent = McpAgent(
+        config=AgentConfig(
+            name="native",
+            instruction="Instruction",
+            servers=[],
+            shell=True,
+            model="xai/grok-4.5?reasoning=high",
+        ),
+        context=Context(
+            config=Settings(
+                shell_execution=ShellSettings(tool_profile="native"),
+            )
+        ),
+    )
+    native_runtime = native_agent.shell_runtime
+    assert native_runtime is not None
+    assert native_runtime.owns_tool(EXECUTE_TOOL_NAME)
+    assert not native_runtime.owns_tool(BASH_TOOL_NAME)
+    assert not native_runtime.owns_tool(PROCESS_TOOL_NAME)
+
+    await minimal_agent._aggregator.close()
+    await native_agent._aggregator.close()
+
+
+@pytest.mark.asyncio
+async def test_default_shell_output_limit_returns_after_switching_away_from_grok() -> None:
+    settings = Settings(shell_execution=ShellSettings())
+    config = AgentConfig(
+        name="test",
+        instruction="Instruction",
+        servers=[],
+        shell=True,
+        model="xai/grok-4.5",
+    )
+    agent = McpAgent(config=config, context=Context(config=settings))
+
+    shell_runtime = agent.shell_runtime
+    assert shell_runtime is not None
+    assert shell_runtime.output_byte_limit == 16_000
+
+    agent._on_llm_attached(cast("Any", StubLLM("claude-opus-4-6")))
+
+    assert shell_runtime.output_byte_limit == DEFAULT_TERMINAL_OUTPUT_BYTE_LIMIT
+
+    await agent._aggregator.close()
+
+
+@pytest.mark.asyncio
+async def test_explicit_null_shell_output_limit_uses_automatic_model_sizing() -> None:
+    settings = Settings(shell_execution=ShellSettings(output_byte_limit=None))
+    config = AgentConfig(
+        name="test",
+        instruction="Instruction",
+        servers=[],
+        shell=True,
+        model="claude-opus-4-6",
+    )
+    agent = McpAgent(config=config, context=Context(config=settings))
+
+    shell_runtime = agent.shell_runtime
+    assert shell_runtime is not None
+    assert shell_runtime.output_byte_limit == calculate_terminal_output_limit_for_model(
+        "claude-opus-4-6"
+    )
+
+    await agent._aggregator.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("configured_limit", [8192, 32_000])
+async def test_explicit_shell_output_limit_overrides_grok_catalog(
+    configured_limit: int,
+) -> None:
+    settings = Settings(shell_execution=ShellSettings(output_byte_limit=configured_limit))
+    config = AgentConfig(
+        name="test",
+        instruction="Instruction",
+        servers=[],
+        shell=True,
+        model="xai/grok-4.5",
+    )
+    agent = McpAgent(config=config, context=Context(config=settings))
+
+    shell_runtime = agent.shell_runtime
+    assert shell_runtime is not None
+    assert shell_runtime.output_byte_limit == configured_limit
+
+    agent._on_llm_attached(cast("Any", StubLLM("xai/grok-4.5")))
+
+    assert shell_runtime.output_byte_limit == configured_limit
+
+    await agent._aggregator.close()
+
+
+@pytest.mark.asyncio
 async def test_shell_output_limit_override_is_preserved_after_llm_attach() -> None:
     settings = Settings(shell_execution=ShellSettings(output_byte_limit=9000))
     config = AgentConfig(name="test", instruction="Instruction", servers=[], shell=True)
@@ -1468,6 +1800,48 @@ async def test_shell_output_limit_override_is_preserved_after_llm_attach() -> No
     await agent.attach_llm(_stub_llm_factory("claude-opus-4-6"), model="opus")
 
     assert shell_runtime.output_byte_limit == 9000
+
+    await agent._aggregator.close()
+
+
+@pytest.mark.asyncio
+async def test_local_shell_result_is_not_retruncated_by_mcp_result_policy() -> None:
+    settings = Settings(shell_execution=ShellSettings(output_byte_limit=9000))
+    config = AgentConfig(name="test", instruction="Instruction", servers=[], shell=True)
+    agent = McpAgent(config=config, context=Context(config=settings))
+    output = "x" * 80
+
+    async def fake_call_tool(
+        name: str,
+        arguments: dict[str, object] | None = None,
+        tool_use_id: str | None = None,
+        *,
+        request_tool_handler: object | None = None,
+        request_params: RequestParams | None = None,
+    ) -> CallToolResult:
+        del name, arguments, tool_use_id, request_tool_handler, request_params
+        return CallToolResult(content=[TextContent(type="text", text=output)], isError=False)
+
+    agent.call_tool = cast("Any", fake_call_tool)
+    agent._model_tool_output_byte_limit = cast("Any", lambda _llm=None: 40)
+    request = PromptMessageExtended(
+        role="assistant",
+        content=[],
+        tool_calls={
+            "call-1": CallToolRequest(
+                params=CallToolRequestParams(
+                    name="bash",
+                    arguments={"command": "emit output"},
+                )
+            )
+        },
+    )
+
+    result = await agent.run_tools(request)
+
+    assert result.tool_results is not None
+    shell_result = result.tool_results["call-1"]
+    assert shell_result.content == [TextContent(type="text", text=output)]
 
     await agent._aggregator.close()
 
@@ -1517,6 +1891,10 @@ async def test_shell_call_forwards_parallel_display_flags() -> None:
                 inputSchema={"type": "object", "properties": {}},
             )
             self.calls: list[dict[str, object]] = []
+            self.tools = [self.tool]
+
+        def owns_tool(self, name: str) -> bool:
+            return name == self.tool.name
 
         def metadata(self, command: str | None) -> dict[str, object]:
             return {
@@ -1543,6 +1921,23 @@ async def test_shell_call_forwards_parallel_display_flags() -> None:
                 }
             )
             return CallToolResult(content=[TextContent(type="text", text="ok")], isError=False)
+
+        async def call_tool(
+            self,
+            name: str,
+            arguments: dict[str, object] | None = None,
+            tool_use_id: str | None = None,
+            *,
+            show_tool_call_id: bool = False,
+            defer_display_to_tool_result: bool = False,
+        ) -> CallToolResult:
+            assert name == self.tool.name
+            return await self.execute(
+                arguments,
+                tool_use_id,
+                show_tool_call_id=show_tool_call_id,
+                defer_display_to_tool_result=defer_display_to_tool_result,
+            )
 
     config = AgentConfig(name="test", instruction="Instruction", servers=[], shell=True)
     agent = McpAgent(config=config, context=Context())
@@ -1572,6 +1967,10 @@ async def test_parallel_shell_results_display_in_tool_call_order() -> None:
                 description="Run shell command",
                 inputSchema={"type": "object", "properties": {}},
             )
+            self.tools = [self.tool]
+
+        def owns_tool(self, name: str) -> bool:
+            return name == self.tool.name
 
         def metadata(self, command: str | None) -> dict[str, object]:
             return {
@@ -1601,6 +2000,23 @@ async def test_parallel_shell_results_display_in_tool_call_order() -> None:
             )
             setattr(result, "_suppress_display", not defer_display_to_tool_result)
             return result
+
+        async def call_tool(
+            self,
+            name: str,
+            arguments: dict[str, object] | None = None,
+            tool_use_id: str | None = None,
+            *,
+            show_tool_call_id: bool = False,
+            defer_display_to_tool_result: bool = False,
+        ) -> CallToolResult:
+            assert name == self.tool.name
+            return await self.execute(
+                arguments,
+                tool_use_id,
+                show_tool_call_id=show_tool_call_id,
+                defer_display_to_tool_result=defer_display_to_tool_result,
+            )
 
     class RecordingDisplay:
         def __init__(self) -> None:

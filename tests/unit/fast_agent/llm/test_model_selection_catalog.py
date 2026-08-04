@@ -69,9 +69,10 @@ def test_list_current_aliases_for_provider() -> None:
         "fable",
         "haiku",
         "opus",
+        "opus48",
         "sonnet",
     }.issubset(aliases)
-    assert aliases.index("opus") < aliases.index("opus46")
+    assert aliases.index("opus") < aliases.index("opus48") < aliases.index("opus46")
 
 
 def test_anthropic_catalog_lists_user_facing_factory_aliases() -> None:
@@ -84,6 +85,9 @@ def test_anthropic_catalog_lists_user_facing_factory_aliases() -> None:
     assert ModelFactory.MODEL_PRESETS["sonnet5"] == "claude-sonnet-5"
     assert ModelFactory.MODEL_PRESETS["fable"] == "claude-fable-5"
     assert ModelFactory.MODEL_PRESETS["fable5"] == "claude-fable-5"
+    assert ModelFactory.MODEL_PRESETS["opus"] == "claude-opus-5"
+    assert ModelFactory.MODEL_PRESETS["opus5"] == "claude-opus-5"
+    assert ModelFactory.MODEL_PRESETS["opus48"] == "claude-opus-4-8"
 
 
 def test_current_catalog_entries_match_model_presets_for_shared_aliases() -> None:
@@ -101,9 +105,9 @@ def test_current_catalog_entries_match_model_presets_for_shared_aliases() -> Non
             ) == parsed_preset.model_dump(exclude={"provider", "model_name"})
 
 
-def test_deepseek_current_order_prefers_pro_above_flash() -> None:
+def test_deepseek_catalog_exposes_only_responses_model() -> None:
     aliases = ModelSelectionCatalog.list_current_aliases(Provider.DEEPSEEK)
-    assert aliases[:2] == ["deepseek", "deepseek4flash"]
+    assert aliases == ["deepseek"]
 
 
 def test_non_current_aliases_are_listed_but_not_current() -> None:
@@ -234,6 +238,20 @@ def test_configured_providers_reads_environment_keys() -> None:
     assert Provider.RESPONSES in providers
 
 
+def test_configured_providers_reads_codex_auth_json_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("CODEX_API_KEY", raising=False)
+    monkeypatch.setattr(
+        "fast_agent.llm.provider.openai.codex_oauth.get_codex_access_token",
+        lambda: "codex-token-from-auth-json",
+    )
+
+    providers = ModelSelectionCatalog.configured_providers({})
+
+    assert Provider.CODEX_RESPONSES in providers
+
+
 def test_configured_providers_does_not_treat_overlay_only_provider_as_ready(
     monkeypatch,
     tmp_path: Path,
@@ -297,6 +315,18 @@ def test_catalog_lists_legacy_aliases_when_configured() -> None:
     assert "glm5" in non_current_aliases
     assert "glm47" in non_current_aliases
     assert "glm47" not in current_aliases
+
+
+def test_huggingface_curated_catalog_includes_both_kimi_k3_routes() -> None:
+    entries = ModelSelectionCatalog.CATALOG_ENTRIES_BY_PROVIDER[Provider.HUGGINGFACE]
+    aliases = {"Kimi K3 (fireworks-ai)", "Kimi K3 (together)"}
+    kimi_k3_entries = [entry for entry in entries if entry.alias in aliases]
+
+    assert [(entry.display_label, entry.model) for entry in kimi_k3_entries] == [
+        ("Kimi K3 (fireworks-ai)", "hf.moonshotai/Kimi-K3:fireworks-ai"),
+        ("Kimi K3 (together)", "hf.moonshotai/Kimi-K3:together"),
+    ]
+    assert all(entry.current for entry in kimi_k3_entries)
 
 
 def test_list_all_models_for_provider() -> None:

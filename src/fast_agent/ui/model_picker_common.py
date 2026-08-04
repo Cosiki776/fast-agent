@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, Literal
 
 from fast_agent.config import get_settings
@@ -25,7 +25,6 @@ if TYPE_CHECKING:
     from pathlib import Path
 
 ModelSource = Literal["curated", "all"]
-ProviderActivationAction = Literal["codex-login"]
 ModelAvailability = Literal["active", "attention", "inactive"]
 
 
@@ -39,6 +38,8 @@ PICKER_PROVIDER_ORDER: tuple[Provider, ...] = (
     Provider.XAI,
     Provider.META_AI,
     Provider.DEEPSEEK,
+    Provider.ZAI,
+    Provider.MOONSHOT,
     Provider.GENERIC,
     Provider.ANTHROPIC_VERTEX,
     Provider.OPENAI,
@@ -57,12 +58,16 @@ REFER_TO_DOCS_PROVIDERS: tuple[Provider, ...] = (
 )
 
 GENERIC_CUSTOM_MODEL_SENTINEL = "generic.__custom__"
-CODEX_LOGIN_SENTINEL = "codexresponses.__login__"
 LLAMACPP_PROVIDER_KEY = "llamacpp"
 LLAMACPP_IMPORT_SENTINEL = "llamacpp.__import__"
 PROVIDER_PREFIX_DELIMITERS = ("/", ".")
 ProviderActiveCheck = Callable[[dict[str, Any]], bool]
 ModelSpecTransform = Callable[[str], str]
+
+
+@dataclass(frozen=True)
+class ProviderActivation:
+    provider: Provider
 
 
 @dataclass(frozen=True)
@@ -74,6 +79,7 @@ class ProviderOption:
     display_name: str | None = None
     overlay_group: bool = False
     disabled_reason: str | None = None
+    credential_label: str | None = None
 
     @property
     def option_key(self) -> str:
@@ -90,7 +96,7 @@ class ModelOption:
     label: str
     preset_token: str | None = None
     fast: bool = False
-    activation_action: ProviderActivationAction | None = None
+    activation_action: ProviderActivation | None = None
 
 
 SyntheticProviderOptionFactory = Callable[[Provider], list[ModelOption] | None]
@@ -115,21 +121,7 @@ class ModelPickerSnapshot:
 
 
 def _provider_is_active(provider: Provider, config_payload: dict[str, Any]) -> bool:
-    if provider == Provider.ANTHROPIC_VERTEX:
-        ready, _ = anthropic_vertex_ready(config_payload)
-        return ready
-
-    config_key = ProviderKeyManager.get_config_file_key(provider.config_name, config_payload)
-    if config_key:
-        return True
-
-    if ProviderKeyManager.get_env_var(provider.config_name):
-        return True
-
-    if active_check := _PROVIDER_ACTIVE_CHECKS.get(provider):
-        return active_check(config_payload)
-
-    return provider in {Provider.FAST_AGENT, Provider.GENERIC}
+    return provider_credential_summary(provider, config_payload).active
 
 
 def _google_vertex_is_active(config_payload: dict[str, Any]) -> bool:
@@ -150,16 +142,6 @@ def _azure_default_credential_is_active(config_payload: dict[str, Any]) -> bool:
     return use_default and normalized_base_url is not None
 
 
-def _codex_oauth_is_active(_config_payload: dict[str, Any]) -> bool:
-    try:
-        from fast_agent.llm.provider.openai.codex_oauth import get_codex_token_status
-
-        status = get_codex_token_status()
-        return bool(status.get("present"))
-    except Exception:
-        return False
-
-
 def _huggingface_hub_is_active(_config_payload: dict[str, Any]) -> bool:
     return is_huggingface_hub_logged_in()
 
@@ -167,9 +149,75 @@ def _huggingface_hub_is_active(_config_payload: dict[str, Any]) -> bool:
 _PROVIDER_ACTIVE_CHECKS: dict[Provider, ProviderActiveCheck] = {
     Provider.GOOGLE: _google_vertex_is_active,
     Provider.AZURE: _azure_default_credential_is_active,
-    Provider.CODEX_RESPONSES: _codex_oauth_is_active,
     Provider.HUGGINGFACE: _huggingface_hub_is_active,
 }
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderCredentialSummary:
+    active: bool
+    label: str | None = None
+
+
+def provider_credential_summary(
+    provider: Provider,
+    config_payload: dict[str, Any],
+) -> ProviderCredentialSummary:
+    """Return whether a provider is usable and a short credential source label."""
+    if provider == Provider.ANTHROPIC_VERTEX:
+        ready, _ = anthropic_vertex_ready(config_payload)
+        return ProviderCredentialSummary(active=ready, label="ADC" if ready else None)
+
+    if ProviderKeyManager.get_config_file_key(provider.config_name, config_payload):
+        return ProviderCredentialSummary(active=True, label="api key")
+
+    if ProviderKeyManager.get_env_var(provider.config_name):
+        return ProviderCredentialSummary(active=True, label="env")
+
+    if provider == Provider.CODEX_RESPONSES:
+        from fast_agent.cli.codex_oauth_display import codex_oauth_source_label
+        from fast_agent.llm.provider.openai.codex_oauth import get_codex_token_status
+
+        status = get_codex_token_status()
+        if bool(status.get("present")) and not bool(status.get("expired")):
+            return ProviderCredentialSummary(
+                active=True,
+                label=codex_oauth_source_label(status.get("source")),
+            )
+        return ProviderCredentialSummary(active=False)
+
+    if provider == Provider.XAI:
+        from fast_agent.llm.provider.openai.xai_oauth import get_xai_token_status
+
+        status = get_xai_token_status()
+        if bool(status.get("present")) and not bool(status.get("expired")):
+            source = status.get("source")
+            if source == "keyring":
+                label = "OAuth keyring"
+            elif source == "file":
+                label = "OAuth file"
+            else:
+                label = "OAuth"
+            return ProviderCredentialSummary(active=True, label=label)
+        return ProviderCredentialSummary(active=False)
+
+    if provider == Provider.HUGGINGFACE and _huggingface_hub_is_active(config_payload):
+        return ProviderCredentialSummary(active=True, label="hf login")
+
+    if provider == Provider.GOOGLE and _google_vertex_is_active(config_payload):
+        return ProviderCredentialSummary(active=True, label="Vertex")
+
+    if provider == Provider.AZURE and _azure_default_credential_is_active(config_payload):
+        return ProviderCredentialSummary(active=True, label="Azure default")
+
+    if provider in {Provider.FAST_AGENT, Provider.GENERIC}:
+        return ProviderCredentialSummary(active=True, label="local")
+
+    if active_check := _PROVIDER_ACTIVE_CHECKS.get(provider):
+        if active_check(config_payload):
+            return ProviderCredentialSummary(active=True)
+
+    return ProviderCredentialSummary(active=False)
 
 
 def _catalog_options_from_entries(
@@ -322,10 +370,16 @@ def build_snapshot(
         settings = get_settings(str(config_path) if config_path else None)
         config_payload = settings.model_dump()
 
-    active_providers = set(ModelSelectionCatalog.configured_providers(config_payload))
-    for provider in PICKER_PROVIDER_ORDER:
-        if _provider_is_active(provider, config_payload):
-            active_providers.add(provider)
+    credential_by_provider = {
+        provider: provider_credential_summary(provider, config_payload)
+        for provider in PICKER_PROVIDER_ORDER
+    }
+    active_providers = {
+        provider for provider, summary in credential_by_provider.items() if summary.active
+    }
+    # Keep catalog-configured providers (env/config) even if they are not in the
+    # picker order helper path above.
+    active_providers.update(ModelSelectionCatalog.configured_providers(config_payload))
 
     providers: list[ProviderOption] = []
     overlay_registry = _load_overlay_registry_for_snapshot(
@@ -380,6 +434,7 @@ def build_snapshot(
                     display_name="llama.cpp",
                 )
             )
+        summary = credential_by_provider[provider]
         providers.append(
             ProviderOption(
                 provider=provider,
@@ -391,6 +446,7 @@ def build_snapshot(
                     if provider == Provider.ANTHROPIC_VERTEX and provider not in active_providers
                     else None
                 ),
+                credential_label=summary.label if provider in active_providers else None,
             )
         )
 
@@ -594,10 +650,10 @@ def infer_initial_picker_provider(model_spec: str | None) -> str | None:
 def provider_activation_action(
     snapshot: ModelPickerSnapshot,
     provider: Provider,
-) -> ProviderActivationAction | None:
+) -> ProviderActivation | None:
     option = find_provider(snapshot, provider.config_name)
-    if provider == Provider.CODEX_RESPONSES and not option.active:
-        return "codex-login"
+    if provider in {Provider.CODEX_RESPONSES, Provider.XAI} and not option.active:
+        return ProviderActivation(provider)
     return None
 
 
@@ -640,10 +696,11 @@ def model_options_for_provider(
     activation_action = provider_activation_action(snapshot, provider)
     if activation_action is not None:
         return [
-            ModelOption(
-                spec=CODEX_LOGIN_SENTINEL,
-                label="Log in to enable Codex (Plan)",
-                activation_action=activation_action,
+            replace(option, activation_action=activation_action)
+            for option in _catalog_options_from_entries(
+                provider_option.curated_entries,
+                provider=provider,
+                source=source,
             )
         ]
     return _catalog_options_from_entries(

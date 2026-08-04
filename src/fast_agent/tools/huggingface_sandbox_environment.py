@@ -7,6 +7,9 @@ import base64
 import json
 import posixpath
 import re
+import shlex
+import time
+import uuid
 from dataclasses import dataclass
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import PurePosixPath
@@ -20,7 +23,12 @@ from fast_agent.tools.execution_environment import (
     ShellExecutionOptions,
     ShellExecutionRequest,
     ShellExecutionResult,
+    ShellOutputActivityCallbacks,
     ShellRuntimeInfo,
+)
+from fast_agent.tools.shell_output_spool import (
+    ShellOutputSpoolPaths,
+    ShellOutputSpoolTailer,
 )
 from fast_agent.utils.huggingface_hub import get_huggingface_hub_token
 
@@ -29,6 +37,25 @@ if TYPE_CHECKING:
 
 DEFAULT_HF_SANDBOX_IDLE_TIMEOUT = 10 * 60
 FAST_AGENT_HF_SANDBOX_LABEL = "fast-agent"
+_MANAGED_PROCESS_POLL_SECONDS = 0.25
+_MANAGED_PROCESS_DISCOVERY_TIMEOUT_SECONDS = 5.0
+_MANAGED_PROCESS_TERMINATION_TIMEOUT_SECONDS = 10.0
+_MANAGED_PROCESS_TERM_GRACE_SECONDS = 3.0
+_MANAGED_OUTPUT_ROOT = "/tmp/fast-agent-managed"
+_MANAGED_OUTPUT_READ_CHUNK_BYTES = 1024 * 1024
+_MANAGED_OUTPUT_CHUNKS_PER_POLL = 4
+_READ_MANAGED_OUTPUT_SCRIPT = """
+import base64
+import sys
+
+try:
+    with open(sys.argv[1], "rb") as stream:
+        stream.seek(int(sys.argv[2]))
+        payload = stream.read(int(sys.argv[3]))
+except FileNotFoundError:
+    payload = b""
+sys.stdout.write(base64.b64encode(payload).decode("ascii"))
+""".strip()
 _ENV_REFERENCE_PATTERN = re.compile(r"^\$\{([A-Za-z_][A-Za-z0-9_]*)\}$")
 _LIST_DIR_SCRIPT = """
 import json
@@ -64,6 +91,14 @@ class _SandboxCommandResult(Protocol):
     timed_out: bool
 
 
+class _SandboxProcess(Protocol):
+    pid: int
+    running: bool
+    exit_code: int | None
+
+    def kill(self) -> None: ...
+
+
 class _SandboxFiles(Protocol):
     def read_text(self, path: str, encoding: str = "utf-8") -> str: ...
 
@@ -91,7 +126,10 @@ class _Sandbox(Protocol):
         on_stdout: Callable[[str], None] | None = None,
         on_stderr: Callable[[str], None] | None = None,
         check: bool = True,
-    ) -> _SandboxCommandResult: ...
+        background: bool = False,
+    ) -> _SandboxCommandResult | _SandboxProcess: ...
+
+    def processes(self) -> list[_SandboxProcess]: ...
 
     def kill(self) -> None: ...
 
@@ -194,9 +232,7 @@ class HuggingFaceSandboxEnvironment:
 
     async def open(self) -> None:
         if self._sandbox is None:
-            self._emit_startup_stage(
-                f"creating sandbox image={self._image} flavor={self._flavor}"
-            )
+            self._emit_startup_stage(f"creating sandbox image={self._image} flavor={self._flavor}")
             self._sandbox = await asyncio.to_thread(self._create_sandbox)
             self._owns_sandbox = True
         else:
@@ -305,6 +341,14 @@ class HuggingFaceSandboxEnvironment:
     ) -> ShellExecution:
         sandbox = self._require_sandbox()
         cwd = self.resolve_path(request.cwd) if request.cwd is not None else self._cwd
+        if not request.terminate_after_idle:
+            return await self._execute_managed(
+                sandbox,
+                request,
+                cwd=cwd,
+                callbacks=callbacks,
+            )
+
         loop = asyncio.get_running_loop()
         active_callbacks = callbacks
         callback_futures: list[Future[None]] = []
@@ -321,20 +365,25 @@ class HuggingFaceSandboxEnvironment:
                     asyncio.run_coroutine_threadsafe(active_callbacks.on_stderr(text), loop)
                 )
 
-        def run_command():
+        def run_command() -> _SandboxCommandResult:
             effective_env = dict(self._execution_env)
             effective_env.update(request.env or {})
-            return sandbox.run(
-                request.command,
-                shell=True,
-                env=effective_env,
-                cwd=cwd,
-                timeout=request.timeout,
-                on_stdout=on_stdout if active_callbacks is not None else None,
-                on_stderr=on_stderr if active_callbacks is not None else None,
-                check=False,
+            return cast(
+                "_SandboxCommandResult",
+                sandbox.run(
+                    request.command,
+                    shell=True,
+                    env=effective_env,
+                    cwd=cwd,
+                    timeout=request.timeout,
+                    on_stdout=on_stdout if active_callbacks is not None else None,
+                    on_stderr=on_stderr if active_callbacks is not None else None,
+                    check=False,
+                ),
             )
 
+        if active_callbacks is not None:
+            await active_callbacks.on_started(None)
         result = await asyncio.to_thread(run_command)
         if callback_futures:
             callback_results = await asyncio.gather(
@@ -349,13 +398,287 @@ class HuggingFaceSandboxEnvironment:
                 await active_callbacks.on_timeout()
         return ShellExecution(
             result=ShellExecutionResult(
-                stdout=result.stdout,
-                stderr=result.stderr,
+                stdout=result.stdout if request.retain_output else "",
+                stderr=result.stderr if request.retain_output else "",
                 exit_code=result.exit_code if result.exit_code is not None else 1,
             ),
             options=ShellExecutionOptions(timeout_seconds=request.timeout),
             timed_out=bool(result.timed_out),
         )
+
+    async def _execute_managed(
+        self,
+        sandbox: _Sandbox,
+        request: ShellExecutionRequest,
+        *,
+        cwd: str,
+        callbacks: ShellExecutionCallbacks | None,
+    ) -> ShellExecution:
+        execution_id = uuid.uuid4().hex
+        output_dir = f"{_MANAGED_OUTPUT_ROOT}/{execution_id}"
+        stdout_path = f"{output_dir}/stdout"
+        stderr_path = f"{output_dir}/stderr"
+        output_spool = ShellOutputSpoolPaths(
+            directory=output_dir,
+            stdout=stdout_path,
+            stderr=stderr_path,
+        )
+        request.output_spool_path = output_dir
+        effective_env = dict(self._execution_env)
+        effective_env.update(request.env or {})
+        script = (
+            f"mkdir -p {shlex.quote(output_dir)}\n"
+            f"exec >{shlex.quote(stdout_path)} 2>{shlex.quote(stderr_path)}\n"
+            f"{request.command}"
+        )
+
+        def start_process() -> _SandboxProcess:
+            result = sandbox.run(
+                ["/bin/sh", "-lc", script],
+                shell=False,
+                env=effective_env,
+                cwd=cwd,
+                background=True,
+            )
+            return cast("_SandboxProcess", result)
+
+        spawn_task = asyncio.create_task(asyncio.to_thread(start_process))
+        try:
+            process = await asyncio.shield(spawn_task)
+        except asyncio.CancelledError:
+            process = await asyncio.shield(spawn_task)
+            if request.terminate_on_cancel:
+                await self._kill_managed_process(sandbox, process)
+                await self._delete_managed_output(sandbox, output_dir)
+                request.output_spool_path = None
+            raise
+
+        retained_stdout: list[str] = []
+        retained_stderr: list[str] = []
+        activity_callbacks = (
+            callbacks if isinstance(callbacks, ShellOutputActivityCallbacks) else None
+        )
+        discovery_deadline = time.monotonic() + _MANAGED_PROCESS_DISCOVERY_TIMEOUT_SECONDS
+
+        async def on_stdout(text: str) -> None:
+            if request.retain_output:
+                retained_stdout.append(text)
+            if callbacks is not None:
+                await callbacks.on_stdout(text)
+
+        async def on_stderr(text: str) -> None:
+            if request.retain_output:
+                retained_stderr.append(text)
+            if callbacks is not None:
+                await callbacks.on_stderr(text)
+
+        async def on_stdout_activity(byte_count: int) -> None:
+            if activity_callbacks is not None:
+                await activity_callbacks.on_output_activity(
+                    is_stderr=False,
+                    byte_count=byte_count,
+                )
+
+        async def on_stderr_activity(byte_count: int) -> None:
+            if activity_callbacks is not None:
+                await activity_callbacks.on_output_activity(
+                    is_stderr=True,
+                    byte_count=byte_count,
+                )
+
+        async def process_exited() -> bool:
+            nonlocal process
+            current = await asyncio.to_thread(
+                self._managed_process_snapshot,
+                sandbox,
+                process.pid,
+            )
+            if current is None and time.monotonic() >= discovery_deadline:
+                raise RuntimeError(
+                    f"Hugging Face sandbox process {process.pid} was not discoverable"
+                )
+            if current is not None and not current.running:
+                process = current
+                return True
+            return False
+
+        tailer = ShellOutputSpoolTailer(
+            output_spool,
+            read_chunk=lambda path, offset, size: self._read_managed_output_chunk(
+                sandbox,
+                path,
+                offset=offset,
+                size=size,
+            ),
+            on_stdout=on_stdout,
+            on_stderr=on_stderr,
+            on_stdout_activity=on_stdout_activity,
+            on_stderr_activity=on_stderr_activity,
+            chunk_size=_MANAGED_OUTPUT_READ_CHUNK_BYTES,
+            chunks_per_poll=_MANAGED_OUTPUT_CHUNKS_PER_POLL,
+        )
+        delete_output = request.terminate_on_cancel
+        try:
+            if callbacks is not None:
+                await callbacks.on_started(process.pid)
+            await tailer.tail_until(
+                process_exited,
+                poll_interval=_MANAGED_PROCESS_POLL_SECONDS,
+            )
+            exit_code = process.exit_code if process.exit_code is not None else 1
+            return ShellExecution(
+                result=ShellExecutionResult(
+                    stdout="".join(retained_stdout),
+                    stderr="".join(retained_stderr),
+                    exit_code=exit_code,
+                ),
+                options=ShellExecutionOptions(timeout_seconds=None),
+            )
+        except asyncio.CancelledError:
+            if request.terminate_on_cancel:
+                delete_output = True
+                await self._kill_managed_process(sandbox, process)
+            raise
+        except BaseException:
+            delete_output = True
+            await self._kill_managed_process(sandbox, process)
+            raise
+        finally:
+            if delete_output or process.exit_code is not None:
+                await self._delete_managed_output(sandbox, output_dir)
+                request.output_spool_path = None
+
+    @staticmethod
+    def _managed_process_snapshot(
+        sandbox: _Sandbox,
+        process_id: int,
+    ) -> _SandboxProcess | None:
+        return next(
+            (process for process in sandbox.processes() if process.pid == process_id),
+            None,
+        )
+
+    @staticmethod
+    async def _read_managed_output_chunk(
+        sandbox: _Sandbox,
+        path: str,
+        *,
+        offset: int,
+        size: int,
+    ) -> bytes:
+        def read_chunk() -> bytes:
+            result = cast(
+                "_SandboxCommandResult",
+                sandbox.run(
+                    [
+                        "python3",
+                        "-c",
+                        _READ_MANAGED_OUTPUT_SCRIPT,
+                        path,
+                        str(offset),
+                        str(size),
+                    ],
+                    shell=False,
+                    check=False,
+                ),
+            )
+            if result.exit_code not in {0, None}:
+                raise RuntimeError(f"Could not read managed Hugging Face output file {path}")
+            return base64.b64decode(result.stdout)
+
+        return await asyncio.to_thread(read_chunk)
+
+    @staticmethod
+    async def _kill_managed_process(
+        sandbox: _Sandbox,
+        process: _SandboxProcess,
+    ) -> None:
+        await HuggingFaceSandboxEnvironment._signal_managed_process_group(
+            sandbox,
+            process.pid,
+            signal_name="TERM",
+        )
+        deadline = time.monotonic() + _MANAGED_PROCESS_TERM_GRACE_SECONDS
+        while True:
+            current = await asyncio.shield(
+                asyncio.to_thread(
+                    HuggingFaceSandboxEnvironment._managed_process_snapshot,
+                    sandbox,
+                    process.pid,
+                )
+            )
+            if current is None or not current.running:
+                return
+            if time.monotonic() >= deadline:
+                break
+            await asyncio.sleep(_MANAGED_PROCESS_POLL_SECONDS)
+
+        await HuggingFaceSandboxEnvironment._signal_managed_process_group(
+            sandbox,
+            process.pid,
+            signal_name="KILL",
+        )
+        deadline = time.monotonic() + (
+            _MANAGED_PROCESS_TERMINATION_TIMEOUT_SECONDS - _MANAGED_PROCESS_TERM_GRACE_SECONDS
+        )
+        while True:
+            current = await asyncio.shield(
+                asyncio.to_thread(
+                    HuggingFaceSandboxEnvironment._managed_process_snapshot,
+                    sandbox,
+                    process.pid,
+                )
+            )
+            if current is None or not current.running:
+                return
+            if time.monotonic() >= deadline:
+                raise RuntimeError(
+                    f"Hugging Face sandbox process {process.pid} remained alive after TERM and KILL"
+                )
+            await asyncio.sleep(_MANAGED_PROCESS_POLL_SECONDS)
+
+    @staticmethod
+    async def _signal_managed_process_group(
+        sandbox: _Sandbox,
+        process_id: int,
+        *,
+        signal_name: str,
+    ) -> None:
+        command = (
+            f"kill -{signal_name} -- -{process_id} 2>/dev/null "
+            f"|| kill -{signal_name} {process_id} 2>/dev/null || true"
+        )
+
+        def signal_process() -> None:
+            sandbox.run(
+                ["/bin/sh", "-lc", command],
+                shell=False,
+                timeout=5,
+                check=False,
+            )
+
+        await asyncio.shield(asyncio.to_thread(signal_process))
+
+    @staticmethod
+    async def _delete_managed_output(sandbox: _Sandbox, output_dir: str) -> None:
+        def delete_output() -> None:
+            sandbox.run(
+                [
+                    "/bin/sh",
+                    "-c",
+                    'rm -rf -- "$1"',
+                    "fast-agent-managed-cleanup",
+                    output_dir,
+                ],
+                shell=False,
+                timeout=5,
+                check=False,
+            )
+
+        try:
+            await asyncio.shield(asyncio.to_thread(delete_output))
+        except Exception:
+            return
 
     async def read_text(self, path: str) -> str:
         sandbox = self._require_sandbox()
@@ -370,10 +693,13 @@ class HuggingFaceSandboxEnvironment:
         resolved_path = self.resolve_path(path)
 
         def read_file() -> _SandboxCommandResult:
-            return sandbox.run(
-                ["python3", "-c", _READ_BYTES_SCRIPT, resolved_path],
-                shell=False,
-                check=False,
+            return cast(
+                "_SandboxCommandResult",
+                sandbox.run(
+                    ["python3", "-c", _READ_BYTES_SCRIPT, resolved_path],
+                    shell=False,
+                    check=False,
+                ),
             )
 
         result = await asyncio.to_thread(read_file)
@@ -395,10 +721,13 @@ class HuggingFaceSandboxEnvironment:
         resolved_path = self.resolve_path(path)
 
         def list_directory() -> _SandboxCommandResult:
-            return sandbox.run(
-                ["python3", "-c", _LIST_DIR_SCRIPT, resolved_path],
-                shell=False,
-                check=False,
+            return cast(
+                "_SandboxCommandResult",
+                sandbox.run(
+                    ["python3", "-c", _LIST_DIR_SCRIPT, resolved_path],
+                    shell=False,
+                    check=False,
+                ),
             )
 
         result = await asyncio.to_thread(list_directory)

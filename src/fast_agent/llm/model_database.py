@@ -7,8 +7,9 @@ context windows, max output tokens, and supported tokenization types.
 
 from typing import ClassVar, Literal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
+from fast_agent.constants import MAX_TERMINAL_OUTPUT_BYTE_LIMIT
 from fast_agent.llm.model_mime_support import ResourceSource, tokenizes_support_mime
 from fast_agent.llm.provider_types import Provider
 from fast_agent.llm.reasoning_effort import (
@@ -38,6 +39,19 @@ class ModelParameters(BaseModel):
 
     structured_tool_policy: Literal["always", "defer", "no_tools"] | None = None
     """Default structured-output/regular-tool coexistence policy for this model."""
+
+    managed_process_poll_folding: bool | None = None
+    """Whether managed-process poll folding has been validated for this model."""
+
+    process_poll_default_wait_seconds: int = Field(default=0, ge=0, le=600)
+    """Default poll_process wait when the model omits wait_sec."""
+
+    shell_output_byte_limit: int | None = Field(
+        default=None,
+        ge=1,
+        le=MAX_TERMINAL_OUTPUT_BYTE_LIMIT,
+    )
+    """Optional model-specific default for model-facing shell output previews."""
 
     reasoning: None | str = None
     """Reasoning output style. 'tags' if enclosed in <thinking> tags, 'none' if not used"""
@@ -135,6 +149,28 @@ class ModelDatabase:
         *DOCUMENT_MIME_TYPES,
     ]
     OPENAI_VISION: ClassVar[list[str]] = ["text/plain", "image/jpeg", "image/png", "image/webp"]
+    KIMI_K3_MULTIMODAL: ClassVar[list[str]] = [
+        "text/plain",
+        "image/jpeg",
+        "image/png",
+        "image/gif",
+        "image/webp",
+        "image/bmp",
+        "image/heic",
+        "image/heif",
+        "video/mp4",
+        "video/mpeg",
+        "video/mov",
+        "video/quicktime",
+        "video/avi",
+        "video/x-msvideo",
+        "video/x-flv",
+        "video/mpg",
+        "video/webm",
+        "video/wmv",
+        "video/x-ms-wmv",
+        "video/3gpp",
+    ]
     ANTHROPIC_MULTIMODAL: ClassVar[list[str]] = [
         "text/plain",
         "image/jpeg",
@@ -191,6 +227,12 @@ class ModelDatabase:
         "Before making tool calls, send a brief preamble to the user "
         "explaining what you’re about to do."
     )
+    ANTHROPIC_MODEL_SPECIFIC = (
+        "When running POSIX shell commands, create text files with single-quoted heredocs "
+        "(`<<'EOF'`), combining related files in one shell call. Use `edit_file` for "
+        "targeted changes to existing files. Do not serialize independent file creation "
+        "across turns."
+    )
 
     OPENAI_O_CLASS_REASONING = ReasoningEffortSpec(
         kind="effort",
@@ -246,6 +288,11 @@ class ModelDatabase:
         kind="toggle",
         default=ReasoningEffortSetting(kind="toggle", value=True),
     )
+    KIMI_K3_REASONING_EFFORT_SPEC = ReasoningEffortSpec(
+        kind="effort",
+        allowed_efforts=["low", "high", "max"],
+        default=ReasoningEffortSetting(kind="effort", value="max"),
+    )
 
     # Groq exposes reasoning as a binary toggle: `reasoning_effort="default"`
     # (thinking on) or `reasoning_effort="none"` (thinking off). Standard effort
@@ -264,7 +311,7 @@ class ModelDatabase:
 
     DEEPSEEK_REASONING_EFFORT_SPEC = ReasoningEffortSpec(
         kind="effort",
-        allowed_efforts=["high", "max"],
+        allowed_efforts=["none", "low", "high", "max"],
         allow_toggle_disable=True,
         default=ReasoningEffortSetting(kind="effort", value="high"),
     )
@@ -320,6 +367,13 @@ class ModelDatabase:
         default=ReasoningEffortSetting(kind="effort", value="low"),
     )
 
+    # Muse Spark: Responses reasoning.effort; "none" is rejected by the API.
+    MUSE_SPARK_REASONING_EFFORT_SPEC = ReasoningEffortSpec(
+        kind="effort",
+        allowed_efforts=["minimal", "low", "medium", "high", "xhigh"],
+        default=ReasoningEffortSetting(kind="effort", value="medium"),
+    )
+
     ANTHROPIC_WEB_SEARCH_LEGACY = "web_search_20250305"
     ANTHROPIC_WEB_FETCH_LEGACY = "web_fetch_20250910"
     ANTHROPIC_WEB_SEARCH_46 = "web_search_20260209"
@@ -346,7 +400,10 @@ class ModelDatabase:
         cache_ttl="5m",
         anthropic_web_search_version=ANTHROPIC_WEB_SEARCH_LEGACY,
         anthropic_web_fetch_version=ANTHROPIC_WEB_FETCH_LEGACY,
+        managed_process_poll_folding=True,
+        process_poll_default_wait_seconds=250,
         default_provider=Provider.ANTHROPIC,
+        model_specific=ANTHROPIC_MODEL_SPECIFIC,
     )
 
     QWEN_STANDARD = ModelParameters(
@@ -420,6 +477,7 @@ class ModelDatabase:
         text_verbosity_spec=OPENAI_TEXT_VERBOSITY_SPEC,
         response_service_tiers=("fast", "flex"),
         default_provider=Provider.RESPONSES,
+        managed_process_poll_folding=True,
     )
 
     OPENAI_GPT_5_2 = ModelParameters(
@@ -431,6 +489,7 @@ class ModelDatabase:
         text_verbosity_spec=OPENAI_TEXT_VERBOSITY_SPEC,
         response_service_tiers=("fast", "flex"),
         default_provider=Provider.RESPONSES,
+        managed_process_poll_folding=True,
     )
 
     OPENAI_GPT_CODEX = ModelParameters(
@@ -444,6 +503,7 @@ class ModelDatabase:
         response_websocket_providers=(Provider.RESPONSES, Provider.CODEX_RESPONSES),
         response_service_tiers=("fast", "flex"),
         default_provider=Provider.RESPONSES,
+        managed_process_poll_folding=True,
     )
 
     OPENAI_GPT_54_SMALL = ModelParameters(
@@ -457,6 +517,7 @@ class ModelDatabase:
         response_websocket_providers=(Provider.RESPONSES, Provider.CODEX_RESPONSES),
         response_service_tiers=("fast", "flex"),
         default_provider=Provider.RESPONSES,
+        managed_process_poll_folding=True,
     )
 
     OPENAI_GPT_56 = ModelParameters(
@@ -471,6 +532,8 @@ class ModelDatabase:
         response_service_tiers=("fast", "flex"),
         default_provider=Provider.RESPONSES,
         model_specific=GPT_53_PLUS_MODEL_SPECIFIC,
+        managed_process_poll_folding=True,
+        process_poll_default_wait_seconds=240,
     )
 
     OPENAI_GPT_56_LUNA = OPENAI_GPT_56.model_copy(
@@ -486,6 +549,7 @@ class ModelDatabase:
         response_websocket_providers=(Provider.CODEX_RESPONSES,),
         response_service_tiers=("fast",),
         default_provider=Provider.CODEX_RESPONSES,
+        managed_process_poll_folding=True,
     )
 
     OPENAI_CHAT53_INSTANT = ModelParameters(
@@ -498,6 +562,7 @@ class ModelDatabase:
         default_provider=Provider.RESPONSES,
         reasoning="openai",
         model_specific=GPT_53_PLUS_MODEL_SPECIFIC,
+        managed_process_poll_folding=True,
     )
 
     ANTHROPIC_OPUS_4_VERSIONED = ModelParameters(
@@ -509,7 +574,10 @@ class ModelDatabase:
         cache_ttl="5m",
         anthropic_web_search_version=ANTHROPIC_WEB_SEARCH_LEGACY,
         anthropic_web_fetch_version=ANTHROPIC_WEB_FETCH_LEGACY,
+        managed_process_poll_folding=True,
+        process_poll_default_wait_seconds=250,
         default_provider=Provider.ANTHROPIC,
+        model_specific=ANTHROPIC_MODEL_SPECIFIC,
     )
     ANTHROPIC_OPUS_46 = ModelParameters(
         context_window=ANTHROPIC_LONG_CONTEXT_WINDOW,
@@ -521,7 +589,10 @@ class ModelDatabase:
         anthropic_web_search_version=ANTHROPIC_WEB_SEARCH_46,
         anthropic_web_fetch_version=ANTHROPIC_WEB_FETCH_46,
         anthropic_required_betas=(ANTHROPIC_WEB_TOOLS_BETA_46,),
+        managed_process_poll_folding=True,
+        process_poll_default_wait_seconds=250,
         default_provider=Provider.ANTHROPIC,
+        model_specific=ANTHROPIC_MODEL_SPECIFIC,
     )
     ANTHROPIC_OPUS_47 = ANTHROPIC_OPUS_46.model_copy(
         update={
@@ -532,6 +603,13 @@ class ModelDatabase:
     ANTHROPIC_OPUS_48 = ANTHROPIC_OPUS_47.model_copy(
         update={
             "max_output_tokens": 128_000,
+        }
+    )
+    ANTHROPIC_OPUS_5 = ANTHROPIC_OPUS_48.model_copy(
+        update={
+            "anthropic_thinking_field_required": False,
+            "anthropic_thinking_disable_supported": True,
+            "anthropic_web_fetch_version": None,
         }
     )
     ANTHROPIC_FABLE_5 = ANTHROPIC_OPUS_48.model_copy(
@@ -552,7 +630,10 @@ class ModelDatabase:
         cache_ttl="5m",
         anthropic_web_search_version=ANTHROPIC_WEB_SEARCH_LEGACY,
         anthropic_web_fetch_version=ANTHROPIC_WEB_FETCH_LEGACY,
+        managed_process_poll_folding=True,
+        process_poll_default_wait_seconds=250,
         default_provider=Provider.ANTHROPIC,
+        model_specific=ANTHROPIC_MODEL_SPECIFIC,
     )
     ANTHROPIC_SONNET_4_VERSIONED = ModelParameters(
         context_window=200000,
@@ -563,7 +644,10 @@ class ModelDatabase:
         cache_ttl="5m",
         anthropic_web_search_version=ANTHROPIC_WEB_SEARCH_LEGACY,
         anthropic_web_fetch_version=ANTHROPIC_WEB_FETCH_LEGACY,
+        managed_process_poll_folding=True,
+        process_poll_default_wait_seconds=250,
         default_provider=Provider.ANTHROPIC,
+        model_specific=ANTHROPIC_MODEL_SPECIFIC,
     )
     ANTHROPIC_SONNET_46 = ModelParameters(
         context_window=ANTHROPIC_LONG_CONTEXT_WINDOW,
@@ -575,7 +659,10 @@ class ModelDatabase:
         anthropic_web_search_version=ANTHROPIC_WEB_SEARCH_46,
         anthropic_web_fetch_version=ANTHROPIC_WEB_FETCH_46,
         anthropic_required_betas=(ANTHROPIC_WEB_TOOLS_BETA_46,),
+        managed_process_poll_folding=True,
+        process_poll_default_wait_seconds=250,
         default_provider=Provider.ANTHROPIC,
+        model_specific=ANTHROPIC_MODEL_SPECIFIC,
     )
     ANTHROPIC_SONNET_5 = ANTHROPIC_SONNET_46.model_copy(
         update={
@@ -597,35 +684,17 @@ class ModelDatabase:
         cache_ttl="5m",
         anthropic_web_search_version=ANTHROPIC_WEB_SEARCH_LEGACY,
         anthropic_web_fetch_version=ANTHROPIC_WEB_FETCH_LEGACY,
+        managed_process_poll_folding=True,
+        process_poll_default_wait_seconds=250,
         default_provider=Provider.ANTHROPIC,
+        model_specific=ANTHROPIC_MODEL_SPECIFIC,
     )
     DEEPSEEK_V4_FLASH = ModelParameters(
         context_window=1_048_576,
         max_output_tokens=393_216,
         tokenizes=TEXT_ONLY,
-        json_mode="object",
-        reasoning="reasoning_content",
-        reasoning_effort_spec=DEEPSEEK_REASONING_EFFORT_SPEC,
-        default_provider=Provider.DEEPSEEK,
-    )
-
-    DEEPSEEK_V4_PRO = DEEPSEEK_V4_FLASH.model_copy()
-
-    DEEPSEEK_CHAT_STANDARD = DEEPSEEK_V4_FLASH.model_copy(
-        update={
-            "reasoning": None,
-            "reasoning_effort_spec": None,
-            "max_output_tokens": 8192,
-            "fast": True,
-        }
-    )
-
-    DEEPSEEK_REASONER = ModelParameters(
-        context_window=1_048_576,
-        max_output_tokens=393_216,
-        tokenizes=TEXT_ONLY,
         json_mode="schema",
-        reasoning="reasoning_content",
+        reasoning="openai",
         reasoning_effort_spec=DEEPSEEK_REASONING_EFFORT_SPEC,
         default_provider=Provider.DEEPSEEK,
     )
@@ -744,6 +813,26 @@ class ModelDatabase:
         default_provider=Provider.HUGGINGFACE,
         model_specific="You have vision capabilities.",
     )
+    KIMI_K3 = ModelParameters(
+        context_window=1_048_576,
+        max_output_tokens=131_072,
+        tokenizes=KIMI_K3_MULTIMODAL,
+        json_mode="schema",
+        structured_tool_policy="no_tools",
+        reasoning="reasoning_content",
+        reasoning_effort_spec=KIMI_K3_REASONING_EFFORT_SPEC,
+        stream_mode="manual",
+        default_provider=Provider.MOONSHOT,
+        model_specific="You have image and video understanding capabilities.",
+        shell_output_byte_limit=16_000,
+    )
+    KIMI_K3_HF = KIMI_K3.model_copy(
+        update={
+            "tokenizes": OPENAI_VISION,
+            "default_provider": Provider.HUGGINGFACE,
+            "model_specific": "You have image understanding capabilities.",
+        }
+    )
 
     GROK_43 = ModelParameters(
         context_window=1_000_000,
@@ -756,6 +845,7 @@ class ModelDatabase:
         default_provider=Provider.XAI,
         response_transports=("sse", "websocket"),
         response_websocket_providers=(Provider.XAI,),
+        process_poll_default_wait_seconds=240,
     )
 
     GROK_45 = ModelParameters(
@@ -769,6 +859,9 @@ class ModelDatabase:
         default_provider=Provider.XAI,
         response_transports=("sse", "websocket"),
         response_websocket_providers=(Provider.XAI,),
+        managed_process_poll_folding=True,
+        process_poll_default_wait_seconds=240,
+        shell_output_byte_limit=16_000,
     )
 
     MUSE_SPARK_11 = ModelParameters(
@@ -777,6 +870,8 @@ class ModelDatabase:
         tokenizes=META_AI_MULTIMODAL,
         json_mode="schema",
         structured_tool_policy="always",
+        reasoning="openai",
+        reasoning_effort_spec=MUSE_SPARK_REASONING_EFFORT_SPEC,
         default_provider=Provider.META_AI,
         response_transports=("sse",),
     )
@@ -864,6 +959,7 @@ class ModelDatabase:
         tokenizes=TEXT_ONLY,
         json_mode="schema",
         structured_tool_policy="no_tools",
+        default_provider=Provider.HUGGINGFACE,
     )
 
     HF_PROVIDER_DEEPSEEK32 = ModelParameters(
@@ -873,6 +969,7 @@ class ModelDatabase:
         json_mode="schema",
         structured_tool_policy="no_tools",
         reasoning="gpt_oss",
+        default_provider=Provider.HUGGINGFACE,
     )
 
     HF_PROVIDER_DEEPSEEK4_PRO = ModelParameters(
@@ -1012,6 +1109,7 @@ class ModelDatabase:
             update={
                 "reasoning_effort_spec": OPENAI_GPT_51_CLASS_REASONING,
                 "model_specific": GPT_53_PLUS_MODEL_SPECIFIC,
+                "process_poll_default_wait_seconds": 240,
             }
         ),
         "gpt-5.6": OPENAI_GPT_56,
@@ -1062,15 +1160,15 @@ class ModelDatabase:
         "claude-opus-4-6": ANTHROPIC_OPUS_46,
         "claude-opus-4-7": ANTHROPIC_OPUS_47,
         "claude-opus-4-8": ANTHROPIC_OPUS_48,
+        "claude-opus-5": ANTHROPIC_OPUS_5,
         "claude-fable-5": ANTHROPIC_FABLE_5,
         "claude-opus-4-20250514": ANTHROPIC_OPUS_4_LEGACY,
         "claude-haiku-4-5-20251001": ANTHROPIC_SONNET_4_VERSIONED,
         "claude-haiku-4-5": _with_fast(ANTHROPIC_SONNET_4_VERSIONED),
         # DeepSeek Models
-        "deepseek-chat": _with_fast(DEEPSEEK_CHAT_STANDARD),
-        "deepseek-reasoner": DEEPSEEK_REASONER,
         "deepseek-v4-flash": _with_fast(DEEPSEEK_V4_FLASH),
-        "deepseek-v4-pro": DEEPSEEK_V4_PRO,
+        # Z.ai models
+        "glm-5.2": GLM_5_2.model_copy(update={"default_provider": Provider.ZAI}),
         # Google Gemini Models (vanilla aliases and versioned)
         "gemini-2.0-flash": _with_fast(GEMINI_2_FLASH),
         "gemini-2.5-pro": GEMINI_25_STANDARD,
@@ -1090,6 +1188,8 @@ class ModelDatabase:
         "moonshotai/kimi-k2.5": KIMI_MOONSHOT_25,
         "moonshotai/kimi-k2.6": KIMI_MOONSHOT_26,
         "moonshotai/kimi-k2.7-code": KIMI_MOONSHOT_27_CODE,
+        "moonshotai/kimi-k3": KIMI_K3_HF,
+        "kimi-k3": KIMI_K3,
         "qwen/qwen3-32b": QWEN3_REASONER,
         "openai/gpt-oss-120b": OPENAI_GPT_OSS_SERIES,  # https://cookbook.openai.com/articles/openai-harmony
         "openai/gpt-oss-20b": OPENAI_GPT_OSS_SERIES,  # tool/reasoning interleave guidance
@@ -1119,9 +1219,7 @@ class ModelDatabase:
         "qwen3-max": ALIYUN_QWEN3_MODERN,
     }
     _PROVIDER_MODEL_OVERRIDES: ClassVar[dict[tuple[Provider, str], ModelParameters]] = {
-        (Provider.CODEX_RESPONSES, model): params.model_copy(
-            update={"context_window": 372_000}
-        )
+        (Provider.CODEX_RESPONSES, model): params.model_copy(update={"context_window": 372_000})
         for model, params in (
             ("gpt-5.6", OPENAI_GPT_56),
             ("gpt-5.6-sol", OPENAI_GPT_56),
@@ -1129,6 +1227,12 @@ class ModelDatabase:
             ("gpt-5.6-luna", _with_fast(OPENAI_GPT_56_LUNA)),
         )
     }
+    _PROVIDER_MODEL_OVERRIDES[(Provider.ZAI, "glm-5.2")] = GLM_5_2.model_copy(
+        update={
+            "default_provider": Provider.ZAI,
+            "process_poll_default_wait_seconds": 240,
+        }
+    )
     _PROVIDER_WIRE_MODEL_NAMES: ClassVar[dict[tuple[Provider, str], str]] = {}
 
     @classmethod
@@ -1246,6 +1350,17 @@ class ModelDatabase:
         """Get maximum output tokens for a model"""
         params = cls.get_model_params(model, provider=provider)
         return params.max_output_tokens if params else None
+
+    @classmethod
+    def get_shell_output_byte_limit(
+        cls,
+        model: str,
+        *,
+        provider: Provider | None = None,
+    ) -> int | None:
+        """Get a model-specific shell output preview default."""
+        params = cls.get_model_params(model, provider=provider)
+        return params.shell_output_byte_limit if params else None
 
     @classmethod
     def get_tokenizes(cls, model: str, *, provider: Provider | None = None) -> list[str] | None:

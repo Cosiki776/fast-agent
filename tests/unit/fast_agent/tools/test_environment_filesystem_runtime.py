@@ -1,10 +1,15 @@
 from __future__ import annotations
 
+import base64
 import logging
+import struct
+import zlib
+from io import BytesIO
 from pathlib import Path
 
 import pytest
 from mcp.types import ImageContent, TextContent
+from PIL import Image
 
 from fast_agent.agents.agent_types import AgentConfig
 from fast_agent.agents.mcp_agent import McpAgent
@@ -21,8 +26,36 @@ from fast_agent.tools.execution_environment import (
     ShellExecutionResult,
     ShellRuntimeInfo,
 )
+from fast_agent.tools.local_filesystem_runtime import LocalFilesystemRuntime
 from fast_agent.tools.local_shell_executor import LocalEnvironment
 from fast_agent.tools.skill_reader import READ_SKILL_TOOL_NAME
+
+_PNG_BYTES = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+)
+
+
+def _image_bytes(image_format: str) -> bytes:
+    output = BytesIO()
+    Image.new("RGB", (1, 1), color="blue").save(output, format=image_format)
+    return output.getvalue()
+
+
+def _png_chunk(chunk_type: bytes, data: bytes) -> bytes:
+    checksum = zlib.crc32(chunk_type + data)
+    return struct.pack(">I", len(data)) + chunk_type + data + struct.pack(">I", checksum)
+
+
+def _png_with_excess_raster_data() -> bytes:
+    width, height = 262, 250
+    raster = b"".join(b"\0" + b"\0\0\0" * 263 for _ in range(height))
+    header = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + _png_chunk(b"IHDR", header)
+        + _png_chunk(b"IDAT", zlib.compress(raster))
+        + _png_chunk(b"IEND", b"")
+    )
 
 
 class FakeEnvironment:
@@ -182,7 +215,7 @@ async def test_environment_filesystem_runtime_preserves_full_file_content() -> N
 @pytest.mark.asyncio
 async def test_environment_filesystem_runtime_attaches_environment_media() -> None:
     env = FakeEnvironment()
-    env.binary_files["/workspace/image.png"] = b"\x89PNG\r\n"
+    env.binary_files["/workspace/image.png"] = _PNG_BYTES
     runtime = EnvironmentFilesystemRuntime(env, enable_attach_media="on")
 
     tool_names = {tool.name for tool in runtime.tools}
@@ -197,6 +230,117 @@ async def test_environment_filesystem_runtime_attaches_environment_media() -> No
     assert "Staged image.png as embedded image/png media input" in _text(result)
     assert len(pending) == 1
     assert isinstance(pending[0], ImageContent)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("runtime_kind", ["local", "environment"])
+async def test_filesystem_runtimes_normalize_png_with_excess_raster_data(
+    runtime_kind: str,
+    tmp_path: Path,
+) -> None:
+    malformed_png = _png_with_excess_raster_data()
+    with Image.open(BytesIO(malformed_png)) as image:
+        image.verify()
+    with Image.open(BytesIO(malformed_png)) as image:
+        image.load()
+
+    if runtime_kind == "local":
+        image_path = tmp_path / "crop.png"
+        image_path.write_bytes(malformed_png)
+        runtime = LocalFilesystemRuntime(
+            logging.getLogger("local-filesystem-runtime-test"),
+            enable_attach_media="on",
+            working_directory=tmp_path,
+        )
+        result = await runtime.attach_media({"source": "crop.png", "mime_type": "image/png"})
+    else:
+        env = FakeEnvironment()
+        env.binary_files["/workspace/crop.png"] = malformed_png
+        runtime = EnvironmentFilesystemRuntime(env, enable_attach_media="on")
+        result = await runtime.call_tool(
+            "attach_media",
+            {"source": "crop.png", "mime_type": "image/png"},
+        )
+
+    assert result.isError is False
+    pending = runtime.consume_pending_media_attachments()
+    assert len(pending) == 1
+    assert isinstance(pending[0], ImageContent)
+    normalized_png = base64.b64decode(pending[0].data)
+    assert normalized_png != malformed_png
+    with Image.open(BytesIO(normalized_png)) as image:
+        image.load()
+        assert image.size == (262, 250)
+        assert image.getpixel((261, 249)) == (0, 0, 0)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("data", "error"),
+    [
+        (
+            b"not an image",
+            "does not contain valid 'image/png' data",
+        ),
+        (
+            b"\x89PNG\r\n\x1a\ntruncated",
+            "does not contain valid 'image/png' data",
+        ),
+    ],
+)
+async def test_environment_filesystem_runtime_rejects_invalid_image_data(
+    data: bytes,
+    error: str,
+) -> None:
+    env = FakeEnvironment()
+    env.binary_files["/workspace/image.png"] = data
+    runtime = EnvironmentFilesystemRuntime(env, enable_attach_media="on")
+
+    result = await runtime.call_tool(
+        "attach_media",
+        {"source": "image.png", "mime_type": "image/png"},
+    )
+
+    assert result.isError is True
+    assert error in _text(result)
+    assert runtime.consume_pending_media_attachments() == []
+
+
+@pytest.mark.asyncio
+async def test_environment_filesystem_runtime_converts_ppm_to_png() -> None:
+    env = FakeEnvironment()
+    env.binary_files["/workspace/screen.ppm"] = b"P6\n1 1\n255\n\x00\x00\x00"
+    runtime = EnvironmentFilesystemRuntime(env, enable_attach_media="on")
+
+    result = await runtime.call_tool(
+        "attach_media",
+        {"source": "screen.ppm", "mime_type": "image/png"},
+    )
+    pending = runtime.consume_pending_media_attachments()
+
+    assert result.isError is False
+    assert "Converted screen.ppm from image/x-portable-anymap to image/png" in _text(result)
+    assert len(pending) == 1
+    assert isinstance(pending[0], ImageContent)
+    assert pending[0].mimeType == "image/png"
+    assert base64.b64decode(pending[0].data).startswith(b"\x89PNG\r\n\x1a\n")
+
+
+@pytest.mark.asyncio
+async def test_environment_filesystem_runtime_detects_pillow_image_without_known_mime() -> None:
+    env = FakeEnvironment()
+    env.binary_files["/workspace/screen.tga"] = _image_bytes("TGA")
+    runtime = EnvironmentFilesystemRuntime(env, enable_attach_media="on")
+
+    result = await runtime.call_tool("attach_media", {"source": "screen.tga"})
+    pending = runtime.consume_pending_media_attachments()
+
+    assert result.isError is False
+    assert "Converted screen.tga from image/x-tga to image/png" in _text(result)
+    assert len(pending) == 1
+    assert isinstance(pending[0], ImageContent)
+    assert pending[0].mimeType == "image/png"
+    assert base64.b64decode(pending[0].data).startswith(b"\x89PNG\r\n\x1a\n")
 
 
 @pytest.mark.asyncio
@@ -263,13 +407,7 @@ async def test_environment_filesystem_runtime_applies_patch_to_remote_files() ->
         "apply_patch",
         {
             "input": (
-                "*** Begin Patch\n"
-                "*** Update File: notes.txt\n"
-                "@@\n"
-                "-one\n"
-                "+ONE\n"
-                " two\n"
-                "*** End Patch\n"
+                "*** Begin Patch\n*** Update File: notes.txt\n@@\n-one\n+ONE\n two\n*** End Patch\n"
             )
         },
     )
@@ -277,6 +415,52 @@ async def test_environment_filesystem_runtime_applies_patch_to_remote_files() ->
     assert result.isError is False
     assert env.files["/workspace/notes.txt"] == "ONE\ntwo\n"
     assert "M notes.txt" in _text(result)
+
+
+@pytest.mark.asyncio
+async def test_environment_filesystem_runtime_move_removes_source_file() -> None:
+    env = FakeEnvironment()
+    env.files["/workspace/a.py"] = "print('hi')\n"
+    runtime = EnvironmentFilesystemRuntime(env, enable_read=True, enable_apply_patch=True)
+
+    result = await runtime.call_tool(
+        "apply_patch",
+        {
+            "input": (
+                "*** Begin Patch\n"
+                "*** Update File: a.py\n"
+                "*** Move to: b.py\n"
+                "@@\n"
+                "-print('hi')\n"
+                "+print('hello')\n"
+                "*** End Patch\n"
+            )
+        },
+    )
+
+    assert result.isError is False
+    assert env.files["/workspace/b.py"] == "print('hello')\n"
+    assert "/workspace/a.py" not in env.files
+
+
+@pytest.mark.asyncio
+async def test_environment_filesystem_runtime_reports_edit_write_failure() -> None:
+    class FailingWriteEnvironment(FakeEnvironment):
+        async def write_text(self, path: str, content: str) -> None:
+            del path, content
+            raise OSError("disk full")
+
+    env = FailingWriteEnvironment()
+    env.files["/workspace/notes.txt"] = "hello world\n"
+    runtime = EnvironmentFilesystemRuntime(env, enable_edit_file=True)
+
+    result = await runtime.call_tool(
+        "edit_file",
+        {"path": "notes.txt", "old_string": "world", "new_string": "there"},
+    )
+
+    assert result.isError is True
+    assert _text(result) == "Error writing file: disk full"
 
 
 @pytest.mark.asyncio
@@ -293,12 +477,13 @@ async def test_mcp_agent_routes_file_tools_to_injected_execution_environment() -
     agent = McpAgent(config=config, context=Context(), shell_environment=env)
 
     tool_names = {tool.name for tool in (await agent.list_tools()).tools}
-    assert "execute" in tool_names
+    assert "bash" in tool_names
+    assert "process" in tool_names
     assert "read_text_file" in tool_names
     assert "apply_patch" in tool_names
 
     read = await agent.call_tool("read_text_file", {"path": "remote.txt"})
-    shell = await agent.call_tool("execute", {"command": "pwd"})
+    shell = await agent.call_tool("bash", {"command": "pwd"})
 
     assert read.isError is False
     assert _text(read) == "remote file\n"
@@ -322,7 +507,8 @@ async def test_mcp_agent_does_not_expose_host_file_tools_for_shell_only_environm
 
     tool_names = {tool.name for tool in (await agent.list_tools()).tools}
 
-    assert "execute" in tool_names
+    assert "bash" in tool_names
+    assert "process" in tool_names
     assert "read_text_file" not in tool_names
     assert "write_text_file" not in tool_names
     assert "apply_patch" not in tool_names
@@ -335,7 +521,7 @@ async def test_mcp_agent_does_not_expose_host_file_tools_for_shell_only_environm
 @pytest.mark.asyncio
 async def test_mcp_agent_stages_media_from_injected_execution_environment() -> None:
     env = FakeEnvironment()
-    env.binary_files["/workspace/image.png"] = b"\x89PNG\r\n"
+    env.binary_files["/workspace/image.png"] = _PNG_BYTES
     config = AgentConfig(
         name="test",
         instruction="Instruction",

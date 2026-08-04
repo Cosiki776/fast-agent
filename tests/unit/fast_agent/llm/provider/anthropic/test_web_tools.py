@@ -124,11 +124,17 @@ def test_serialize_anthropic_text_payload_flattens_nested_text_objects() -> None
 
 
 class _DummyStreamManager:
-    async def __aenter__(self):
+    async def __aenter__(self) -> _DummyStreamManager:
         return self
 
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
+    async def __aexit__(self, *_args: object) -> bool:
         return False
+
+    def __aiter__(self) -> _DummyStreamManager:
+        return self
+
+    async def __anext__(self) -> Any:
+        raise StopAsyncIteration
 
 
 class _FinalMessageValidationFailureStream:
@@ -191,6 +197,22 @@ def test_web_search_enabled_property_reflects_search_only() -> None:
     assert llm.web_tools_enabled == (False, True)
     assert llm.web_search_enabled is False
     assert llm.web_fetch_enabled is True
+
+
+def test_opus_5_supports_web_search_but_not_web_fetch() -> None:
+    llm = _create_llm(
+        model="claude-opus-5",
+        web_search=AnthropicWebSearchSettings(enabled=True),
+        web_fetch=AnthropicWebFetchSettings(enabled=True),
+    )
+
+    tools, betas = llm._prepare_web_tools("claude-opus-5")
+
+    assert llm.web_search_supported is True
+    assert llm.web_fetch_supported is False
+    assert [tool["name"] for tool in tools] == ["web_search"]
+    assert tools[0]["type"] == "web_search_20260209"
+    assert betas == ("code-execution-web-tools-2026-02-09",)
 
 
 @pytest.mark.asyncio

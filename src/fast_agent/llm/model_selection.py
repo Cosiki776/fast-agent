@@ -82,8 +82,9 @@ class ModelSelectionCatalog:
         ),
         Provider.ANTHROPIC: (
             CatalogModelEntry(alias="fable", model="claude-fable-5"),
-            CatalogModelEntry(alias="opus", model="claude-opus-4-8"),
+            CatalogModelEntry(alias="opus", model="claude-opus-5"),
             CatalogModelEntry(alias="sonnet", model="claude-sonnet-5"),
+            CatalogModelEntry(alias="opus48", model="claude-opus-4-8"),
             CatalogModelEntry(alias="opus46", model="claude-opus-4-6"),
             CatalogModelEntry(alias="haiku", model="claude-haiku-4-5", fast=True),
         ),
@@ -123,9 +124,9 @@ class ModelSelectionCatalog:
         ),
         Provider.XAI: (
             CatalogModelEntry(alias="Grok 4.5", model="xai.grok-4.5"),
+            CatalogModelEntry(alias="Grok 4.5 (X Search)", model="xai.grok-4.5?x_search=true"),
             CatalogModelEntry(alias="Grok 4.3", model="xai.grok-4.3"),
             CatalogModelEntry(alias="Grok 4.3 (instant)", model="xai.grok-4.3?reasoning=none"),
-            CatalogModelEntry(alias="Grok 4.3 (X Search)", model="xai.grok-4.3?x_search=true"),
         ),
         Provider.META_AI: (
             CatalogModelEntry(alias="Muse Spark 1.1", model="metaai.muse-spark-1.1"),
@@ -133,20 +134,23 @@ class ModelSelectionCatalog:
         Provider.DEEPSEEK: (
             CatalogModelEntry(
                 alias="deepseek",
-                display_label="DeepSeek V4 Pro",
-                model="deepseek.deepseek-v4-pro",
-            ),
-            CatalogModelEntry(
-                alias="deepseek4flash",
                 display_label="DeepSeek V4 Flash",
                 model="deepseek.deepseek-v4-flash",
                 fast=True,
             ),
+        ),
+        Provider.ZAI: (
             CatalogModelEntry(
-                alias="deepseek3",
-                model="deepseek.deepseek-chat",
-                fast=True,
-                current=False,
+                alias="zaiglm",
+                display_label="GLM 5.2",
+                model="zai.glm-5.2",
+            ),
+        ),
+        Provider.MOONSHOT: (
+            CatalogModelEntry(
+                alias="kimik3",
+                display_label="Kimi K3",
+                model="moonshot.kimi-k3",
             ),
         ),
         Provider.OPENROUTER: (),
@@ -155,6 +159,20 @@ class ModelSelectionCatalog:
             CatalogModelEntry(alias="qwen3-max", model="aliyun.qwen3-max"),
         ),
         Provider.HUGGINGFACE: (
+            CatalogModelEntry(
+                alias="Kimi K3 (fireworks-ai)",
+                display_label="Kimi K3 (fireworks-ai)",
+                description="image-only HF route",
+                model="hf.moonshotai/Kimi-K3:fireworks-ai",
+                current=True,
+            ),
+            CatalogModelEntry(
+                alias="Kimi K3 (together)",
+                display_label="Kimi K3 (together)",
+                description="image-only HF route",
+                model="hf.moonshotai/Kimi-K3:together",
+                current=True,
+            ),
             CatalogModelEntry(
                 alias="GLM 5.2 (zai-org)",
                 display_label="GLM 5.2 (zai-org)",
@@ -626,6 +644,15 @@ class ModelSelectionCatalog:
             env_key = ProviderKeyManager.get_env_var(provider_name)
             if config_key or env_key:
                 providers.append(provider)
+                continue
+
+            # OAuth / external credential stores are valid runtime sources for
+            # providers that intentionally support them. Keep this narrow so
+            # fallbacks like generic/ollama or optional HF hub tokens do not
+            # mark every local provider "configured".
+            if provider in {Provider.CODEX_RESPONSES, Provider.XAI}:
+                if ProviderKeyManager._provider_specific_fallback_key(provider_name):
+                    providers.append(provider)
 
         return providers
 

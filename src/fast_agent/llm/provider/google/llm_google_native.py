@@ -29,7 +29,10 @@ from fast_agent.llm.provider.google._stream_capture import (
     stream_capture_filename,
 )
 from fast_agent.llm.provider.google.google_converter import GoogleConverter, GoogleToolResult
-from fast_agent.llm.provider.streaming_timeouts import await_stream_start
+from fast_agent.llm.provider.streaming_timeouts import (
+    await_stream_start,
+    with_stream_idle_timeout,
+)
 from fast_agent.llm.provider_types import Provider
 from fast_agent.llm.reasoning_effort import (
     format_reasoning_setting,
@@ -38,7 +41,7 @@ from fast_agent.llm.reasoning_effort import (
 from fast_agent.llm.stream_types import StreamChunk
 from fast_agent.llm.tool_call_errors import format_incomplete_tool_call_error
 from fast_agent.llm.tool_tracking import ToolCallTracker
-from fast_agent.llm.usage_tracking import TurnUsage
+from fast_agent.llm.usage_tracking import usage_from_google_generate_content
 from fast_agent.mcp.prompt import Prompt
 from fast_agent.types import PromptMessageExtended, RequestParams
 from fast_agent.types.llm_stop_reason import LlmStopReason
@@ -400,8 +403,12 @@ class GoogleNativeLLM(FastAgentLLM[types.Content, types.Content]):
             )
             return None
 
-        return await self._consume_google_stream(
+        timed_stream = with_stream_idle_timeout(
             response_stream,
+            idle_timeout_seconds=timeout_seconds,
+        )
+        return await self._consume_google_stream(
+            timed_stream,
             model=model,
             capture_base=capture_base,
         )
@@ -988,7 +995,10 @@ class GoogleNativeLLM(FastAgentLLM[types.Content, types.Content]):
         if not usage_metadata:
             return
         try:
-            turn_usage = TurnUsage.from_google(usage_metadata, model_name)
+            turn_usage = usage_from_google_generate_content(
+                usage_metadata,
+                model=model_name,
+            )
             self._finalize_turn_usage(turn_usage)
         except Exception as e:
             self.logger.warning(f"Failed to track usage: {e}")

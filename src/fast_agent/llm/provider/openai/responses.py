@@ -47,7 +47,6 @@ from fast_agent.llm.provider.openai.schema_sanitizer import (
     sanitize_tool_input_schema,
     should_strip_tool_schema_defaults,
 )
-from fast_agent.llm.provider.openai.streaming_utils import with_stream_idle_timeout
 from fast_agent.llm.provider.openai.structured_output import OpenAIStructuredOutputMixin
 from fast_agent.llm.provider.openai.web_tools import (
     ResolvedOpenAIWebSearch,
@@ -55,7 +54,13 @@ from fast_agent.llm.provider.openai.web_tools import (
     resolve_web_search,
 )
 from fast_agent.llm.provider.reasoning_config import reasoning_setting_from_config
-from fast_agent.llm.provider.streaming_timeouts import enter_stream_with_timeout
+from fast_agent.llm.provider.streaming_timeouts import (
+    StreamIdleTimeoutError,
+    StreamTiming,
+    enter_stream_with_timeout,
+    stream_timing_payload,
+    with_stream_idle_timeout,
+)
 from fast_agent.llm.provider_types import Provider
 from fast_agent.llm.reasoning_effort import format_reasoning_setting, parse_reasoning_setting
 from fast_agent.llm.request_params import RequestParams
@@ -113,6 +118,7 @@ class _ResponsesCompletionContext:
     model_name: str
     transport: ResponsesTransport
     display_model: str
+    requested_service_tier: ResponsesServiceTier | None
 
 
 @dataclass(slots=True)
@@ -191,6 +197,7 @@ class ResponsesLLM(
         self._last_ws_request_mode: Literal["create", "continuation"] | None = None
         self._last_ws_turn_outcome: ResponsesWsTurnOutcome | None = None
         self._last_ws_phase_timings_ms: dict[str, float] | None = None
+        self._last_stream_timing: dict[str, int | float | bool | None] | None = None
         self._ws_turn_counters: dict[str, int] = {
             "total": 0,
             RESPONSES_WS_FRESH_OUTCOME: 0,
@@ -298,8 +305,10 @@ class ResponsesLLM(
         self._ws_turn_counters["total"] += 1
         self._ws_turn_counters[outcome] += 1
 
-    def _websocket_diagnostics_payload(self) -> dict[str, Any]:
+    def _transport_diagnostics_payload(self) -> dict[str, Any]:
         payload: dict[str, Any] = {"transport": self._last_transport_used or "unknown"}
+        if self._last_stream_timing is not None:
+            payload["stream_timing"] = self._last_stream_timing
         if self._last_transport_used != RESPONSES_TRANSPORT_WEBSOCKET:
             return payload
         if self._last_ws_request_type:
@@ -313,6 +322,25 @@ class ResponsesLLM(
         if self._last_ws_phase_timings_ms:
             payload["websocket_phase_ms"] = self._last_ws_phase_timings_ms
         return payload
+
+    def _record_successful_stream_timing(
+        self,
+        timing: StreamTiming,
+        *,
+        model: str,
+        transport: ResponsesActiveTransport,
+    ) -> None:
+        payload = stream_timing_payload(timing, timed_out=False)
+        self._last_stream_timing = payload
+        if timing.inter_event_waits_over_threshold:
+            self.logger.warning(
+                "Responses stream observed extended inter-event gap",
+                data={
+                    "model": model,
+                    "transport": transport,
+                    "stream_timing": payload,
+                },
+            )
 
     def _parse_service_tier(self, raw_value: Any) -> ResponsesServiceTier | None:
         if raw_value is None:
@@ -926,6 +954,7 @@ class ResponsesLLM(
             model_name=model_name,
             transport=transport,
             display_model=display_model,
+            requested_service_tier=self._resolve_service_tier(request_params, model_name),
         )
 
     def _reset_responses_transport_diagnostics(self) -> None:
@@ -933,6 +962,7 @@ class ResponsesLLM(
         self._last_ws_request_mode = None
         self._last_ws_turn_outcome = None
         self._last_ws_phase_timings_ms = None
+        self._last_stream_timing = None
 
     async def _run_responses_transport(
         self,
@@ -1060,11 +1090,14 @@ class ResponsesLLM(
     ) -> dict[str, list[ContentBlock]] | None:
         tool_call_diagnostics = self._consume_tool_call_diagnostics()
         diagnostics_payload = dict(tool_call_diagnostics) if tool_call_diagnostics else None
-        websocket_diagnostics = self._websocket_diagnostics_payload()
+        transport_diagnostics = self._transport_diagnostics_payload()
         if diagnostics_payload is not None:
-            diagnostics_payload.update(websocket_diagnostics)
-        elif self._last_transport_used == RESPONSES_TRANSPORT_WEBSOCKET:
-            diagnostics_payload = websocket_diagnostics
+            diagnostics_payload.update(transport_diagnostics)
+        elif (
+            self._last_transport_used == RESPONSES_TRANSPORT_WEBSOCKET
+            or self._last_stream_timing is not None
+        ):
+            diagnostics_payload = transport_diagnostics
 
         if not diagnostics_payload:
             return channels
@@ -1128,7 +1161,11 @@ class ResponsesLLM(
         channels = self._responses_server_tool_channels(response, channels)
 
         if getattr(response, "usage", None):
-            self._record_usage(response.usage, context.model_name)
+            self._record_usage(
+                response.usage,
+                context.model_name,
+                requested_service_tier=context.requested_service_tier,
+            )
         self.history.set(result.input_items)
 
         return PromptMessageExtended(
@@ -1141,6 +1178,41 @@ class ResponsesLLM(
             ),
             phase=message_phase,
         )
+
+    @staticmethod
+    def _is_empty_responses_completion(message: PromptMessageExtended) -> bool:
+        has_content = any(
+            not isinstance(block, TextContent) or bool(block.text.strip())
+            for block in message.content
+        )
+        return (
+            message.stop_reason == LlmStopReason.END_TURN
+            and not has_content
+            and not message.tool_calls
+        )
+
+    def _empty_responses_error(
+        self,
+        *,
+        context: _ResponsesCompletionContext,
+        retry_error: Exception | None = None,
+    ) -> PromptMessageExtended:
+        if retry_error is None:
+            error = RuntimeError(
+                "OpenAI Responses returned no assistant content or tool calls after one retry."
+            )
+        else:
+            error = RuntimeError(
+                f"OpenAI Responses retry after an empty response failed: {retry_error}"
+            )
+        self.logger.error(
+            str(error),
+            data={
+                "model": context.model_name,
+                "transport": self._last_transport_used or "unknown",
+            },
+        )
+        return build_stream_failure_response(self.provider, error, context.model_name)
 
     async def _responses_completion(
         self,
@@ -1163,7 +1235,38 @@ class ResponsesLLM(
                 TextContent(type="text", text=""),
                 stop_reason=LlmStopReason.CANCELLED,
             )
-        return self._finalize_responses_completion(result=result, context=context)
+        message = self._finalize_responses_completion(result=result, context=context)
+        if not self._is_empty_responses_completion(message):
+            return message
+
+        self.logger.warning(
+            "OpenAI Responses returned no assistant content or tool calls; retrying once",
+            data={
+                "model": context.model_name,
+                "transport": self._last_transport_used or "unknown",
+            },
+        )
+        self._reset_responses_transport_diagnostics()
+        try:
+            retry_result = await self._run_responses_transport(
+                input_items=input_items,
+                request_params=request_params,
+                tools=tools,
+                context=context,
+            )
+        except asyncio.CancelledError:
+            return Prompt.assistant(
+                TextContent(type="text", text=""),
+                stop_reason=LlmStopReason.CANCELLED,
+            )
+
+        retry_message = self._finalize_responses_completion(
+            result=retry_result,
+            context=context,
+        )
+        if self._is_empty_responses_completion(retry_message):
+            return self._empty_responses_error(context=context)
+        return retry_message
 
     async def _responses_completion_sse(
         self,
@@ -1189,23 +1292,34 @@ class ResponsesLLM(
                     timed_stream = with_stream_idle_timeout(
                         stream,
                         idle_timeout_seconds=timeout,
-                        timeout_message=f"Streaming was idle for more than {timeout} seconds.",
                     )
                     try:
                         response, streamed_summary = await self._process_stream(
                             timed_stream, model_name, capture_filename
                         )
-                    except TimeoutError:
-                        if timeout is None:
-                            raise
+                    except StreamIdleTimeoutError:
+                        self._record_stream_failure(timed_stream.timing)
                         self.logger.error(
                             "Streaming idle timeout while waiting for Responses",
                             data={
                                 "model": model_name,
+                                "transport": RESPONSES_TRANSPORT_SSE,
                                 "timeout_seconds": timeout,
+                                "stream_timing": stream_timing_payload(
+                                    timed_stream.timing,
+                                    timed_out=True,
+                                ),
                             },
                         )
                         raise
+                    except Exception:
+                        self._record_stream_failure(timed_stream.timing)
+                        raise
+                    self._record_successful_stream_timing(
+                        timed_stream.timing,
+                        model=model_name,
+                        transport=RESPONSES_TRANSPORT_SSE,
+                    )
                 return response, streamed_summary, normalized_input
         except AuthenticationError as e:
             raise ProviderKeyError(
@@ -1356,23 +1470,34 @@ class ResponsesLLM(
         timed_stream = with_stream_idle_timeout(
             stream,
             idle_timeout_seconds=context.timeout,
-            timeout_message=f"Streaming was idle for more than {context.timeout} seconds.",
         )
         try:
             response, streamed_summary = await self._process_stream(
                 timed_stream, context.model_name, context.capture_filename
             )
-        except TimeoutError:
-            if context.timeout is None:
-                raise
+        except StreamIdleTimeoutError:
+            self._record_stream_failure(timed_stream.timing)
             self.logger.error(
                 "Streaming idle timeout while waiting for Responses websocket",
                 data={
                     "model": context.model_name,
+                    "transport": RESPONSES_TRANSPORT_WEBSOCKET,
                     "timeout_seconds": context.timeout,
+                    "stream_timing": stream_timing_payload(
+                        timed_stream.timing,
+                        timed_out=True,
+                    ),
                 },
             )
             raise
+        except Exception:
+            self._record_stream_failure(timed_stream.timing)
+            raise
+        self._record_successful_stream_timing(
+            timed_stream.timing,
+            model=context.model_name,
+            transport=RESPONSES_TRANSPORT_WEBSOCKET,
+        )
         self._record_ws_phase(context.phase_timings, "stream_total", stream_started_at)
         if stream.first_event_monotonic is not None:
             context.phase_timings["first_event"] = round(
@@ -1567,6 +1692,8 @@ class ResponsesLLM(
         self._last_ws_request_type = None
         self._last_ws_request_mode = None
         self._last_ws_turn_outcome = None
+        self._last_ws_phase_timings_ms = None
+        self._last_stream_timing = None
         self._ws_turn_counters = {
             "total": 0,
             RESPONSES_WS_FRESH_OUTCOME: 0,

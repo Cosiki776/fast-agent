@@ -13,6 +13,7 @@ if TYPE_CHECKING:
 
 from fast_agent.core.logging.events import Event, EventFilter, EventType
 from fast_agent.utils.text import strip_str_to_none
+from fast_agent.utils.tool_names import POLL_PROCESS_TOOL_NAME, matches_tool_name
 
 
 def _optional_text_or_none(value: object) -> str | None:
@@ -21,6 +22,20 @@ def _optional_text_or_none(value: object) -> str | None:
 
 def _optional_text(value: object) -> str:
     return _optional_text_or_none(value) or ""
+
+
+def _optional_float(value: object) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return max(float(value), 0.0)
+
+
+def _optional_nonnegative_int(value: object) -> int | None:
+    return value if type(value) is int and value >= 0 else None
+
+
+def _optional_bool(value: object) -> bool | None:
+    return value if isinstance(value, bool) else None
 
 
 def _first_text(*values: object) -> str | None:
@@ -108,7 +123,10 @@ def _mcp_progress_details(
     from fast_agent.event_progress import ProgressAction
 
     details = tool_context or _optional_text(server_name)
-    if action == ProgressAction.READING_RESOURCE:
+    if action in {
+        ProgressAction.READING_RESOURCE,
+        ProgressAction.RESOURCE_READ,
+    }:
         return _append_details(details, str(raw_details or ""))
     if action == ProgressAction.TOOL_PROGRESS:
         return _append_details(details, str(raw_details or ""))
@@ -152,12 +170,18 @@ def _target_and_details(
     target = event_data.get("agent_name")
     raw_details = event_data.get("details", "")
     server_name = event_data.get("server_name")
+    tool_name = _optional_text_or_none(event_data.get("tool_name"))
 
     if action == ProgressAction.FATAL_ERROR:
         fallback_target = _optional_text(server_name)
         return str(target or fallback_target), str(
             event_data.get("error_message", "An error occurred")
         )
+    if action == ProgressAction.CALLING_TOOL and matches_tool_name(
+        tool_name,
+        POLL_PROCESS_TOOL_NAME,
+    ):
+        return str(target or ""), _optional_text(raw_details)
 
     if "mcp_aggregator" in event.namespace:
         return str(target or ""), _mcp_progress_details(
@@ -176,7 +200,7 @@ def _target_and_details(
             action=action,
             tool_context=tool_context,
             raw_details=raw_details,
-        )
+        ),
     )
 
 
@@ -260,6 +284,26 @@ def convert_log_event(event: Event) -> "ProgressEvent | None":
         tool_event=_optional_text_or_none(event_data.get("tool_event")),
         tool_state=_optional_text_or_none(event_data.get("tool_state")),
         tool_terminal=bool(event_data.get("tool_terminal", False)),
+        process_elapsed_seconds=_optional_float(event_data.get("process_elapsed_seconds")),
+        process_command=_optional_text_or_none(event_data.get("process_command")),
+        process_id=_optional_text_or_none(event_data.get("process_id")),
+        process_wait_seconds=_optional_nonnegative_int(event_data.get("process_wait_seconds")),
+        process_yield_reason=_optional_text_or_none(event_data.get("process_yield_reason")),
+        process_has_observed_output=_optional_bool(event_data.get("process_has_observed_output")),
+        process_seconds_since_last_output=_optional_float(
+            event_data.get("process_seconds_since_last_output")
+        ),
+        process_total_output_bytes=_optional_nonnegative_int(
+            event_data.get("process_total_output_bytes")
+        ),
+        process_seconds_since_last_stdout=_optional_float(
+            event_data.get("process_seconds_since_last_stdout")
+        ),
+        process_seconds_since_last_stderr=_optional_float(
+            event_data.get("process_seconds_since_last_stderr")
+        ),
+        process_stdout_bytes=_optional_nonnegative_int(event_data.get("process_stdout_bytes")),
+        process_stderr_bytes=_optional_nonnegative_int(event_data.get("process_stderr_bytes")),
         streaming_tokens=_streaming_tokens(action, event_data),
         progress=progress,
         total=total,

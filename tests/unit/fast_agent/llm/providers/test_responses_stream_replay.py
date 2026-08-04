@@ -8,6 +8,8 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from openai import APIError
+from openai.types.responses import ResponseErrorEvent
 
 from fast_agent.core.logging.logger import get_logger
 from fast_agent.llm.provider.openai.openresponses_streaming import OpenResponsesStreamingMixin
@@ -362,13 +364,8 @@ async def test_responses_stream_uses_summary_index_for_split_heading_boundary() 
     reasoning_text = "".join(
         event["text"] for event in harness.stream_events if event["is_reasoning"]
     )
-    assert reasoning_text == (
-        "**Planning server initialization**\n\n"
-        "**Reducing endpoint calls**"
-    )
-    assert reasoning_parts == [
-        "**Planning server initialization**\n\n**Reducing endpoint calls**"
-    ]
+    assert reasoning_text == ("**Planning server initialization**\n\n**Reducing endpoint calls**")
+    assert reasoning_parts == ["**Planning server initialization**\n\n**Reducing endpoint calls**"]
 
 
 @pytest.mark.unit
@@ -488,9 +485,22 @@ async def test_responses_stream_namespaces_mcp_call_tool_with_server_label() -> 
 
 @pytest.mark.unit
 @pytest.mark.asyncio
-async def test_openresponses_out_of_order_tool_events_are_ignored() -> None:
+async def test_openresponses_out_of_order_tool_call_is_recovered_from_completed_items() -> None:
+    """An out-of-order tool item is recovered when the terminal payload arrives empty.
+
+    The provider never sent ``response.output_item.added``, so the tool is not tracked
+    during the stream, and the terminal response reports no output at all. Rather than
+    dropping the call, the completed item is reconstructed into ``output`` so it is
+    surfaced and dispatched.
+    """
     harness = _OpenResponsesHarness()
     final_response = SimpleNamespace(output=[], usage=None)
+    completed_item = SimpleNamespace(
+        type="function_call",
+        id="fc_123",
+        call_id="call_123",
+        name="weather",
+    )
     stream = _FakeResponsesStream(
         events=[
             SimpleNamespace(
@@ -501,22 +511,22 @@ async def test_openresponses_out_of_order_tool_events_are_ignored() -> None:
                 type="response.output_item.done",
                 output_index=5,
                 item_id="fc_123",
-                item=SimpleNamespace(
-                    type="function_call",
-                    id="fc_123",
-                    call_id="call_123",
-                    name="weather",
-                ),
+                item=completed_item,
             ),
             SimpleNamespace(type="response.completed", response=final_response),
         ],
         final_response=final_response,
     )
 
-    await harness._process_stream(stream, model="gpt-test", capture_filename=None)
+    recovered, _reasoning = await harness._process_stream(
+        stream, model="gpt-test", capture_filename=None
+    )
+
+    assert recovered.output == [completed_item]
+    assert final_response.output == []
 
     stop_events = [event for event in harness.tool_events if event["event_type"] == "stop"]
-    assert stop_events == []
+    assert [event["payload"]["tool_name"] for event in stop_events] == ["weather"]
 
 
 @pytest.mark.unit
@@ -752,3 +762,72 @@ async def test_incomplete_responses_return_final_payload(
     )
 
     assert returned_response is final_response
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_failed_responses_raise_provider_error_details() -> None:
+    harness = _ResponsesHarness()
+    final_response = SimpleNamespace(
+        status="failed",
+        error=SimpleNamespace(
+            code="server_error",
+            message="DeepSeek generation failed",
+        ),
+        output=[],
+        usage=None,
+    )
+    stream = _FakeResponsesStream(
+        events=[
+            SimpleNamespace(
+                type="response.failed",
+                response=final_response,
+            )
+        ],
+        final_response=final_response,
+    )
+
+    with pytest.raises(APIError, match="DeepSeek generation failed") as exc_info:
+        await harness._process_stream(
+            stream,
+            model="deepseek-v4-flash",
+            capture_filename=None,
+        )
+
+    assert exc_info.value.body == {
+        "error": {
+            "message": "DeepSeek generation failed",
+            "code": "server_error",
+        }
+    }
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_error_event_raises_provider_error_details() -> None:
+    harness = _ResponsesHarness()
+    error_event = ResponseErrorEvent(
+        code="rate_limit_exceeded",
+        message="Too many requests",
+        param=None,
+        sequence_number=1,
+        type="error",
+    )
+    stream = _FakeResponsesStream(
+        events=[error_event],
+        final_response=SimpleNamespace(output=[], usage=None),
+    )
+
+    with pytest.raises(APIError, match="Too many requests") as exc_info:
+        await harness._process_stream(
+            stream,
+            model="deepseek-v4-flash",
+            capture_filename=None,
+        )
+
+    assert exc_info.value.body == {
+        "error": {
+            "message": "Too many requests",
+            "code": "rate_limit_exceeded",
+        }
+    }

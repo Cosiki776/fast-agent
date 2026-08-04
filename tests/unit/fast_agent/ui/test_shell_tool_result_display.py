@@ -1,8 +1,10 @@
 from mcp.types import CallToolResult, TextContent
 
 from fast_agent.config import Settings, ShellSettings
+from fast_agent.constants import FAST_AGENT_SHELL_PROCESS_METADATA
 from fast_agent.ui import console
 from fast_agent.ui.console_display import ConsoleDisplay
+from fast_agent.ui.progress_display import progress_display
 from fast_agent.ui.shell_output_truncation import SHELL_OUTPUT_TRUNCATION_MARKER
 
 
@@ -22,7 +24,7 @@ def test_shell_tool_result_uses_styled_exit_line() -> None:
             tool_call_id="call_abcdef0123456789",
         )
 
-    rendered = capture.get()
+    rendered = " ".join(capture.get().split())
     assert "hello" in rendered
     assert "exit code 0" in rendered
     assert "1 line" in rendered
@@ -51,6 +53,154 @@ def test_shell_tool_result_no_output_adds_no_output_detail() -> None:
     assert "0 lines" not in rendered
     assert "process exit code was 0" not in rendered
     assert "(empty text)" not in rendered
+
+
+def test_poll_process_result_hides_process_metadata_and_keeps_exit_banner() -> None:
+    display = ConsoleDisplay()
+    result = CallToolResult(
+        content=[
+            TextContent(
+                type="text",
+                text="finished\nprocess_id: process-1\nprocess exit code was 0",
+            )
+        ],
+        isError=False,
+    )
+    setattr(result, "output_line_count", 1)
+
+    with console.console.capture() as capture:
+        display.show_tool_result(result, name="dev", tool_name="poll_process")
+
+    rendered = capture.get()
+    assert "finished" in rendered
+    assert "process_id:" not in rendered
+    assert "exit code 0" in rendered
+    assert "1 line" in rendered
+
+
+def test_running_process_result_uses_compact_lifecycle_line() -> None:
+    display = ConsoleDisplay()
+    result = CallToolResult(
+        content=[
+            TextContent(
+                type="text",
+                text="\n".join(
+                    [
+                        "building",
+                        "Process is still running because it reached the foreground yield threshold.",
+                        "process_id: process-2",
+                        "os_pid: 4321",
+                        "elapsed_seconds: 30.0",
+                        "total_output_bytes: 9",
+                        "Use poll_process to monitor it or terminate_process to stop it.",
+                    ]
+                ),
+            )
+        ],
+        isError=False,
+    )
+
+    with console.console.capture() as capture:
+        display.show_tool_result(result, name="dev", tool_name="execute")
+
+    rendered = capture.get()
+    assert "building" in rendered
+    assert "▶ process-2 running • foreground yield • 30.0s • pid 4321" in rendered
+    assert "total_output_bytes" not in rendered
+    assert "Use poll_process" not in rendered
+
+
+def test_quiet_running_poll_result_is_not_rendered() -> None:
+    display = ConsoleDisplay()
+    result = CallToolResult(
+        content=[
+            TextContent(
+                type="text",
+                text="\n".join(
+                    [
+                        "Process is still running.",
+                        "process_id: process-2",
+                        "elapsed_seconds: 30.0",
+                        "total_output_bytes: 0",
+                    ]
+                ),
+            )
+        ],
+        isError=False,
+    )
+    result.meta = {
+        FAST_AGENT_SHELL_PROCESS_METADATA: {
+            "process_id": "process-2",
+            "process_status": "running",
+            "poll_wait_sec": 30,
+        }
+    }
+
+    for tool_name in ("poll_process", "Process"):
+        with console.console.capture() as capture:
+            display.show_tool_result(result, name="dev", tool_name=tool_name)
+
+        assert capture.get() == ""
+
+
+def test_process_non_poll_result_is_rendered() -> None:
+    display = ConsoleDisplay()
+    result = CallToolResult(
+        content=[TextContent(type="text", text="Process is still running.")],
+        isError=False,
+    )
+
+    with console.console.capture() as capture:
+        display.show_tool_result(result, name="dev", tool_name="Process")
+
+    assert "Process is still running" in capture.get()
+
+
+def test_managed_process_poll_uses_shared_elapsed_format() -> None:
+    display = ConsoleDisplay()
+    progress_display.set_default_agent_name("dev")
+
+    try:
+        with console.console.capture() as capture:
+            display.show_managed_process_poll(
+                name=None,
+                process_id="process-2",
+                command="uv run worker.py",
+                elapsed_seconds=7_200,
+                wait_sec=50,
+                has_observed_output=True,
+                seconds_since_last_output=9,
+                total_output_bytes=12_500,
+                tool_call_id="call_abcdef0123456789",
+            )
+    finally:
+        progress_display.set_default_agent_name(None)
+
+    rendered = " ".join(capture.get().split())
+    assert "dev" not in rendered
+    assert (
+        "process-2 · out — · err — · time 2h · size 12.5KB · uv run worker.py · id: call_…456789"
+    ) in rendered
+
+
+def test_terminate_process_result_uses_compact_lifecycle_line() -> None:
+    display = ConsoleDisplay()
+    result = CallToolResult(
+        content=[
+            TextContent(
+                type="text",
+                text="process_id: process-3\noutcome: terminated",
+            )
+        ],
+        isError=False,
+    )
+
+    with console.console.capture() as capture:
+        display.show_tool_result(result, name="dev", tool_name="terminate_process")
+
+    rendered = capture.get()
+    assert "▶ process-3 terminated" in rendered
+    assert "outcome:" not in rendered
 
 
 def test_shell_tool_result_truncates_with_head_and_tail_windows() -> None:

@@ -21,6 +21,7 @@ class ProgressAction(str, Enum):
     READY = "Ready"
     CALLING_TOOL = "Calling Tool"
     READING_RESOURCE = "Reading Resource"
+    RESOURCE_READ = "Resource Read"
     TOOL_PROGRESS = "Tool Progress"
     UPDATED = "Updated"
     FINISHED = "Finished"
@@ -43,6 +44,18 @@ class ProgressEvent(BaseModel):
     tool_event: str | None = None
     tool_state: str | None = None
     tool_terminal: bool = False
+    process_elapsed_seconds: float | None = None
+    process_command: str | None = None
+    process_id: str | None = None
+    process_wait_seconds: int | None = None
+    process_yield_reason: str | None = None
+    process_has_observed_output: bool | None = None
+    process_seconds_since_last_output: float | None = None
+    process_total_output_bytes: int | None = None
+    process_seconds_since_last_stdout: float | None = None
+    process_seconds_since_last_stderr: float | None = None
+    process_stdout_bytes: int | None = None
+    process_stderr_bytes: int | None = None
     streaming_tokens: str | None = None  # Special field for streaming token count
     progress: float | None = None  # Current progress value
     total: float | None = None  # Total value for progress calculation

@@ -217,7 +217,7 @@ Anthropic models fall into three groups:
 - **Budget-based thinking** (older models): defaults to a 1024 token budget. Set `reasoning` to a
   budget integer or disable with `"0"`/`off`/`false`. You can also pass `low`/`medium`/`high`/`max`,
   which map to preset budgets.
-- **Adaptive thinking** (e.g. `claude-opus-4-6`, `claude-opus-4-7`, `claude-opus-4-8`): defaults
+- **Adaptive thinking** (e.g. `claude-opus-4-6`, `claude-opus-4-8`, `claude-opus-5`): defaults
   to `auto` (provider-chosen). Use effort levels (`low`/`medium`/`high`/`max`, plus `xhigh` where
   advertised) to set `output_config.effort`. Fixed thinking budgets are deprecated for these models;
   Opus 4.7+ additionally supports `task_budget` for model-visible agent-loop budgets.
@@ -250,14 +250,15 @@ openai:
 ```
 
 For OpenAI Responses API models, use the `responses` section below. The
-Responses-family `web_search` block is also supported for `openresponses` and
-`codexresponses` provider sections.
+Responses-family `web_search` block is also supported for `openresponses`,
+`codexresponses`, and `metaai` provider sections.
 
 Responses-family providers can also be toggled per run in the model string:
 
 - `responses.gpt-5?web_search=on`
 - `openresponses.openai/gpt-oss-120b:groq?web_search=on`
 - `codexresponses.gpt-5.3-codex?web_search=off`
+- `metaai.muse-spark-1.1?web_search=on`
 
 Allowed values: `on`/`off` (also accepts `true`/`false`, `1`/`0`).
 
@@ -358,6 +359,26 @@ xai:
   api_key: "your_xai_key"  # Can also use XAI_API_KEY env var
   base_url: "https://api.x.ai/v1"  # Optional, defaults to this value
 ```
+
+### MetaAI
+
+```yaml
+metaai:
+  api_key: "${META_AI_API_KEY}"
+  base_url: "https://api.meta.ai/v1"  # Optional, defaults to this value
+  default_model: "muse-spark-1.1"
+  web_search:
+    enabled: false
+    search_context_size: medium  # Optional: low | medium | high
+    user_location:  # Optional approximate locale bias
+      type: approximate
+      country: "GB"
+```
+
+MetaAI search grounding can also be toggled per run with
+`metaai.muse-spark-1.1?web_search=on`. See the
+[MetaAI provider guide](../models/providers/metaai/) for supported media,
+interactive toggles, and search-result behavior.
 
 ### Groq
 
@@ -709,7 +730,7 @@ logger:
   type: "file"  # "none", "console", "file", or "http"
   level: "warning"  # "debug", "info", "warning", or "error"
   progress_display: true  # Enable/disable progress display
-  path: "fast-agent-log.jsonl"  # Path to log file (for "file" type)
+  path: "fast-agent-log.jsonl"  # Explicit path to log file (for "file" type)
   batch_size: 100  # Events to accumulate before processing
   flush_interval: 2.0  # Flush interval in seconds
   max_queue_size: 2048  # Maximum queue size for events
@@ -728,6 +749,11 @@ logger:
   enable_prompt_marks: true # Emit OSC 133 prompt marks in supported terminals
   streaming: "markdown"  # "markdown", "plain", or "none"
 ```
+
+When `logger.path` is omitted, file logging writes to
+`<fast-agent-home>/fast-agent-log.jsonl`. Under `--no-home`, it falls back to
+`<current-working-directory>/fast-agent-log.jsonl`. Explicit relative paths continue to resolve
+from the process current working directory.
 
 ## MCP UI Settings
 
@@ -755,10 +781,49 @@ skills:
 
 ```yaml
 shell_execution:
+  tool_profile: minimal_process  # Bash + Process (default); native retains legacy tools
   timeout_seconds: 90
   warning_interval_seconds: 30
   interactive_use_pty: true  # Use PTY for interactive prompt shell commands
+  output_byte_limit: 16000  # Explicit value; omit for catalog/default selection, null for auto
+  retain_truncated_output: true
+  retained_output_max_bytes: 2097152  # Per shell process
+  retained_output_temp_directory: null  # Optional parent directory
+  process_poll_max_wait_seconds: 250  # Accepted range: 1–600
+  managed_process_poll_history_folding: auto  # auto | on | off
 ```
+
+`tool_profile` controls the model-facing contract only. The default
+`minimal_process` profile exposes `Bash(command, run_in_background?)` and
+`Process(action, process_id?)`. Use `Process(action="list")` to list retained
+managed processes in creation order; `process_id` is required for `status`,
+`wait`, and `stop`. The `native` profile remains available as a
+compatibility escape hatch for the legacy `execute`, `poll_process`, and
+`terminate_process` schemas; both profiles use the same managed-process runtime.
+
+When `output_byte_limit` is omitted, a model-catalog override is used when
+available, followed by the global 16,000-byte default. An explicit positive
+value always wins. Set the field to `null` to use automatic sizing from model
+output-token metadata.
+
+When `retain_truncated_output` is enabled, fast-agent creates a private
+session-scoped directory and lazily writes a `0600` file only when a shell
+result exceeds its model-facing preview. The truncation notice includes the
+temporary path so the model can inspect selected ranges or search the complete
+output. Each process is limited by `retained_output_max_bytes`; retained files
+are removed when the shell runtime closes.
+
+`process_poll_max_wait_seconds` caps a single managed-process wait. The default
+stays below Anthropic's five-minute prompt-cache TTL and applies even when a
+model or model overlay declares a longer default poll wait.
+
+`managed_process_poll_history_folding` controls whether repetitive quiet
+managed-process polling exchanges are collapsed before the next model call:
+
+- `auto` enables folding only for models whose metadata marks the behavior as
+  validated.
+- `on` forces folding for every model.
+- `off` preserves every poll exchange in model history.
 
 ## LLM Retries
 

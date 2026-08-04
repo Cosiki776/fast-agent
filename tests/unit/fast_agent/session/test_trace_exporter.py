@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Any
 
 import pytest
 from mcp.types import (
@@ -21,6 +22,7 @@ from mcp.types import (
 
 from fast_agent.constants import (
     ANTHROPIC_SERVER_TOOLS_CHANNEL,
+    FAST_AGENT_RETRY,
     FAST_AGENT_TIMING,
     FAST_AGENT_TOOL_METADATA,
     FAST_AGENT_TOOL_TIMING,
@@ -40,6 +42,12 @@ from fast_agent.session import (
     SessionTraceExporter,
 )
 from fast_agent.session.session_manager import SessionManager
+from fast_agent.session.trace_export_atif import (
+    AtifRunSource,
+    _package_version,
+    build_atif_fanout_trajectory,
+    build_atif_trajectory,
+)
 from fast_agent.session.trace_export_errors import (
     SessionExportAmbiguousAgentError,
     SessionExportPrivacyFilterError,
@@ -232,7 +240,10 @@ def test_session_trace_exporter_writes_codex_trace(tmp_path: Path) -> None:
     assert records[8]["payload"]["last_agent_message"] == "done"
 
 
-def test_session_trace_exporter_writes_atif_v17_with_tool_observation(tmp_path: Path) -> None:
+def test_session_trace_exporter_writes_atif_v17_with_tool_observation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     manager = _build_manager(tmp_path)
     session_id = "2604201303-atif"
     session_dir = manager.base_dir / session_id
@@ -267,21 +278,42 @@ def test_session_trace_exporter_writes_atif_v17_with_tool_observation(tmp_path: 
                         type="text",
                         text=json.dumps(
                             {
-                                "turn": {
-                                    "provider": "codexresponses",
-                                    "model": "gpt-5.4",
-                                    "input_tokens": 20,
-                                    "output_tokens": 8,
-                                    "cache_usage": {
-                                        "cache_hit_tokens": 5,
-                                        "cache_read_tokens": 5,
-                                        "cache_write_tokens": 0,
+                                "schema": "fast-agent.usage/v2",
+                                "provider_attempts": [
+                                    {
+                                        "provider": "codexresponses",
+                                        "usage_schema": "openai-responses",
+                                        "model": "gpt-5.4",
+                                        "prompt": {
+                                            "total": 15,
+                                            "cache_read": 2,
+                                            "cache_write": 0,
+                                            "tool_use": 0,
+                                        },
+                                        "completion": {"total": 0, "reasoning": 0},
+                                        "tool_calls": 0,
+                                        "cost_usd": 0.0,
+                                        "raw_usage": {},
                                     },
-                                    "reasoning_tokens": 3,
-                                    "tool_use_tokens": 2,
-                                    "tool_calls": 2,
-                                    "cost_usd": 0.01,
-                                }
+                                    {
+                                        "provider": "codexresponses",
+                                        "usage_schema": "openai-responses",
+                                        "model": "gpt-5.4",
+                                        "prompt": {
+                                            "total": 20,
+                                            "cache_read": 5,
+                                            "cache_write": 0,
+                                            "tool_use": 2,
+                                        },
+                                        "completion": {
+                                            "total": 8,
+                                            "reasoning": 3,
+                                        },
+                                        "tool_calls": 2,
+                                        "cost_usd": 0.01,
+                                        "raw_usage": {},
+                                    },
+                                ],
                             }
                         ),
                     )
@@ -302,7 +334,7 @@ def test_session_trace_exporter_writes_atif_v17_with_tool_observation(tmp_path: 
                 ),
                 call_id: CallToolResult(
                     content=[TextContent(type="text", text="/workspace")], isError=False
-                )
+                ),
             },
             channels={
                 FAST_AGENT_TOOL_TIMING: [
@@ -330,15 +362,45 @@ def test_session_trace_exporter_writes_atif_v17_with_tool_observation(tmp_path: 
         PromptMessageExtended(
             role="assistant",
             content=[TextContent(type="text", text="The directory is /workspace.")],
+            channels={
+                FAST_AGENT_USAGE: [
+                    TextContent(
+                        type="text",
+                        text=json.dumps(
+                            {
+                                "schema": "fast-agent.usage/v2",
+                                "provider_attempts": [
+                                    {
+                                        "provider": "codexresponses",
+                                        "usage_schema": "openai-responses",
+                                        "model": "gpt-5.4",
+                                        "prompt": {
+                                            "total": 0,
+                                            "cache_read": 0,
+                                            "cache_write": 0,
+                                            "tool_use": 0,
+                                        },
+                                        "completion": {
+                                            "total": 0,
+                                            "reasoning": 0,
+                                        },
+                                        "tool_calls": 0,
+                                        "cost_usd": 0.0,
+                                        "raw_usage": {},
+                                    }
+                                ],
+                            }
+                        ),
+                    )
+                ]
+            },
         ),
     ]
     save_json(messages, str(session_dir / "history_dev.json"))
     trajectory_dir = session_dir / "trajectories"
     trajectory_dir.mkdir()
     child_messages = [
-        PromptMessageExtended(
-            role="user", content=[TextContent(type="text", text="inspect cwd")]
-        ),
+        PromptMessageExtended(role="user", content=[TextContent(type="text", text="inspect cwd")]),
         PromptMessageExtended(
             role="assistant", content=[TextContent(type="text", text="child complete")]
         ),
@@ -357,11 +419,10 @@ def test_session_trace_exporter_writes_atif_v17_with_tool_observation(tmp_path: 
                 "started_at": "2026-04-20T13:03:01Z",
                 "completed_at": "2026-04-20T13:03:02Z",
                 "usage_summary": {
-                    "cumulative_input_tokens": 11,
-                    "cumulative_output_tokens": 4,
-                    "cumulative_cache_hit_tokens": 3,
-                    "cumulative_reasoning_tokens": 2,
-                    "cumulative_tool_use_tokens": 1,
+                    "prompt": {"total": 11, "cache_read": 3, "tool_use": 1},
+                    "completion": {"total": 4, "reasoning": 2},
+                    "provider_attempts": 1,
+                    "tool_calls": 0,
                 },
                 "messages": [message.model_dump(mode="json") for message in child_messages],
             }
@@ -382,6 +443,16 @@ def test_session_trace_exporter_writes_atif_v17_with_tool_observation(tmp_path: 
         },
     )
 
+    child_reads = 0
+    read_text = Path.read_text
+
+    def track_child_reads(path: Path, *args, **kwargs) -> str:
+        nonlocal child_reads
+        if path.parent == trajectory_dir:
+            child_reads += 1
+        return read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", track_child_reads)
     result = SessionTraceExporter(session_manager=manager).export(
         ExportRequest(
             target=session_dir,
@@ -436,26 +507,31 @@ def test_session_trace_exporter_writes_atif_v17_with_tool_observation(tmp_path: 
     ]
     assert payload["subagent_trajectories"][0]["trajectory_id"] == "traj_child_1"
     assert payload["subagent_trajectories"][0]["agent"]["name"] == "worker"
-    assert tool_step["metrics"]["cached_tokens"] == 5
+    assert payload["subagent_trajectories"][0]["final_metrics"]["extra"] == {
+        "total_reasoning_tokens": 2,
+        "total_tool_use_tokens": 1,
+    }
+    assert child_reads == 1
+    assert tool_step["metrics"]["cached_tokens"] == 7
     assert tool_step["metrics"]["extra"] == {
         "provider": "codexresponses",
+        "usage_schema": "openai-responses",
         "model": "gpt-5.4",
         "reasoning_tokens": 3,
-        "tool_use_tokens": 2,
+        "tool_use_prompt_tokens": 2,
         "tool_calls": 2,
-        "cache_read_tokens": 5,
         "cache_write_tokens": 0,
+        "raw_usage": [{}, {}],
     }
     assert payload["final_metrics"] == {
-        "total_prompt_tokens": 31,
+        "total_prompt_tokens": 46,
         "total_completion_tokens": 12,
-        "total_cached_tokens": 8,
-        "total_cost_usd": 0.01,
+        "total_cached_tokens": 10,
         "total_steps": 4,
         "extra": {
-            "total_reasoning_tokens": 3,
-            "total_tool_use_tokens": 2,
-            "root_prompt_tokens": 20,
+            "total_reasoning_tokens": 5,
+            "total_tool_use_tokens": 3,
+            "root_prompt_tokens": 35,
             "root_completion_tokens": 8,
             "subagent_prompt_tokens": 11,
             "subagent_completion_tokens": 4,
@@ -482,6 +558,220 @@ def test_session_trace_exporter_writes_atif_v17_with_tool_observation(tmp_path: 
     )
     assert private_result.redaction is not None
     assert private_result.redaction.total == 1
+
+
+def test_atif_package_version_is_cached(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = 0
+
+    def package_version(_distribution_name: str) -> str:
+        nonlocal calls
+        calls += 1
+        return "0.9.9"
+
+    monkeypatch.setattr(
+        "fast_agent.session.trace_export_atif.version",
+        package_version,
+    )
+    _package_version.cache_clear()
+    try:
+        assert _package_version() == "0.9.9"
+        assert _package_version() == "0.9.9"
+        assert calls == 1
+    finally:
+        _package_version.cache_clear()
+
+
+def test_atif_omits_unknown_tool_use_tokens() -> None:
+    def trajectory(tool_use_tokens: int | None) -> dict[str, Any]:
+        usage = {
+            "schema": "fast-agent.usage/v2",
+            "provider_attempts": [
+                {
+                    "provider": "anthropic",
+                    "usage_schema": "anthropic",
+                    "model": "claude-sonnet-5",
+                    "prompt": {
+                        "total": 112,
+                        "uncached": 112,
+                        "cache_read": 0,
+                        "cache_write": 0,
+                        "tool_use": tool_use_tokens,
+                    },
+                    "completion": {"total": 54},
+                    "tool_calls": 1,
+                    "raw_usage": {
+                        "input_tokens": 112,
+                        "output_tokens": 54,
+                    },
+                },
+            ],
+        }
+        message = PromptMessageExtended(
+            role="assistant",
+            content=[TextContent(type="text", text="done")],
+            channels={
+                FAST_AGENT_USAGE: [
+                    TextContent(type="text", text=json.dumps(usage)),
+                ]
+            },
+        )
+
+        return build_atif_trajectory(
+            AtifRunSource(
+                session_id="2607150938-atif",
+                agent_name="test",
+                model_name="claude-sonnet-5",
+                provider="anthropic",
+                history=[message],
+                message_timestamps=(None,),
+            )
+        ).to_json_dict()
+
+    unknown = trajectory(None)
+    assert "tool_use_prompt_tokens" not in unknown["steps"][0]["metrics"]["extra"]
+    assert "extra" not in unknown["final_metrics"]
+
+    reported_zero = trajectory(0)
+    assert reported_zero["steps"][0]["metrics"]["extra"]["tool_use_prompt_tokens"] == 0
+    assert reported_zero["final_metrics"]["extra"]["total_tool_use_tokens"] == 0
+
+
+def test_atif_records_provider_retry_and_clean_boundary() -> None:
+    retry = {
+        "schema": "fast-agent.retry/v1",
+        "provider_attempts": 2,
+        "retries": [
+            {
+                "attempt": 1,
+                "max_attempts": 3,
+                "wait_seconds": 10.0,
+                "error_type": "StreamIdleTimeoutError",
+                "error_message": "No stream events were received for 120.0 seconds.",
+                "reason": "stream_idle",
+                "boundary": {
+                    "kind": "completed_tool_call",
+                    "message_index": 2,
+                    "tool_call_ids": ["call_1"],
+                },
+                "stream_events_received": 7,
+            }
+        ],
+    }
+    message = PromptMessageExtended(
+        role="assistant",
+        content=[TextContent(type="text", text="recovered")],
+        channels={FAST_AGENT_RETRY: [TextContent(type="text", text=json.dumps(retry))]},
+    )
+
+    trajectory = build_atif_trajectory(
+        AtifRunSource(
+            session_id="session",
+            agent_name="agent",
+            model_name="model",
+            provider="openai",
+            history=[message],
+            message_timestamps=(None,),
+        )
+    )
+
+    step = trajectory.steps[0]
+    assert step.llm_call_count == 2
+    assert step.extra == {"retry": retry}
+
+
+def test_atif_final_metrics_require_complete_llm_step_usage() -> None:
+    usage = {
+        "schema": "fast-agent.usage/v2",
+        "provider_attempts": [
+            {
+                "provider": "openai",
+                "usage_schema": "openai-chat",
+                "model": "model",
+                "prompt": {"total": 10, "cache_read": 0},
+                "completion": {"total": 2},
+                "tool_calls": 0,
+                "cost_usd": 0.01,
+            }
+        ],
+    }
+    known = PromptMessageExtended(
+        role="assistant",
+        channels={FAST_AGENT_USAGE: [TextContent(type="text", text=json.dumps(usage))]},
+    )
+    unknown = PromptMessageExtended(role="assistant")
+
+    trajectory = build_atif_trajectory(
+        AtifRunSource(
+            session_id="session",
+            agent_name="agent",
+            model_name="model",
+            provider="openai",
+            history=[known, unknown],
+            message_timestamps=(None, None),
+        )
+    )
+
+    assert trajectory.final_metrics is not None
+    assert trajectory.final_metrics.total_prompt_tokens is None
+    assert trajectory.final_metrics.total_completion_tokens is None
+    assert trajectory.final_metrics.total_cached_tokens is None
+    assert trajectory.final_metrics.total_cost_usd is None
+
+
+def test_atif_fanout_totals_include_all_model_routes() -> None:
+    def source(index: int) -> AtifRunSource:
+        usage = {
+            "schema": "fast-agent.usage/v2",
+            "provider_attempts": [
+                {
+                    "provider": "openai",
+                    "usage_schema": "openai-chat",
+                    "model": f"model-{index}",
+                    "prompt": {
+                        "total": 10 * index,
+                        "cache_read": index,
+                        "tool_use": index,
+                    },
+                    "completion": {"total": 2 * index, "reasoning": index},
+                    "tool_calls": 0,
+                    "cost_usd": index / 100,
+                }
+            ],
+        }
+        messages = [
+            PromptMessageExtended(
+                role="user",
+                content=[TextContent(type="text", text="run")],
+            ),
+            PromptMessageExtended(
+                role="assistant",
+                content=[TextContent(type="text", text=f"done {index}")],
+                channels={FAST_AGENT_USAGE: [TextContent(type="text", text=json.dumps(usage))]},
+            ),
+        ]
+        return AtifRunSource(
+            session_id="session",
+            agent_name=f"agent-{index}",
+            model_name=f"model-{index}",
+            provider="openai",
+            history=messages,
+            message_timestamps=(None, None),
+        )
+
+    trajectory = build_atif_fanout_trajectory(
+        session_id="session",
+        sources=[source(1), source(2)],
+    )
+
+    assert trajectory.final_metrics is not None
+    assert trajectory.final_metrics.total_prompt_tokens == 30
+    assert trajectory.final_metrics.total_completion_tokens == 6
+    assert trajectory.final_metrics.total_cached_tokens == 3
+    assert trajectory.final_metrics.total_cost_usd == pytest.approx(0.03)
+    assert trajectory.final_metrics.total_steps == len(trajectory.steps)
+    assert trajectory.final_metrics.extra is not None
+    assert trajectory.final_metrics.extra["total_reasoning_tokens"] == 3
+    assert trajectory.final_metrics.extra["total_tool_use_tokens"] == 3
 
 
 def test_session_trace_exporter_treats_latest_target_case_insensitively(tmp_path: Path) -> None:
@@ -571,7 +861,9 @@ def test_session_trace_exporter_includes_git_metadata(tmp_path: Path) -> None:
         )
     )
 
-    first_record = json.loads((tmp_path / "trace.jsonl").read_text(encoding="utf-8").splitlines()[0])
+    first_record = json.loads(
+        (tmp_path / "trace.jsonl").read_text(encoding="utf-8").splitlines()[0]
+    )
     git = first_record["payload"]["git"]
     assert git["started"]["commit"] == "a" * 40
     assert git["started"]["github_repository"] == "fast-agent-ai/fast-agent"
@@ -1560,23 +1852,29 @@ def test_session_trace_exporter_uses_usage_metadata_for_model_and_token_count(
                         type="text",
                         text=json.dumps(
                             {
-                                "turn": {
-                                    "provider": "codexresponses",
-                                    "model": "gpt-5.3-codex",
-                                    "input_tokens": 120,
-                                    "output_tokens": 30,
-                                    "total_tokens": 150,
-                                    "reasoning_tokens": 7,
-                                    "display_input_tokens": 120,
-                                    "cache_usage": {
-                                        "cache_read_tokens": 0,
-                                        "cache_write_tokens": 0,
-                                        "cache_hit_tokens": 12,
+                                "schema": "fast-agent.usage/v2",
+                                "provider_attempts": [
+                                    {
+                                        "provider": "codexresponses",
+                                        "usage_schema": "openai-responses",
+                                        "model": "gpt-5.3-codex",
+                                        "prompt": {"total": 20, "cache_read": 3},
+                                        "completion": {"total": 0, "reasoning": 0},
+                                        "raw_usage": {},
                                     },
-                                },
-                                "summary": {
-                                    "context_window_size": 400000,
-                                },
+                                    {
+                                        "provider": "codexresponses",
+                                        "usage_schema": "openai-responses",
+                                        "model": "gpt-5.3-codex",
+                                        "prompt": {
+                                            "total": 25,
+                                            "cache_read": 4,
+                                            "cache_write": 0,
+                                        },
+                                        "completion": {"total": 5, "reasoning": 1},
+                                        "raw_usage": {},
+                                    },
+                                ],
                             }
                         ),
                     )
@@ -1616,7 +1914,7 @@ def test_session_trace_exporter_uses_usage_metadata_for_model_and_token_count(
     assert records[0]["payload"]["model_spec"] == "gpt-5.3-codex?service_tier=flex"
     assert records[1]["type"] == "event_msg"
     assert records[1]["payload"]["type"] == "task_started"
-    assert records[1]["payload"]["model_context_window"] == 400000
+    assert records[1]["payload"]["model_context_window"] == 272000
     assert records[3]["type"] == "turn_context"
     assert records[3]["payload"]["model"] == "gpt-5.3-codex"
     assert records[3]["payload"]["model_spec"] == "gpt-5.3-codex?service_tier=flex"
@@ -1625,20 +1923,20 @@ def test_session_trace_exporter_uses_usage_metadata_for_model_and_token_count(
         "type": "token_count",
         "info": {
             "total_token_usage": {
-                "input_tokens": 120,
-                "cached_input_tokens": 12,
-                "output_tokens": 30,
-                "reasoning_output_tokens": 7,
-                "total_tokens": 150,
+                "input_tokens": 45,
+                "cached_input_tokens": 7,
+                "output_tokens": 5,
+                "reasoning_output_tokens": 1,
+                "total_tokens": 50,
             },
             "last_token_usage": {
-                "input_tokens": 120,
-                "cached_input_tokens": 12,
-                "output_tokens": 30,
-                "reasoning_output_tokens": 7,
-                "total_tokens": 150,
+                "input_tokens": 45,
+                "cached_input_tokens": 7,
+                "output_tokens": 5,
+                "reasoning_output_tokens": 1,
+                "total_tokens": 50,
             },
-            "model_context_window": 400000,
+            "model_context_window": 272000,
         },
     }
 

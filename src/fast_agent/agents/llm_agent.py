@@ -56,6 +56,7 @@ from fast_agent.ui.message_display_helpers import (
     build_user_message_image_previews,
     resolve_highlight_indexes,
     tool_use_requests_file_read_access,
+    tool_use_requests_process_poll,
     tool_use_requests_shell_access,
 )
 from fast_agent.utils.count_display import format_count
@@ -95,6 +96,11 @@ STOP_REASON_ADDITIONAL_MESSAGES: tuple[tuple[LlmStopReason, str, str], ...] = (
         LlmStopReason.CANCELLED,
         "\n\nGeneration cancelled by user.",
         "dim yellow italic",
+    ),
+    (
+        LlmStopReason.MAX_ITERATIONS,
+        "\n\nMaximum tool loop iterations reached - generation stopped.",
+        "dim red italic",
     ),
 )
 
@@ -315,9 +321,12 @@ class LlmAgent(LlmDecorator):
                 message,
                 name=display_name,
             )
+            has_visible_text = bool(message.all_text().strip())
             should_render_assistant_message = not (
+                tool_use_requests_process_poll(message) and not has_visible_text
+            ) and not (
                 rendered_remote_activities
-                and message.last_text() is None
+                and not has_visible_text
                 and additional_message_text is None
                 and pre_content is None
             )

@@ -48,14 +48,41 @@ class ShellRuntimeInfo:
     environment_name: str | None = None
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(slots=True)
 class ShellExecutionRequest:
-    """One command execution request."""
+    """One command execution request.
+
+    ``terminate_on_cancel`` controls whether cancellation terminates the process
+    tree. ``detach`` requires the child to survive runtime exit, so adapters must
+    capture output without parent-owned pipes. A request that starts with
+    ``terminate_on_cancel=False`` must therefore also set ``detach=True``; a
+    surviving child attached to parent-owned pipes would block or die on SIGPIPE
+    once the runtime exits. ``retain_output`` controls whether joined output
+    strings are retained in the returned result; callbacks remain independent of
+    result retention.
+
+    Owners may set ``terminate_on_cancel`` to ``True`` before cancelling an
+    active request to distinguish explicit termination from persistent runtime
+    shutdown. Adapters may populate ``output_spool_path`` while detached output
+    remains on disk.
+    """
 
     command: str
     cwd: str | None = None
     env: Mapping[str, str] | None = None
     timeout: float | None = None
+    terminate_after_idle: bool = True
+    retain_output: bool = True
+    terminate_on_cancel: bool = True
+    detach: bool = False
+    output_spool_path: str | None = None
+
+    def __post_init__(self) -> None:
+        if not self.terminate_on_cancel and not self.detach:
+            raise ValueError(
+                "terminate_on_cancel=False requires detach=True: a child that "
+                "survives cancellation cannot use parent-owned output pipes"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -94,6 +121,8 @@ class ShellExecutionCallbacks(Protocol):
     result. Callers must tolerate zero, one, or many stdout/stderr callback chunks.
     """
 
+    async def on_started(self, process_id: int | None) -> None: ...
+
     async def on_stdout(self, text: str) -> None: ...
 
     async def on_stderr(self, text: str) -> None: ...
@@ -101,6 +130,13 @@ class ShellExecutionCallbacks(Protocol):
     async def on_idle_warning(self, elapsed: float, remaining: float) -> None: ...
 
     async def on_timeout(self) -> None: ...
+
+
+@runtime_checkable
+class ShellOutputActivityCallbacks(Protocol):
+    """Optional notification for output buffered before a complete line is available."""
+
+    async def on_output_activity(self, *, is_stderr: bool, byte_count: int) -> None: ...
 
 
 @runtime_checkable
@@ -138,9 +174,10 @@ class ShellEnvironment(Protocol):
     ) -> ShellExecution:
         """Execute one command and return full execution metadata.
 
-        If the coroutine is cancelled, adapters that own a running process or
-        remote job must make a best effort to terminate that execution before
-        re-raising cancellation.
+        If the coroutine is cancelled and ``request.terminate_on_cancel`` is
+        true, adapters that own a running process or remote job must make a best
+        effort to terminate it before re-raising cancellation. Otherwise they
+        must leave it running in the execution environment.
         """
         ...
 
@@ -274,6 +311,7 @@ async def execute_shell(
         )
     )
     return execution.result
+
 
 __all__ = [
     "EnvironmentFileEntry",

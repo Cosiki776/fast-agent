@@ -25,7 +25,8 @@ if TYPE_CHECKING:
 class _DefaultSessionManager:
     current_session = None
 
-    def list_sessions(self) -> list[object]:
+    def list_sessions(self, *, include_empty: bool = True) -> list[object]:
+        del include_empty
         return []
 
 
@@ -33,9 +34,7 @@ class _Agent:
     acp_commands: dict[str, object] = {}
 
     def __init__(self, session_manager: object | None = None) -> None:
-        self.context = SimpleNamespace(
-            session_manager=session_manager or _DefaultSessionManager()
-        )
+        self.context = SimpleNamespace(session_manager=session_manager or _DefaultSessionManager())
 
 
 class _App:
@@ -72,13 +71,13 @@ async def test_render_session_list_uses_acp_session_cwd(
     )
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    list_calls: list[str] = []
+    list_calls: list[bool] = []
 
     class _Manager:
         current_session = None
 
-        def list_sessions(self) -> list[object]:
-            list_calls.append("list")
+        def list_sessions(self, *, include_empty: bool = True) -> list[object]:
+            list_calls.append(include_empty)
             return []
 
     cast("Any", instance.agents["main"]).context.session_manager = _Manager()
@@ -100,7 +99,7 @@ async def test_render_session_list_uses_acp_session_cwd(
     output = session_slash_handlers.render_session_list(handler)
 
     assert "# sessions" in output
-    assert list_calls == ["list"]
+    assert list_calls == [False]
 
 
 @pytest.mark.asyncio
@@ -115,13 +114,13 @@ async def test_render_session_list_uses_app_session_store_when_configured(
     )
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    list_calls: list[str] = []
+    list_calls: list[bool] = []
 
     class _Manager:
         current_session = None
 
-        def list_sessions(self) -> list[object]:
-            list_calls.append("list")
+        def list_sessions(self, *, include_empty: bool = True) -> list[object]:
+            list_calls.append(include_empty)
             return []
 
     cast("Any", instance.agents["main"]).context.session_manager = _Manager()
@@ -143,7 +142,7 @@ async def test_render_session_list_uses_app_session_store_when_configured(
     output = session_slash_handlers.render_session_list(handler)
 
     assert "# sessions" in output
-    assert list_calls == ["list"]
+    assert list_calls == [False]
 
 
 @pytest.mark.asyncio
@@ -275,8 +274,8 @@ async def test_handle_session_export_leaves_agent_unset_for_latest_target(
         *,
         target: str | None,
         agent_name: str | None,
-            output_path: str | None,
-            export_format: str = "codex",
+        output_path: str | None,
+        export_format: str = "codex",
         hf_url: str | None,
         hf_dataset: str | None,
         hf_dataset_path: str | None,
@@ -290,8 +289,8 @@ async def test_handle_session_export_leaves_agent_unset_for_latest_target(
         error: str | None = None,
     ) -> CommandOutcome:
         del (
-                ctx,
-                export_format,
+            ctx,
+            export_format,
             hf_url,
             privacy_filter,
             privacy_filter_path,
@@ -369,8 +368,8 @@ async def test_handle_session_export_defaults_agent_only_with_current_session(
         *,
         target: str | None,
         agent_name: str | None,
-            output_path: str | None,
-            export_format: str = "codex",
+        output_path: str | None,
+        export_format: str = "codex",
         hf_url: str | None,
         hf_dataset: str | None,
         hf_dataset_path: str | None,
@@ -384,8 +383,8 @@ async def test_handle_session_export_defaults_agent_only_with_current_session(
         error: str | None = None,
     ) -> CommandOutcome:
         del (
-                ctx,
-                export_format,
+            ctx,
+            export_format,
             output_path,
             hf_url,
             hf_dataset,
@@ -460,8 +459,8 @@ async def test_handle_session_export_uses_handler_session_when_manager_current_i
         *,
         target: str | None,
         agent_name: str | None,
-            output_path: str | None,
-            export_format: str = "codex",
+        output_path: str | None,
+        export_format: str = "codex",
         hf_url: str | None,
         hf_dataset: str | None,
         hf_dataset_path: str | None,
@@ -475,8 +474,8 @@ async def test_handle_session_export_uses_handler_session_when_manager_current_i
         error: str | None = None,
     ) -> CommandOutcome:
         del (
-                ctx,
-                export_format,
+            ctx,
+            export_format,
             output_path,
             hf_url,
             hf_dataset,

@@ -104,6 +104,100 @@ def test_shell_tool_call_header_includes_timeout() -> None:
     assert "bash (/bin/bash) | timeout 90s" in rendered
 
 
+def test_background_shell_tool_call_header_shows_background() -> None:
+    display = ConsoleDisplay()
+
+    with console.console.capture() as capture:
+        display.show_tool_call(
+            tool_name="execute",
+            tool_args={"command": "sleep 30", "background": True},
+            metadata={
+                "variant": "shell",
+                "command": "sleep 30",
+                "shell_name": "bash",
+                "shell_path": "/bin/bash",
+                "background": True,
+                "idle_yield_seconds": 10,
+                "foreground_yield_seconds": 30,
+            },
+            name="dev",
+        )
+
+    rendered = capture.get()
+    assert "bash (/bin/bash) | background" in rendered
+    assert "idle yield" not in rendered
+
+
+def test_process_lifecycle_tool_calls_use_compact_display() -> None:
+    display = ConsoleDisplay(config=Settings(logger=LoggerSettings(progress_display=False)))
+
+    with console.console.capture() as capture:
+        display.show_tool_call(
+            tool_name="poll_process",
+            tool_args={"process_id": "process-3", "wait_sec": 5},
+            metadata={
+                "variant": "shell_process",
+                "action": "poll",
+                "process_id": "process-3",
+                "wait_sec": 5,
+                "command_summary": "uv run worker.py",
+                "elapsed_seconds": 65,
+                "os_process_id": 4321,
+            },
+            name="dev",
+        )
+        display.show_tool_call(
+            tool_name="terminate_process",
+            tool_args={"process_id": "process-4"},
+            metadata={
+                "variant": "shell_process",
+                "action": "terminate",
+                "process_id": "process-4",
+            },
+            name="dev",
+        )
+        display.show_tool_call(
+            tool_name="Process",
+            tool_args={"action": "list"},
+            metadata={
+                "variant": "shell_process",
+                "action": "list",
+                "process_id": None,
+                "wait_sec": None,
+            },
+            name="dev",
+        )
+
+    rendered = capture.get()
+    compact_rendered = " ".join(rendered.split())
+    assert (
+        "dev monitoring · process-3 · out — · err — · time 1m05s · size 0B · uv run worker.py"
+    ) in compact_rendered
+    assert "pid 4321" not in rendered
+    assert "terminate process-4" in rendered
+    assert "list managed processes" in rendered
+    assert "'process_id'" not in rendered
+
+
+def test_process_poll_tool_call_uses_live_progress_instead_of_transcript() -> None:
+    display = ConsoleDisplay()
+
+    with console.console.capture() as capture:
+        display.show_tool_call(
+            tool_name="poll_process",
+            tool_args={"process_id": "process-3", "wait_sec": 30},
+            metadata={
+                "variant": "shell_process",
+                "action": "poll",
+                "process_id": "process-3",
+                "wait_sec": 30,
+            },
+            name="dev",
+        )
+
+    assert capture.get() == ""
+
+
 def test_apply_patch_tool_call_renders_preview() -> None:
     display = ConsoleDisplay()
     patch_text = "*** Begin Patch\n*** Add File: hello.txt\n+hello\n*** End Patch\n"

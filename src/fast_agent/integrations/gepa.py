@@ -474,7 +474,9 @@ class FastAgentReflectionLM:
             doc = json.loads(results_path.read_text(encoding="utf-8"))
         except json.JSONDecodeError:
             return {}
-        summaries: list[dict[str, Any]] = []
+        from fast_agent.llm.usage_tracking import UsageAccumulator, UsageReport
+
+        accumulator = UsageAccumulator()
         turns: list[dict[str, Any]] = []
         messages = doc.get("messages")
         if not isinstance(messages, list):
@@ -498,11 +500,19 @@ class FastAgentReflectionLM:
                     usage = json.loads(text)
                 except json.JSONDecodeError:
                     continue
-                if isinstance(usage.get("turn"), dict):
-                    turns.append(usage["turn"])
-                if isinstance(usage.get("summary"), dict):
-                    summaries.append(usage["summary"])
-        return {"turns": turns, "summary": summaries[-1] if summaries else {}}
+                if not isinstance(usage, dict):
+                    continue
+                try:
+                    report = UsageReport.model_validate(usage)
+                except ValueError:
+                    continue
+                for attempt in report.provider_attempts:
+                    accumulator.add_turn(attempt)
+                turns.append(report.final_attempt.model_dump(mode="json", exclude={"raw_usage"}))
+        return {
+            "turns": turns,
+            "summary": accumulator.summary.model_dump(mode="json"),
+        }
 
 
 class FastAgentBatchEvaluator:
@@ -661,7 +671,9 @@ class FastAgentSingleTaskAdapter:
             return None
         return self._pending_gepa_eval_metrics.popleft()
 
-    def __call__(self, candidate: Mapping[str, str], example: Any | None = None) -> tuple[float, Any]:
+    def __call__(
+        self, candidate: Mapping[str, str], example: Any | None = None
+    ) -> tuple[float, Any]:
         self._evaluations += 1
         candidate_run = self.run.candidate()
         candidate_dict = dict(candidate)
@@ -669,7 +681,9 @@ class FastAgentSingleTaskAdapter:
 
         eval_dir = candidate_run.path
         built_input = self.input_builder(candidate_dict, example)
-        input_row = dict(built_input) if isinstance(built_input, Mapping) else {"prompt": str(built_input)}
+        input_row = (
+            dict(built_input) if isinstance(built_input, Mapping) else {"prompt": str(built_input)}
+        )
         input_path = eval_dir / "input.jsonl"
         _write_jsonl(input_path, [input_row])
 
@@ -900,7 +914,9 @@ class FastAgentGEPATrackioCallback:
         self._pending_gepa_eval_contexts: deque[dict[str, NumericMetric]] = deque()
 
     def on_evaluation_end(self, event: Mapping[str, Any]) -> None:
-        if self.eval_adapter is None or not callable(getattr(self.eval_adapter, "pop_pending_gepa_eval_metrics", None)):
+        if self.eval_adapter is None or not callable(
+            getattr(self.eval_adapter, "pop_pending_gepa_eval_metrics", None)
+        ):
             return
         context = _evaluation_event_metrics(event, include_context=self.include_gepa_context)
         if "gepa/total_metric_calls" in context:
@@ -1106,18 +1122,18 @@ def _row_wise_eval_metrics(
             usage,
             prefix="fast_agent/eval/usage/",
             names=(
-                "billing_tokens",
+                "total_tokens",
                 "tool_calls",
             ),
         )
         rows_with_usage = usage.get("rows_with_usage")
         if _is_numeric_metric(rows_with_usage) and rows_with_usage > 0:
             for key in (
-                "input_tokens",
-                "output_tokens",
-                "billing_tokens",
+                "prompt_tokens",
+                "completion_tokens",
+                "total_tokens",
                 "reasoning_tokens",
-                "tool_use_tokens",
+                "tool_use_prompt_tokens",
                 "tool_calls",
             ):
                 value = usage.get(key)
@@ -1127,7 +1143,7 @@ def _row_wise_eval_metrics(
                 duration = timing.get("duration")
                 if isinstance(duration, Mapping):
                     duration_mean_ms = duration.get("mean")
-                    output_tokens = usage.get("output_tokens")
+                    output_tokens = usage.get("completion_tokens")
                     if (
                         _is_numeric_metric(output_tokens)
                         and output_tokens >= 0
@@ -1141,8 +1157,8 @@ def _row_wise_eval_metrics(
                             else duration_mean_ms
                         )
                         if generation_ms > 0:
-                            metrics["fast_agent/eval/usage/output_tokens_per_second"] = output_tokens / (
-                                generation_ms / 1000
+                            metrics["fast_agent/eval/usage/completion_tokens_per_second"] = (
+                                output_tokens / (generation_ms / 1000)
                             )
     cache = batch_summary.get("cache")
     if isinstance(cache, Mapping):
@@ -1178,21 +1194,23 @@ def _reflection_usage_metrics(
             metrics,
             summary,
             prefix="fast_agent/reflection/usage/",
-            names=(
-                "cumulative_billing_tokens",
-                "cache_hit_rate_percent",
-            ),
+            names=("total", "tool_calls", "provider_attempts"),
         )
         if turn_count:
-            for key in (
-                "input_tokens",
-                "output_tokens",
-                "billing_tokens",
-                "reasoning_tokens",
-            ):
-                value = summary.get(f"cumulative_{key}")
+            prompt = summary.get("prompt")
+            completion = summary.get("completion")
+            if isinstance(prompt, Mapping):
+                value = prompt.get("total")
                 if _is_numeric_metric(value):
-                    metrics[f"fast_agent/reflection/usage/{key}_per_turn"] = value / turn_count
+                    metrics["fast_agent/reflection/usage/prompt_tokens_per_turn"] = (
+                        value / turn_count
+                    )
+            if isinstance(completion, Mapping):
+                for field in ("total", "reasoning"):
+                    value = completion.get(field)
+                    if _is_numeric_metric(value):
+                        name = "completion_tokens" if field == "total" else "reasoning_tokens"
+                        metrics[f"fast_agent/reflection/usage/{name}_per_turn"] = value / turn_count
     return metrics
 
 

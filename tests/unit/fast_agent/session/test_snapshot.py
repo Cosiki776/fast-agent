@@ -13,6 +13,7 @@ from mcp.types import TextContent
 from fast_agent.agents.agent_types import AgentConfig
 from fast_agent.config import get_settings
 from fast_agent.llm.request_params import RequestParams
+from fast_agent.llm.usage_tracking import UsageAccumulator
 from fast_agent.mcp.prompt_message_extended import PromptMessageExtended
 from fast_agent.session import (
     SESSION_SNAPSHOT_SCHEMA_VERSION,
@@ -108,12 +109,24 @@ class _Llm:
         )
 
 
-class _UsageAccumulator:
+class _UsageAccumulator(UsageAccumulator):
     def __init__(self, summary: dict[str, object]) -> None:
-        self._summary = summary
+        from fast_agent.llm.provider_types import Provider
+        from fast_agent.llm.usage_tracking import TurnUsage, UsageSchema, UsageSummary
 
-    def get_summary(self) -> dict[str, object]:
-        return dict(self._summary)
+        canonical = UsageSummary.model_validate(summary)
+        super().__init__(
+            turns=[
+                TurnUsage(
+                    provider=Provider.GENERIC,
+                    usage_schema=UsageSchema.OPENAI_CHAT,
+                    model="test",
+                    prompt=canonical.prompt,
+                    completion=canonical.completion,
+                    tool_calls=canonical.tool_calls,
+                )
+            ]
+        )
 
 
 class _ChildAgent:
@@ -189,7 +202,7 @@ def test_legacy_session_synthesizes_into_typed_snapshot() -> None:
     assert agent_snapshot.model_overlay_refs == []
 
 
-def test_session_snapshot_v2_round_trips_unchanged() -> None:
+def test_session_snapshot_v3_round_trips_unchanged() -> None:
     snapshot = SessionSnapshot(
         session_id="2604141705-AbCd12",
         created_at=datetime(2026, 4, 14, 17, 5, 0),
@@ -264,7 +277,7 @@ def test_session_snapshot_v2_round_trips_unchanged() -> None:
     assert reloaded == snapshot
 
 
-def test_load_session_rewrites_legacy_file_as_v2_snapshot(tmp_path) -> None:
+def test_load_session_rewrites_legacy_file_as_v3_snapshot(tmp_path) -> None:
     manager = SessionManager(
         cwd=tmp_path,
         home_override=tmp_path / ".fast-agent",
@@ -291,7 +304,7 @@ def test_load_session_rewrites_legacy_file_as_v2_snapshot(tmp_path) -> None:
 
     assert session is not None
     rewritten = json.loads(metadata_path.read_text(encoding="utf-8"))
-    assert rewritten["schema_version"] == 2
+    assert rewritten["schema_version"] == 3
     assert rewritten["session_id"] == session_id
     assert rewritten["created_at"] == payload["created_at"]
     assert rewritten["last_activity"] != payload["last_activity"]
@@ -321,6 +334,31 @@ def test_malformed_legacy_fields_warn_but_still_synthesize() -> None:
     assert isinstance(snapshot.last_activity, datetime)
     assert snapshot.continuation.active_agent is None
     assert snapshot.metadata.pinned is False
+
+
+def test_v2_snapshot_imports_usage_summary() -> None:
+    payload = {
+        "schema_version": 2,
+        "session_id": "2604141705-AbCd12",
+        "created_at": "2026-04-14T17:05:00",
+        "last_activity": "2026-04-14T17:09:00",
+        "analysis": {
+            "usage_summary": {
+                "input_tokens": 100,
+                "output_tokens": 25,
+                "total_tokens": 125,
+            }
+        },
+    }
+
+    snapshot = load_session_snapshot(payload)
+
+    assert snapshot.schema_version == SESSION_SNAPSHOT_SCHEMA_VERSION
+    assert snapshot.analysis.usage_summary == SessionUsageSummarySnapshot(
+        prompt_tokens=100,
+        completion_tokens=25,
+        total_tokens=125,
+    )
 
 
 def test_capture_session_snapshot_maps_runtime_state_for_all_known_agents(tmp_path: Path) -> None:
@@ -389,9 +427,10 @@ def test_capture_session_snapshot_maps_runtime_state_for_all_known_agents(tmp_pa
             overlay_manifest_path=tmp_path / "overlays" / "bar.yaml",
         ),
         usage_summary={
-            "cumulative_input_tokens": 100,
-            "cumulative_output_tokens": 25,
-            "cumulative_billing_tokens": 130,
+            "prompt": {"total": 100},
+            "completion": {"total": 25},
+            "provider_attempts": 1,
+            "tool_calls": 0,
         },
         attached_mcp_servers=["zeta", "alpha"],
         child_agents={
@@ -478,13 +517,13 @@ def test_capture_session_snapshot_maps_runtime_state_for_all_known_agents(tmp_pa
         SessionModelOverlayRef(ref=str((tmp_path / "overlays" / "bar.yaml").resolve()))
     ]
     assert snapshot.analysis.usage_summary == SessionUsageSummarySnapshot(
-        input_tokens=100,
-        output_tokens=25,
-        total_tokens=130,
+        prompt_tokens=100,
+        completion_tokens=25,
+        total_tokens=125,
     )
 
 
-def test_capture_session_snapshot_preserves_existing_v2_fallback_values(tmp_path: Path) -> None:
+def test_capture_session_snapshot_preserves_existing_v3_fallback_values(tmp_path: Path) -> None:
     manager = SessionManager(
         cwd=tmp_path,
         home_override=tmp_path / ".fast-agent",
@@ -565,7 +604,9 @@ def test_capture_session_snapshot_tracks_started_and_current_git_commits(
         home_override=tmp_path / ".fast-agent",
         respect_env_override=False,
     )
-    session = manager.create_session(metadata={"last_history_by_agent": {"foo": "history_foo.json"}})
+    session = manager.create_session(
+        metadata={"last_history_by_agent": {"foo": "history_foo.json"}}
+    )
     session.info.history_files = ["history_foo.json"]
     agent = _Agent(
         name="foo",
@@ -615,6 +656,102 @@ def test_capture_session_snapshot_tracks_started_and_current_git_commits(
     assert second_snapshot.continuation.git.current.commit == second_commit
 
 
+def test_capture_session_snapshot_checkpoint_reuses_captured_git_state(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    first_commit = _init_git_repo(workspace)
+    config_path = tmp_path / "fast-agent.yaml"
+    config_path.write_text("git_aware: true\n", encoding="utf-8")
+    get_settings(config_path=str(config_path))
+
+    manager = SessionManager(
+        cwd=workspace,
+        home_override=tmp_path / ".fast-agent",
+        respect_env_override=False,
+    )
+    session = manager.create_session(
+        metadata={"last_history_by_agent": {"foo": "history_foo.json"}}
+    )
+    session.info.history_files = ["history_foo.json"]
+    agent = _Agent(
+        name="foo",
+        instruction="resolved foo prompt",
+        config=AgentConfig("foo", instruction="template foo", model=None),
+    )
+    identity = SessionSaveIdentity(
+        manager=manager,
+        session=session,
+        created=False,
+        acp_session_id=None,
+        session_cwd=workspace,
+        session_store_scope="workspace",
+        session_store_cwd=workspace,
+    )
+
+    # A session's first save captures provenance even as a checkpoint.
+    first_snapshot = capture_session_snapshot(
+        session=session,
+        active_agent=cast("AgentProtocol", agent),
+        agent_registry=None,
+        identity=identity,
+        refresh_git=False,
+    )
+    assert first_snapshot.continuation.git is not None
+    assert first_snapshot.continuation.git.current is not None
+    assert first_snapshot.continuation.git.current.commit == first_commit
+
+    (session.directory / "session.json").write_text(
+        json.dumps(first_snapshot.model_dump(mode="json"), indent=2),
+        encoding="utf-8",
+    )
+    second_commit = _commit_change(workspace)
+
+    # Checkpoints reuse the captured state instead of shelling out to git.
+    checkpoint_snapshot = capture_session_snapshot(
+        session=session,
+        active_agent=cast("AgentProtocol", agent),
+        agent_registry=None,
+        identity=identity,
+        refresh_git=False,
+    )
+    assert checkpoint_snapshot.continuation.git is not None
+    assert checkpoint_snapshot.continuation.git.current is not None
+    assert checkpoint_snapshot.continuation.git.current.commit == first_commit
+
+    # Turn boundaries refresh to the live repository state.
+    refreshed_snapshot = capture_session_snapshot(
+        session=session,
+        active_agent=cast("AgentProtocol", agent),
+        agent_registry=None,
+        identity=identity,
+    )
+    assert refreshed_snapshot.continuation.git is not None
+    assert refreshed_snapshot.continuation.git.current is not None
+    assert refreshed_snapshot.continuation.git.current.commit == second_commit
+
+    # A resumed session can retain the original git state in its compatibility
+    # SessionInfo even after a full save persists a refreshed state.
+    session.info.metadata["git"] = first_snapshot.continuation.git.model_dump(
+        mode="json", exclude_none=True
+    )
+    (session.directory / "session.json").write_text(
+        json.dumps(refreshed_snapshot.model_dump(mode="json"), indent=2),
+        encoding="utf-8",
+    )
+
+    resumed_checkpoint = capture_session_snapshot(
+        session=session,
+        active_agent=cast("AgentProtocol", agent),
+        agent_registry=None,
+        identity=identity,
+        refresh_git=False,
+    )
+    assert resumed_checkpoint.continuation.git is not None
+    assert resumed_checkpoint.continuation.git.current is not None
+    assert resumed_checkpoint.continuation.git.current.commit == second_commit
+
+
 def test_capture_session_snapshot_omits_git_when_config_disabled(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     _init_git_repo(workspace)
@@ -627,7 +764,9 @@ def test_capture_session_snapshot_omits_git_when_config_disabled(tmp_path: Path)
         home_override=tmp_path / ".fast-agent",
         respect_env_override=False,
     )
-    session = manager.create_session(metadata={"last_history_by_agent": {"foo": "history_foo.json"}})
+    session = manager.create_session(
+        metadata={"last_history_by_agent": {"foo": "history_foo.json"}}
+    )
     session.info.history_files = ["history_foo.json"]
     agent = _Agent(
         name="foo",
@@ -710,9 +849,10 @@ async def test_save_history_writes_captured_snapshot_payload(tmp_path: Path) -> 
             request_params=RequestParams(maxTokens=123, temperature=0.4),
         ),
         usage_summary={
-            "cumulative_input_tokens": 11,
-            "cumulative_output_tokens": 7,
-            "cumulative_billing_tokens": 18,
+            "prompt": {"total": 11},
+            "completion": {"total": 7},
+            "provider_attempts": 1,
+            "tool_calls": 0,
         },
         message_history=[
             PromptMessageExtended(
@@ -729,7 +869,7 @@ async def test_save_history_writes_captured_snapshot_payload(tmp_path: Path) -> 
     await session.save_history(cast("AgentProtocol", agent))
 
     payload = json.loads((session.directory / "session.json").read_text(encoding="utf-8"))
-    assert payload["schema_version"] == 2
+    assert payload["schema_version"] == 3
     assert payload["continuation"]["active_agent"] == "main"
     assert payload["metadata"]["first_user_preview"] == "hello save path"
 
@@ -741,8 +881,8 @@ async def test_save_history_writes_captured_snapshot_payload(tmp_path: Path) -> 
     assert agent_payload["request_settings"]["max_tokens"] == 123
     assert agent_payload["request_settings"]["temperature"] == 0.4
     assert payload["analysis"]["usage_summary"] == {
-        "input_tokens": 11,
-        "output_tokens": 7,
+        "prompt_tokens": 11,
+        "completion_tokens": 7,
         "total_tokens": 18,
     }
 

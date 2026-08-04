@@ -42,9 +42,14 @@ from pydantic import BaseModel
 from fast_agent.agents.agent_card import build_fast_agent_card
 from fast_agent.agents.agent_types import AgentConfig, AgentType
 from fast_agent.agents.tool_agent import ToolAgent
-from fast_agent.commands.model_capabilities import resolve_model_name, resolve_resolved_model
+from fast_agent.commands.model_capabilities import (
+    resolve_model_name,
+    resolve_model_params,
+    resolve_resolved_model,
+)
 from fast_agent.config import MCPServerSettings
 from fast_agent.constants import (
+    DEFAULT_TERMINAL_OUTPUT_BYTE_LIMIT,
     HUMAN_INPUT_TOOL_NAME,
     should_parallelize_tool_calls,
 )
@@ -54,6 +59,7 @@ from fast_agent.interfaces import FastAgentLLMProtocol
 from fast_agent.llm.model_database import ModelDatabase
 from fast_agent.llm.provider_types import Provider
 from fast_agent.llm.terminal_output_limits import (
+    calculate_terminal_output_limit_for_max_tokens,
     calculate_terminal_output_limit_for_model,
     calculate_terminal_output_limit_for_resolved_model,
 )
@@ -78,10 +84,12 @@ from fast_agent.mcp.provider_management import (
     build_provider_managed_mcp_state,
     split_managed_server_names,
 )
+from fast_agent.mcp.tool_result_truncation import truncate_tool_result_for_llm
 from fast_agent.skills import SKILLS_DEFAULT, SkillManifest
 from fast_agent.skills.registry import SkillRegistry
 from fast_agent.tools.apply_patch_tool import APPLY_PATCH_TOOL_NAME
 from fast_agent.tools.composite_filesystem_runtime import CompositeFilesystemRuntime
+from fast_agent.tools.edit_file_tool import EDIT_FILE_TOOL_NAME
 from fast_agent.tools.elicitation import (
     get_elicitation_tool,
     run_elicitation_form,
@@ -130,6 +138,7 @@ TOOL_DISPLAY_NAMES: dict[str, str] = {
 
 class ShellEditToolMode(StrEnum):
     WRITE_TEXT_FILE = WRITE_TEXT_FILE_TOOL_NAME
+    EDIT_FILE = EDIT_FILE_TOOL_NAME
     APPLY_PATCH = APPLY_PATCH_TOOL_NAME
     OFF = "off"
 
@@ -146,7 +155,7 @@ class ShellEditToolFlags:
         return cls(
             write_text_file=write_text_file,
             apply_patch=mode is ShellEditToolMode.APPLY_PATCH,
-            edit_file=write_text_file,
+            edit_file=write_text_file or mode is ShellEditToolMode.EDIT_FILE,
         )
 
 
@@ -155,6 +164,7 @@ class _ShellRuntimeSettings:
     timeout_seconds: int
     warning_interval_seconds: int
     output_byte_limit: int
+    process_poll_default_wait_seconds: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -166,6 +176,7 @@ class _PlannedMcpToolCall:
     display_tool_name: str
     namespaced_tool: NamespacedTool | None
     candidate_namespaced_tool: NamespacedTool | None
+    is_local_shell: bool = False
     metadata: dict[str, Any] | None = None
 
 
@@ -439,6 +450,8 @@ class McpAgent(ABC, ToolAgent):
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         """Clean up the agent and its MCP aggregator."""
+        if self._shell_runtime is not None:
+            await self._shell_runtime.close()
         await self._aggregator.__aexit__(exc_type, exc_val, exc_tb)
 
     async def initialize(self) -> None:
@@ -461,6 +474,8 @@ class McpAgent(ABC, ToolAgent):
         if self._shutdown_complete:
             return
         await self._run_lifecycle_hook("on_shutdown")
+        if self._shell_runtime is not None:
+            await self._shell_runtime.close()
         await self._aggregator.close()
         await self._finalize_shutdown(run_hook=False)
 
@@ -788,18 +803,51 @@ class McpAgent(ABC, ToolAgent):
             warning_interval_seconds = shell_config.warning_interval_seconds
             config_output_byte_limit = shell_config.output_byte_limit
 
-        if config_output_byte_limit is not None:
+        output_limit_selection = (
+            shell_config.output_byte_limit_selection if shell_config is not None else "auto"
+        )
+        model_name = self.config.model
+        if not model_name and self._context and self._context.config:
+            model_name = self._context.config.default_model
+
+        if output_limit_selection == "explicit" and config_output_byte_limit is not None:
             output_byte_limit = config_output_byte_limit
+        elif output_limit_selection == "auto":
+            max_output_tokens = (
+                ModelDatabase.get_max_output_tokens(model_name) if model_name else None
+            )
+            output_byte_limit = calculate_terminal_output_limit_for_max_tokens(max_output_tokens)
         else:
-            model_name = self.config.model
-            if not model_name and self._context and self._context.config:
-                model_name = self._context.config.default_model
-            output_byte_limit = calculate_terminal_output_limit_for_model(model_name)
+            model_override = (
+                ModelDatabase.get_shell_output_byte_limit(model_name) if model_name else None
+            )
+            output_byte_limit = (
+                model_override
+                if model_override is not None
+                else config_output_byte_limit or DEFAULT_TERMINAL_OUTPUT_BYTE_LIMIT
+            )
         return _ShellRuntimeSettings(
             timeout_seconds=timeout_seconds,
             warning_interval_seconds=warning_interval_seconds,
             output_byte_limit=output_byte_limit,
+            process_poll_default_wait_seconds=(self._model_process_poll_default_wait_seconds()),
         )
+
+    def _model_process_poll_default_wait_seconds(
+        self,
+        llm: FastAgentLLMProtocol | None = None,
+    ) -> int:
+        active_llm = llm or self._llm
+        model_params = resolve_model_params(active_llm)
+        if model_params is not None:
+            return model_params.process_poll_default_wait_seconds
+        model_name = (
+            resolve_model_name(active_llm)
+            if active_llm is not None
+            else self._resolve_shell_tool_model_name()
+        )
+        params = ModelDatabase.get_model_params(model_name) if model_name else None
+        return params.process_poll_default_wait_seconds if params is not None else 0
 
     def _shell_read_text_file_enabled(self) -> bool:
         """Return whether shell-enabled agents should expose local read_text_file."""
@@ -815,8 +863,11 @@ class McpAgent(ABC, ToolAgent):
 
     def _resolve_shell_edit_tool_mode(self) -> ShellEditToolMode:
         """Return which shell edit tool should be exposed for the current model/config."""
-        if self._prefers_apply_patch_model(self._resolve_shell_tool_model_name()):
+        model_name = self._resolve_shell_tool_model_name()
+        if self._prefers_apply_patch_model(model_name):
             default_mode = ShellEditToolMode.APPLY_PATCH
+        elif self._prefers_anthropic_edit_file_model(model_name):
+            default_mode = ShellEditToolMode.EDIT_FILE
         else:
             default_mode = ShellEditToolMode.WRITE_TEXT_FILE
 
@@ -866,6 +917,29 @@ class McpAgent(ABC, ToolAgent):
         if minor is None:
             return False
         return int(minor) >= 2
+
+    @staticmethod
+    def _prefers_extended_shell_guidance(model_name: str | None) -> bool:
+        """Return True for GPT-5.6-class models."""
+        if not model_name:
+            return False
+        normalized = ModelDatabase.normalize_model_name(model_name)
+        return re.match(r"^gpt-5\.6(?:$|[-.])", normalized) is not None
+
+    @staticmethod
+    def _prefers_anthropic_edit_file_model(model_name: str | None) -> bool:
+        """Return True for Anthropic-series models."""
+        if not model_name:
+            return False
+
+        normalized = ModelDatabase.normalize_model_name(model_name)
+        params = ModelDatabase.get_model_params(normalized)
+        if params is not None and params.default_provider in {
+            Provider.ANTHROPIC,
+            Provider.ANTHROPIC_VERTEX,
+        }:
+            return True
+        return re.search(r"(?:^|[./:])claude-", normalized) is not None
 
     def _maybe_enable_local_filesystem_runtime(self, working_directory: Path | None = None) -> None:
         """Enable local filesystem runtime when shell mode is active and configured."""
@@ -973,7 +1047,8 @@ class McpAgent(ABC, ToolAgent):
         """Return True when shell output byte limit is explicitly configured."""
         if not self._context or not self._context.config:
             return False
-        return self._context.config.shell_execution.output_byte_limit is not None
+        shell_config = self._context.config.shell_execution
+        return shell_config.output_byte_limit_selection == "explicit"
 
     def _on_llm_attached(self, llm: FastAgentLLMProtocol) -> None:
         super()._on_llm_attached(llm)
@@ -1018,15 +1093,60 @@ class McpAgent(ABC, ToolAgent):
 
         if self._shell_runtime is None:
             return
+        self._shell_runtime.set_extended_guidance(
+            self._prefers_extended_shell_guidance(resolve_model_name(llm))
+        )
+        self._bash_tool = self._shell_runtime.tool
+        self._shell_runtime.set_process_poll_default_wait_seconds(
+            self._model_process_poll_default_wait_seconds(llm)
+        )
         if self._shell_output_limit_overridden():
             return
 
-        resolved_model = resolve_resolved_model(llm)
+        self._shell_runtime.set_output_byte_limit(self._model_tool_output_byte_limit(llm))
+
+    def _model_tool_output_byte_limit(
+        self,
+        llm: FastAgentLLMProtocol | None = None,
+    ) -> int:
+        active_llm = llm or self._llm
+        resolved_model = resolve_resolved_model(active_llm) if active_llm is not None else None
+        shell_config = (
+            self._context.config.shell_execution
+            if self._context is not None and self._context.config is not None
+            else None
+        )
+        automatic_sizing = (
+            shell_config is None or shell_config.output_byte_limit_selection == "auto"
+        )
         if resolved_model is not None:
-            output_byte_limit = calculate_terminal_output_limit_for_resolved_model(resolved_model)
-        else:
-            output_byte_limit = calculate_terminal_output_limit_for_model(resolve_model_name(llm))
-        self._shell_runtime.set_output_byte_limit(output_byte_limit)
+            if automatic_sizing:
+                return calculate_terminal_output_limit_for_max_tokens(
+                    resolved_model.max_output_tokens
+                )
+            model_override = (
+                resolved_model.model_params.shell_output_byte_limit
+                if resolved_model.model_params is not None
+                else None
+            )
+            if model_override is not None:
+                return calculate_terminal_output_limit_for_resolved_model(resolved_model)
+        model_name = (
+            resolve_model_name(active_llm)
+            if active_llm is not None
+            else self._resolve_shell_tool_model_name()
+        )
+        model_override = (
+            ModelDatabase.get_shell_output_byte_limit(model_name) if model_name else None
+        )
+        if automatic_sizing:
+            max_output_tokens = (
+                ModelDatabase.get_max_output_tokens(model_name) if model_name else None
+            )
+            return calculate_terminal_output_limit_for_max_tokens(max_output_tokens)
+        if model_override is not None:
+            return calculate_terminal_output_limit_for_model(model_name)
+        return shell_config.output_byte_limit or DEFAULT_TERMINAL_OUTPUT_BYTE_LIMIT
 
     def _activate_shell_runtime(
         self,
@@ -1051,9 +1171,13 @@ class McpAgent(ABC, ToolAgent):
             warning_interval_seconds=shell_settings.warning_interval_seconds,
             working_directory=working_directory,
             output_byte_limit=shell_settings.output_byte_limit,
+            process_poll_default_wait_seconds=(shell_settings.process_poll_default_wait_seconds),
             config=self._context.config if self._context else None,
             agent_name=self._name,
             shell_environment=self._shell_environment,
+            extended_guidance=self._prefers_extended_shell_guidance(
+                self._resolve_shell_tool_model_name()
+            ),
         )
         self._shell_runtime_enabled = self._shell_runtime.enabled
         self._bash_tool = self._shell_runtime.tool
@@ -1334,12 +1458,9 @@ class McpAgent(ABC, ToolAgent):
         if self._skill_reader and name == READ_SKILL_TOOL_NAME:
             return await self._skill_reader.execute(arguments)
 
-        if (
-            self._shell_runtime
-            and self._shell_runtime.tool
-            and name == self._shell_runtime.tool.name
-        ):
-            return await self._shell_runtime.execute(
+        if self._shell_runtime and self._shell_runtime.owns_tool(name):
+            return await self._shell_runtime.call_tool(
+                name,
                 arguments,
                 tool_use_id,
                 show_tool_call_id=self._show_shell_tool_call_id,
@@ -1914,6 +2035,11 @@ class McpAgent(ABC, ToolAgent):
         tool_timings: dict[str, ToolTimingInfo],
         parallel: bool,
     ) -> None:
+        if not call.is_local_shell:
+            result = truncate_tool_result_for_llm(
+                result,
+                byte_limit=self._model_tool_output_byte_limit(),
+            )
         self._attach_read_text_file_display_metadata(
             result,
             display_tool_name=call.display_tool_name,
@@ -2046,6 +2172,11 @@ class McpAgent(ABC, ToolAgent):
             display_tool_name=display_tool_name,
             namespaced_tool=namespaced_tool,
             candidate_namespaced_tool=candidate_namespaced_tool,
+            is_local_shell=(
+                self._bash_tool is not None
+                and tool_name == self._bash_tool.name
+                and namespaced_tool is None
+            ),
             metadata=metadata,
         )
 
@@ -2098,11 +2229,7 @@ class McpAgent(ABC, ToolAgent):
         is_external_runtime_tool: bool,
         is_filesystem_runtime_tool: bool,
     ) -> bool:
-        is_shell_tool = bool(
-            self._shell_runtime
-            and self._shell_runtime.tool
-            and tool_name == self._shell_runtime.tool.name
-        )
+        is_shell_tool = bool(self._shell_runtime and self._shell_runtime.owns_tool(tool_name))
         is_skill_reader_tool = bool(
             self._skill_reader and self._skill_reader.enabled and tool_name == READ_SKILL_TOOL_NAME
         )
@@ -2127,13 +2254,11 @@ class McpAgent(ABC, ToolAgent):
         is_filesystem_runtime_tool: bool,
         route_to_namespaced_candidate: bool,
     ) -> dict[str, Any] | None:
-        if (
-            self._shell_runtime_enabled
-            and self._shell_runtime
-            and self._shell_runtime.tool
-            and tool_name == self._shell_runtime.tool.name
-        ):
-            return self._shell_runtime.metadata(tool_args.get("command"))
+        if self._shell_runtime_enabled and self._shell_runtime:
+            if self._shell_runtime.tool and tool_name == self._shell_runtime.tool.name:
+                return self._shell_runtime.metadata(tool_args)
+            if self._shell_runtime.owns_tool(tool_name):
+                return self._shell_runtime.process_tool_metadata(tool_name, tool_args)
         if is_external_runtime_tool and self._external_runtime is not None:
             return self._external_runtime.metadata()
         if (
@@ -2445,9 +2570,7 @@ class McpAgent(ABC, ToolAgent):
 
     async def _additional_runtime_tools(self) -> list[Tool]:
         tools = list((await super().list_tools()).tools)
-        terminal_tool = self._terminal_runtime_tool()
-        if terminal_tool is not None:
-            tools.append(terminal_tool)
+        tools.extend(self._terminal_runtime_tools())
         tools.extend(self._filesystem_runtime_tools())
         skill_tool = self._skill_reader_fallback_tool()
         if skill_tool is not None:
@@ -2457,10 +2580,12 @@ class McpAgent(ABC, ToolAgent):
             tools.append(human_tool)
         return tools
 
-    def _terminal_runtime_tool(self) -> Tool | None:
+    def _terminal_runtime_tools(self) -> list[Tool]:
         if self._external_runtime is not None:
-            return self._external_runtime.tool
-        return self._bash_tool
+            return [self._external_runtime.tool]
+        if self._shell_runtime is not None:
+            return self._shell_runtime.tools
+        return []
 
     def _filesystem_runtime_tools(self) -> list[Tool]:
         if not self._filesystem_runtime:
@@ -2630,7 +2755,7 @@ class McpAgent(ABC, ToolAgent):
     def _server_label_for_tool_call(self, tool_name: str) -> str | None:
         if tool_name in self.agent_backed_tools:
             return tool_name.removeprefix("agent__")
-        if tool_name == self._shell_tool_name_for_display():
+        if self._shell_runtime and self._shell_runtime.owns_tool(tool_name):
             return self._shell_server_label()
         if self._skill_reader_tool_called(tool_name):
             return self._skills_tool_label()

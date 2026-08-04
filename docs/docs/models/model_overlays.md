@@ -53,6 +53,7 @@ defaults:
   temperature: 0.8
   top_p: 0.95
   max_tokens: 2048
+  streaming_timeout: 300
 metadata:
   context_window: 75264
   max_output_tokens: 2048
@@ -114,6 +115,7 @@ defaults:
   top_k: 40
   min_p: 0.05
   max_tokens: 2048
+  streaming_timeout: 300
   transport: sse
   service_tier: fast
   web_search: false
@@ -127,6 +129,8 @@ metadata:
     - image/jpeg
     - image/png
   default_temperature: 0.8
+  managed_process_poll_folding: true
+  process_poll_default_wait_seconds: 30
   fast: true
 
 picker:
@@ -166,6 +170,7 @@ Common examples:
 - `min_p`
 - `max_tokens`
 - `reasoning`
+- `streaming_timeout`: positive seconds between provider stream events, or `none` to disable
 - `transport`
 - `service_tier`
 - `web_search`
@@ -182,6 +187,13 @@ Common fields:
 - `context_window`
 - `max_output_tokens`
 - `tokenizes`
+- `managed_process_poll_folding`: whether automatic folding of repetitive
+  quiet `poll_process` exchanges has been validated for this model. This is
+  consulted when `shell_execution.managed_process_poll_history_folding` is
+  `auto`.
+- `process_poll_default_wait_seconds`: default `poll_process` wait when the model
+  omits `wait_sec` (`0` keeps polling non-blocking). The value is capped by
+  `shell_execution.process_poll_max_wait_seconds`.
 - `fast`
 
 ## Authentication options

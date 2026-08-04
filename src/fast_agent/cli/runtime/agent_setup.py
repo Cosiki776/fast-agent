@@ -13,9 +13,11 @@ from urllib.parse import urlparse
 import typer
 
 from fast_agent.cli.commands.server_helpers import add_servers_to_config
+from fast_agent.commands.model_capabilities import resolve_reasoning_effort
 from fast_agent.core.card_tool_attachment import load_and_attach_card_tool_agents
 from fast_agent.core.exceptions import AgentConfigError
 from fast_agent.core.logging.logger import get_logger
+from fast_agent.llm.reasoning_effort import reasoning_setting_telemetry_value
 from fast_agent.types.llm_stop_reason import LlmStopReason
 from fast_agent.ui.interactive_diagnostics import write_interactive_trace
 from fast_agent.utils.filename import sanitize_filename_suffix
@@ -391,7 +393,9 @@ def _live_atif_session_id(
     return f"run_{uuid.uuid4().hex}"
 
 
-def _live_atif_model_metadata(agent_obj: Any, request: AgentRunRequest) -> tuple[str | None, str | None]:
+def _live_atif_model_metadata(
+    agent_obj: Any, request: AgentRunRequest
+) -> tuple[str | None, str | None]:
     llm = agent_obj.llm
     if llm is None:
         return request.model, None
@@ -453,6 +457,7 @@ async def _export_live_atif_trajectory(
     if not messages:
         return
     model_name, provider = _live_atif_model_metadata(agent_obj, request)
+    reasoning = resolve_reasoning_effort(agent_obj.llm)
     trajectory = build_atif_trajectory(
         AtifRunSource(
             session_id=_live_atif_session_id(session_manager, harness_session),
@@ -461,9 +466,7 @@ async def _export_live_atif_trajectory(
             provider=provider,
             history=messages,
             message_timestamps=tuple(message.timestamp for message in messages),
-            child_trajectory_dir=_live_child_trajectory_dir(
-                session_manager, harness_session
-            ),
+            child_trajectory_dir=_live_child_trajectory_dir(session_manager, harness_session),
             tool_definitions=await _live_atif_tool_definitions(agent_obj),
             extra=(
                 {
@@ -484,6 +487,7 @@ async def _export_live_atif_trajectory(
                 else None
             ),
             system_prompt=agent_obj.instruction,
+            reasoning_effort=(reasoning_setting_telemetry_value(reasoning)),
         )
     )
     write_atif_trajectory(trajectory, request.trajectory_output.expanduser().resolve())
@@ -518,6 +522,7 @@ async def _export_parallel_atif_trajectory(
         if not messages:
             continue
         model_name, provider = _live_atif_model_metadata(agent_obj, request)
+        reasoning = resolve_reasoning_effort(agent_obj.llm)
         sources.append(
             AtifRunSource(
                 session_id=session_id,
@@ -526,11 +531,10 @@ async def _export_parallel_atif_trajectory(
                 provider=provider,
                 history=messages,
                 message_timestamps=tuple(message.timestamp for message in messages),
-                child_trajectory_dir=_live_child_trajectory_dir(
-                    session_manager, harness_session
-                ),
+                child_trajectory_dir=_live_child_trajectory_dir(session_manager, harness_session),
                 tool_definitions=await _live_atif_tool_definitions(agent_obj),
                 system_prompt=agent_obj.instruction,
+                reasoning_effort=(reasoning_setting_telemetry_value(reasoning)),
             )
         )
     if not sources:
@@ -557,9 +561,7 @@ async def _export_failed_one_shot_atif(
 
     new_history = agent_obj.message_history[len(history_before) :]
     if isinstance(agent_obj, ToolAgent) and agent_obj.last_turn_messages:
-        messages = [
-            message.model_copy(deep=True) for message in agent_obj.last_turn_messages
-        ]
+        messages = [message.model_copy(deep=True) for message in agent_obj.last_turn_messages]
     else:
         messages = [
             *(
@@ -576,6 +578,66 @@ async def _export_failed_one_shot_atif(
         harness_session=harness_session,
         termination_error=error,
     )
+
+
+async def _export_requested_outputs(
+    agent_app: Any,
+    request: AgentRunRequest,
+    *,
+    transient_messages_by_agent: Mapping[str, list[PromptMessageExtended]] | None,
+    session_manager: SessionManager | None,
+    harness_session: HarnessSession | None,
+) -> None:
+    """Export result history and ATIF independently.
+
+    A failure in one artifact must not prevent the other artifact from being
+    attempted. The first failure remains primary after both attempts finish.
+    """
+
+    async def export_result_history() -> None:
+        await _export_result_histories(
+            agent_app,
+            request,
+            transient_messages_by_agent=transient_messages_by_agent,
+        )
+
+    async def export_atif() -> None:
+        await _export_live_atif_trajectory(
+            agent_app,
+            request,
+            transient_messages_by_agent=transient_messages_by_agent,
+            session_manager=session_manager,
+            harness_session=harness_session,
+        )
+
+    failures: list[Exception] = []
+    exporters = (
+        ("result_history", export_result_history),
+        ("atif", export_atif),
+    )
+    for artifact, exporter in exporters:
+        logger.debug(
+            "CLI artifact export started",
+            data={"artifact": artifact},
+        )
+        try:
+            await exporter()
+        except Exception as exc:
+            failures.append(exc)
+            logger.warning(
+                "CLI artifact export failed",
+                data={
+                    "artifact": artifact,
+                    "error_type": type(exc).__name__,
+                },
+            )
+        else:
+            logger.debug(
+                "CLI artifact export succeeded",
+                data={"artifact": artifact},
+            )
+    if failures:
+        raise failures[0]
 
 
 async def _run_cli_flow(
@@ -628,16 +690,22 @@ async def _run_cli_flow(
                 harness_session=harness_session,
             )
         except BaseException as exc:
-            await _export_failed_one_shot_atif(
-                agent_app,
-                agent_obj,
-                prompt_payload,
-                request,
-                history_before=history_before,
-                session_manager=session_manager,
-                harness_session=harness_session,
-                error=exc,
-            )
+            try:
+                await _export_failed_one_shot_atif(
+                    agent_app,
+                    agent_obj,
+                    prompt_payload,
+                    request,
+                    history_before=history_before,
+                    session_manager=session_manager,
+                    harness_session=harness_session,
+                    error=exc,
+                )
+            except Exception as export_exc:
+                logger.warning(
+                    "Failed-run ATIF export failed",
+                    data={"error_type": type(export_exc).__name__},
+                )
             raise
         one_shot_response = response
         transient_messages_by_agent = _transient_result_messages_if_needed(
@@ -666,16 +734,22 @@ async def _run_cli_flow(
                 harness_session=harness_session,
             )
         except BaseException as exc:
-            await _export_failed_one_shot_atif(
-                agent_app,
-                agent_obj,
-                prompt_payload,
-                request,
-                history_before=history_before,
-                session_manager=session_manager,
-                harness_session=harness_session,
-                error=exc,
-            )
+            try:
+                await _export_failed_one_shot_atif(
+                    agent_app,
+                    agent_obj,
+                    prompt_payload,
+                    request,
+                    history_before=history_before,
+                    session_manager=session_manager,
+                    harness_session=harness_session,
+                    error=exc,
+                )
+            except Exception as export_exc:
+                logger.warning(
+                    "Failed-run ATIF export failed",
+                    data={"error_type": type(export_exc).__name__},
+                )
             raise
         one_shot_response = response
         transient_messages_by_agent = _transient_result_messages_if_needed(
@@ -693,22 +767,14 @@ async def _run_cli_flow(
             harness_session=harness_session,
         )
 
-    await _export_result_histories(
-        agent_app,
-        request,
-        transient_messages_by_agent=transient_messages_by_agent,
-    )
-    await _export_live_atif_trajectory(
+    await _export_requested_outputs(
         agent_app,
         request,
         transient_messages_by_agent=transient_messages_by_agent,
         session_manager=session_manager,
         harness_session=harness_session,
     )
-    if (
-        one_shot_response is not None
-        and one_shot_response.stop_reason == LlmStopReason.ERROR
-    ):
+    if one_shot_response is not None and one_shot_response.stop_reason == LlmStopReason.ERROR:
         raise typer.Exit(1)
 
 
@@ -821,9 +887,8 @@ async def _select_startup_model_if_needed(request: AgentRunRequest) -> str | Non
         model_references=settings.model_references,
     )
 
-    if (
-        not startup_model_defined_by_card
-        and _should_prompt_for_unpinned_system_default(settings, can_prompt=can_prompt_for_model)
+    if not startup_model_defined_by_card and _should_prompt_for_unpinned_system_default(
+        settings, can_prompt=can_prompt_for_model
     ):
         initial_selection = _resolve_model_picker_initial_selection(settings=settings)
         request.model = await _select_model_from_picker(

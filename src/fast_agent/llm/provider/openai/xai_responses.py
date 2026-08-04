@@ -6,8 +6,11 @@ from typing import TYPE_CHECKING, Any
 
 from mcp.types import ContentBlock, TextContent
 
+from fast_agent.core.exceptions import ProviderKeyError
 from fast_agent.llm.provider.openai.responses import ResponsesLLM
 from fast_agent.llm.provider.openai.responses_websocket import (
+    ManagedWebSocketConnection,
+    ResponsesWebSocketError,
     ResponsesWsRequestPlanner,
     StatelessResponsesWsPlanner,
 )
@@ -21,9 +24,11 @@ from fast_agent.llm.provider.openai.web_tools import (
     build_xai_web_search_tool,
 )
 from fast_agent.llm.provider_types import Provider
+from fast_agent.llm.usage_tracking import TurnUsage, usage_from_responses_compatible
 
 if TYPE_CHECKING:
     from mcp import Tool
+    from openai.types.responses import ResponseUsage
 
     from fast_agent.llm.provider.openai.responses import ResponsesTransport
     from fast_agent.tool_activity_presentation import ToolActivityFamily
@@ -44,6 +49,19 @@ XAI_X_SEARCH_INTERNAL_TOOL_NAMES = frozenset(
 class XAIResponsesLLM(ResponsesLLM):
     """LLM implementation for xAI's Responses-compatible API."""
 
+    def _translate_responses_usage(
+        self,
+        usage: ResponseUsage,
+        *,
+        provider: Provider,
+        model: str,
+    ) -> TurnUsage:
+        return usage_from_responses_compatible(
+            usage.model_dump(mode="json"),
+            provider=provider,
+            model=model,
+        )
+
     config_section: str | None = "xai"
 
     def __init__(self, provider: Provider = Provider.XAI, **kwargs: Any) -> None:
@@ -60,7 +78,7 @@ class XAIResponsesLLM(ResponsesLLM):
             kwargs,
             DEFAULT_XAI_MODEL,
         )
-        params.parallel_tool_calls = False
+        params.parallel_tool_calls = True
         return params
 
     def _provider_config_fallback_sections(self) -> tuple[str, ...]:
@@ -170,12 +188,48 @@ class XAIResponsesLLM(ResponsesLLM):
         headers.setdefault("Authorization", f"Bearer {self._api_key()}")
         return headers
 
+    def _uses_oauth_credential(self) -> bool:
+        if self._init_api_key is not None:
+            return False
+        from fast_agent.llm.provider_key_manager import ProviderKeyManager
+
+        return (
+            ProviderKeyManager.get_config_file_key("xai", self.context.config) is None
+            and ProviderKeyManager.get_env_var("xai") is None
+        )
+
     def _new_ws_request_planner(self) -> ResponsesWsRequestPlanner:
         # Live xAI websocket smoke tests currently hang on store=false
         # `previous_response_id` continuations. Keep ZDR/store=false semantics
         # by replaying full context on each websocket turn until xAI's in-memory
         # continuation path behaves as documented.
         return StatelessResponsesWsPlanner()
+
+    async def _create_websocket_connection(
+        self,
+        url: str,
+        headers: dict[str, str],
+        timeout_seconds: float | None,
+    ) -> ManagedWebSocketConnection:
+        try:
+            return await super()._create_websocket_connection(url, headers, timeout_seconds)
+        except ResponsesWebSocketError as exc:
+            if exc.status != 401:
+                raise
+            if not self._uses_oauth_credential():
+                raise
+        from fast_agent.llm.provider.openai.xai_oauth import get_xai_access_token
+
+        if get_xai_access_token(force_refresh=True) is None:
+            raise ProviderKeyError(
+                "xAI OAuth token rejected",
+                "Run `fast-agent auth login xai` to reauthenticate.",
+            )
+        return await super()._create_websocket_connection(
+            url,
+            self._build_websocket_headers(),
+            timeout_seconds,
+        )
 
     def _build_web_search_tool(
         self,

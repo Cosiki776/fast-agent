@@ -148,6 +148,10 @@ class ResolvedModelSpec:
         effective_request_params = request_params
         config = self.model_config
 
+        if config.max_tokens is not None:
+            target = effective_request_params or RequestParams()
+            effective_request_params = target.model_copy(update={"maxTokens": config.max_tokens})
+
         sampling_updates = {
             field_name: value
             for field_name, value in {
@@ -163,6 +167,13 @@ class ResolvedModelSpec:
         if sampling_updates:
             target = effective_request_params or RequestParams()
             effective_request_params = target.model_copy(update=sampling_updates)
+
+        if config.streaming_timeout_configured:
+            target = effective_request_params or RequestParams()
+            if "streaming_timeout" not in target.model_fields_set:
+                effective_request_params = target.model_copy(
+                    update={"streaming_timeout": config.streaming_timeout}
+                )
 
         return _apply_unset_request_defaults(
             effective_request_params,
@@ -194,6 +205,8 @@ class ResolvedModelSpec:
             Provider.OPENRESPONSES,
             Provider.CODEX_RESPONSES,
             Provider.XAI,
+            Provider.META_AI,
+            Provider.DEEPSEEK,
             Provider.GOOGLE,
         }:
             kwargs["web_search"] = config.web_search

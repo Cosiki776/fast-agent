@@ -23,6 +23,7 @@ from anthropic import BadRequestError as AnthropicBadRequestError
 from anthropic import RequestTooLargeError as AnthropicRequestTooLargeError
 from mcp import Tool
 from mcp.types import GetPromptResult
+from openai import APIError as OpenAIAPIError
 from openai import BadRequestError as OpenAIBadRequestError
 from pydantic_core import from_json
 
@@ -39,10 +40,12 @@ from fast_agent.interfaces import (
 )
 from fast_agent.llm.memory import Memory, SimpleMemory
 from fast_agent.llm.model_database import ModelDatabase, ModelParameters
+from fast_agent.llm.provider.streaming_timeouts import StreamTiming
 from fast_agent.llm.provider_types import Provider
 from fast_agent.llm.reasoning_effort import (
     ReasoningEffortSetting,
     ReasoningEffortSpec,
+    reasoning_setting_telemetry_value,
     validate_reasoning_setting,
 )
 from fast_agent.llm.request_param_resolution import (
@@ -58,6 +61,12 @@ from fast_agent.llm.response_telemetry import (
     add_timing_channel,
     append_usage_channel,
     start_request_timing_capture,
+)
+from fast_agent.llm.retry_telemetry import (
+    ProviderRetry,
+    append_retry_channel,
+    provider_retry,
+    retry_boundary,
 )
 from fast_agent.llm.stream_types import StreamChunk
 from fast_agent.llm.structured_schema import (
@@ -196,6 +205,10 @@ class FastAgentLLM(ContextDependent, FastAgentLLMProtocol, Generic[MessageParamT
         self.default_request_params = self._build_default_request_params(model, kwargs)
         self._model_name: str | None = self.default_request_params.model
         self._ensure_resolved_model_spec(provider)
+
+        # Set by providers when a streaming attempt fails part-way through, so
+        # retry telemetry can report how far the stream got (provider-neutral).
+        self._stream_failure_events_received: int | None = None
 
         # Reasoning effort configuration (provider-neutral)
         self._reasoning_effort: ReasoningEffortSetting | None = None
@@ -355,6 +368,14 @@ class FastAgentLLM(ContextDependent, FastAgentLLMProtocol, Generic[MessageParamT
         request_params: RequestParams,
     ) -> Literal["always", "defer", "no_tools"]:
         return self._resolve_structured_tool_policy(request_params)
+
+    def resolve_managed_process_poll_folding(
+        self,
+        request_params: RequestParams,
+    ) -> bool:
+        model_name = request_params.model or self.default_request_params.model or self._model_name
+        params = self._get_model_params(model_name)
+        return params is not None and params.managed_process_poll_folding is True
 
     def _should_defer_structured_schema_for_tools(
         self,
@@ -663,24 +684,62 @@ class FastAgentLLM(ContextDependent, FastAgentLLMProtocol, Generic[MessageParamT
         """
         retries = max(0, int(self.retry_count))
         last_error = None
+        retry_records: list[ProviderRetry] = []
+        boundary = retry_boundary(args[0] if args else None)
 
         for attempt in range(retries + 1):
+            self._stream_failure_events_received = None
             try:
-                # Await the async function
-                return await func(*args, **kwargs)
+                result = await func(*args, **kwargs)
             except Exception as e:
                 if self._is_fatal_retry_error(e):
                     raise
 
                 last_error = e
                 if attempt < retries:
+                    self._notify_stream_listeners(StreamChunk(event="rollback"))
+                    wait_seconds = self._retry_wait_seconds(attempt)
+                    retry_records.append(
+                        provider_retry(
+                            e,
+                            attempt=attempt + 1,
+                            max_attempts=retries + 1,
+                            wait_seconds=wait_seconds,
+                            boundary=boundary,
+                            stream_events_received=self._stream_failure_events_received,
+                        )
+                    )
                     await self._wait_before_retry(e, attempt=attempt, retries=retries)
+            else:
+                self._notify_stream_listeners(StreamChunk(event="commit"))
+                self._append_retry_telemetry(result, retry_records)
+                return result
 
         if last_error:
-            return await self._handle_exhausted_retries(last_error, on_final_error)
+            result = await self._handle_exhausted_retries(last_error, on_final_error)
+            self._notify_stream_listeners(StreamChunk(event="rollback"))
+            self._append_retry_telemetry(result, retry_records)
+            return result
 
         # This line satisfies Pylance that we never implicitly return None
         raise RuntimeError("Retry loop finished without success or exception")
+
+    def _record_stream_failure(self, timing: StreamTiming) -> None:
+        """Record how far a failed provider stream got, for retry telemetry."""
+        self._stream_failure_events_received = timing.events_received
+
+    @staticmethod
+    def _append_retry_telemetry(result: Any, retries: list[ProviderRetry]) -> None:
+        if not retries:
+            return
+        if isinstance(result, PromptMessageExtended):
+            append_retry_channel(result, retries)
+            return
+        if isinstance(result, tuple):
+            for item in reversed(result):
+                if isinstance(item, PromptMessageExtended):
+                    append_retry_channel(item, retries)
+                    return
 
     @staticmethod
     def _is_fatal_retry_error(error: Exception) -> bool:
@@ -695,6 +754,11 @@ class FastAgentLLM(ContextDependent, FastAgentLLMProtocol, Generic[MessageParamT
             ),
         ):
             return True
+
+        if isinstance(error, OpenAIAPIError) and isinstance(error.code, str):
+            code = casefold_text(error.code)
+            if code in _NON_RETRYABLE_CONTEXT_ERROR_CODES:
+                return True
 
         message = casefold_text(str(error))
         if any(code in message for code in _NON_RETRYABLE_CONTEXT_ERROR_CODES):
@@ -711,16 +775,19 @@ class FastAgentLLM(ContextDependent, FastAgentLLMProtocol, Generic[MessageParamT
         attempt: int,
         retries: int,
     ) -> None:
-        wait_time = self.retry_backoff_seconds * (attempt + 1)
+        wait_time = self._retry_wait_seconds(attempt)
         self._log_retry_webdebug(error, attempt=attempt, retries=retries)
 
         with self._paused_progress_display():
             error_console.print(f"\n[yellow]▲ Provider Error: {str(error)[:300]}...[/yellow]")
             error_console.print(
-                f"[dim]⟳ Retrying in {wait_time}s... (Attempt {attempt + 1}/{retries})[/dim]"
+                f"[dim]⟳ Retrying in {wait_time}s... (Attempt {attempt + 1}/{retries + 1})[/dim]"
             )
 
         await asyncio.sleep(wait_time)
+
+    def _retry_wait_seconds(self, attempt: int) -> float:
+        return self.retry_backoff_seconds * (attempt + 1)
 
     @staticmethod
     def _log_retry_webdebug(error: Exception, *, attempt: int, retries: int) -> None:
@@ -877,6 +944,7 @@ class FastAgentLLM(ContextDependent, FastAgentLLMProtocol, Generic[MessageParamT
         # The caller supplies the full conversation to send
         full_history = prepared_messages
 
+        usage_start_index = len(self.usage_accumulator.turns)
         timing_capture, cleanup_timing_capture = self._start_request_timing_capture()
         try:
             assistant_response = await self._execute_with_retry(
@@ -898,12 +966,17 @@ class FastAgentLLM(ContextDependent, FastAgentLLMProtocol, Generic[MessageParamT
         )
 
         self.usage_accumulator.count_tools(len(assistant_response.tool_calls or {}))
-        self._append_usage_channel(assistant_response)
+        self._append_usage_channel(assistant_response, start_index=usage_start_index)
 
         return assistant_response
 
-    def _append_usage_channel(self, response: PromptMessageExtended) -> None:
-        append_usage_channel(response, self.usage_accumulator)
+    def _append_usage_channel(
+        self,
+        response: PromptMessageExtended,
+        *,
+        start_index: int | None = None,
+    ) -> None:
+        append_usage_channel(response, self.usage_accumulator, start_index=start_index)
 
     def _add_timing_channel(
         self,
@@ -978,6 +1051,7 @@ class FastAgentLLM(ContextDependent, FastAgentLLMProtocol, Generic[MessageParamT
         final_request_params = self.get_request_params(request_params)
         mcp_metadata_token = _mcp_metadata_var.set(final_request_params.mcp_metadata)
 
+        usage_start_index = len(self.usage_accumulator.turns)
         timing_capture, cleanup_timing_capture = self._start_request_timing_capture()
         try:
             result_or_response = await self._execute_with_retry(
@@ -1009,7 +1083,7 @@ class FastAgentLLM(ContextDependent, FastAgentLLMProtocol, Generic[MessageParamT
         )
 
         self.usage_accumulator.count_tools(len(assistant_response.tool_calls or {}))
-        self._append_usage_channel(assistant_response)
+        self._append_usage_channel(assistant_response, start_index=usage_start_index)
 
         return result, assistant_response
 
@@ -1285,8 +1359,16 @@ class FastAgentLLM(ContextDependent, FastAgentLLMProtocol, Generic[MessageParamT
         # Many LLM implementations will allow the same type for input and output messages
         return cast("MessageParamT", message)
 
-    def _finalize_turn_usage(self, turn_usage: "TurnUsage") -> None:
+    def _finalize_turn_usage(
+        self,
+        turn_usage: "TurnUsage",
+        *,
+        requested_service_tier: Literal["fast", "flex"] | None = None,
+    ) -> None:
         """Set tool call count on TurnUsage and add to accumulator."""
+        reasoning_effort = self.reasoning_effort
+        turn_usage.reasoning_effort = reasoning_setting_telemetry_value(reasoning_effort)
+        turn_usage.requested_service_tier = requested_service_tier
         self._usage_accumulator.add_turn(turn_usage)
 
     def _log_chat_progress(self, chat_turn: int | None = None, model: str | None = None) -> None:
@@ -1367,7 +1449,7 @@ class FastAgentLLM(ContextDependent, FastAgentLLMProtocol, Generic[MessageParamT
 
     def _notify_stream_listeners(self, chunk: StreamChunk) -> None:
         """Notify registered listeners with a streaming chunk."""
-        if not chunk.text:
+        if chunk.event == "delta" and not chunk.text:
             return
         for listener in list(self._stream_listeners):
             try:
@@ -1551,6 +1633,12 @@ class FastAgentLLM(ContextDependent, FastAgentLLMProtocol, Generic[MessageParamT
         self._usage_accumulator.reset()
 
     def _api_key(self):
+        if self.provider is not None:
+            from fast_agent.llm.provider_key_manager import ProviderKeyManager
+
+            if ProviderKeyManager.serve_oauth_requires_request_token(self.provider.config_name):
+                return self._provider_api_key()
+
         if self._init_api_key is not None:
             return self._init_api_key
 
@@ -1558,6 +1646,14 @@ class FastAgentLLM(ContextDependent, FastAgentLLMProtocol, Generic[MessageParamT
 
     def validate_provider_credentials(self) -> None:
         """Validate that this provider has a locally configured credential source."""
+        if self.provider is not None:
+            from fast_agent.llm.provider_key_manager import ProviderKeyManager
+
+            if ProviderKeyManager.serve_oauth_requires_request_token(self.provider.config_name):
+                # Credentials are supplied per-request via the caller's forwarded
+                # OAuth token; there is no local credential source to validate and
+                # a request-time call would (correctly) fail closed here.
+                return
         self._api_key()
 
     def _provider_api_key(self):

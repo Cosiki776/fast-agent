@@ -336,7 +336,12 @@ def _discovery_top_level_catalog() -> tuple[CommandIndexEntry, ...]:
                 {"name": name, "summary": summary}
                 for name, summary in HISTORY_COMMAND_COMPLETION_DESCRIPTIONS.items()
             ],
-            "examples": ["/history", "/history 3", "/history detail 3", "/history save history.json"],
+            "examples": [
+                "/history",
+                "/history 3",
+                "/history detail 3",
+                "/history save history.json",
+            ],
         },
         _simple_command_entry(
             "load",
@@ -350,6 +355,20 @@ def _discovery_top_level_catalog() -> tuple[CommandIndexEntry, ...]:
             usage="/mcpstatus",
             examples=["/mcpstatus"],
         ),
+        {
+            "name": "process",
+            "summary": "Show managed shell processes",
+            "usage": "/process [--history]",
+            "actions": [
+                {
+                    "name": "history",
+                    "summary": "show retained finished processes",
+                    "aliases": ["--history"],
+                    "usage": "/process --history",
+                }
+            ],
+            "examples": ["/process", "/process --history"],
+        },
         {
             "name": "mcp",
             "summary": "Runtime MCP control",

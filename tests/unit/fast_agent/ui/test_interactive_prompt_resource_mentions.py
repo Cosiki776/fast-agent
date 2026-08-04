@@ -122,7 +122,8 @@ async def test_prompt_loop_materializes_local_file_mentions(
     image_path = tmp_path / "pixel.png"
     image_path.write_bytes(
         base64.b64decode(
-            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9s2nRwAAAABJRU5ErkJggg=="
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk"
+            "+A8AAQUBAScY42YAAAAASUVORK5CYII="
         )
     )
     inputs = iter([f"Compare ^file:{image_path}", "STOP"])
@@ -177,9 +178,7 @@ async def test_prompt_loop_resolves_attach_paths_from_shell_working_dir(
         return next_input
 
     monkeypatch.setattr(interactive_prompt, "get_enhanced_input", fake_get_enhanced_input)
-    monkeypatch.setattr(
-        prompt_input, "resolve_shell_working_dir", lambda **_kwargs: shell_dir
-    )
+    monkeypatch.setattr(prompt_input, "resolve_shell_working_dir", lambda **_kwargs: shell_dir)
 
     sent_payloads: list[str | PromptMessageExtended] = []
 
@@ -280,9 +279,7 @@ async def test_resolve_prompt_payload_uses_shell_working_dir_for_local_file_ment
     notes = shell_dir / "notes.txt"
     notes.write_text("hello", encoding="utf-8")
 
-    monkeypatch.setattr(
-        prompt_input, "resolve_shell_working_dir", lambda **_kwargs: shell_dir
-    )
+    monkeypatch.setattr(prompt_input, "resolve_shell_working_dir", lambda **_kwargs: shell_dir)
 
     prompt_ui = InteractivePrompt()
     app = _MentionAgentApp()

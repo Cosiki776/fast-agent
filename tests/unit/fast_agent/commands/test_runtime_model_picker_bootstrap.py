@@ -41,6 +41,7 @@ from fast_agent.llm.provider_types import Provider
 from fast_agent.ui.model_picker import ModelPickerResult
 from fast_agent.ui.model_picker_common import (
     LLAMACPP_PROVIDER_KEY,
+    ProviderActivation,
     normalize_generic_model_spec,
 )
 
@@ -155,9 +156,7 @@ async def test_startup_model_selection_skipped_when_resuming(monkeypatch) -> Non
     async def _fail(*args, **kwargs):  # type: ignore[no-untyped-def]
         raise AssertionError("model picker must not run during resume")
 
-    monkeypatch.setattr(
-        "fast_agent.cli.runtime.agent_setup._select_model_from_picker", _fail
-    )
+    monkeypatch.setattr("fast_agent.cli.runtime.agent_setup._select_model_from_picker", _fail)
     request = _make_request(resume="__latest__")
 
     assert await _select_startup_model_if_needed(request) == "session resumption"
@@ -171,9 +170,7 @@ async def test_startup_model_selection_skipped_when_resuming_named_session(
     async def _fail(*args, **kwargs):  # type: ignore[no-untyped-def]
         raise AssertionError("model picker must not run during resume")
 
-    monkeypatch.setattr(
-        "fast_agent.cli.runtime.agent_setup._select_model_from_picker", _fail
-    )
+    monkeypatch.setattr("fast_agent.cli.runtime.agent_setup._select_model_from_picker", _fail)
     request = _make_request(resume="session-123")
 
     assert await _select_startup_model_if_needed(request) == "session resumption"
@@ -493,6 +490,101 @@ async def test_select_model_from_picker_preserves_overlay_token_when_resolved_mo
     selected = await _select_model_from_picker(request, config_payload={})
 
     assert selected == "haikutiny"
+
+
+@pytest.mark.asyncio
+async def test_select_model_from_picker_refreshes_expired_oauth_provider(
+    monkeypatch,
+) -> None:
+    request = _make_request()
+    refreshes = 0
+    logins = 0
+
+    async def fake_run_model_picker_async(**kwargs):
+        del kwargs
+        return ModelPickerResult(
+            provider=Provider.XAI.config_name,
+            provider_available=False,
+            selected_model="xai.grok-4",
+            resolved_model="xai.grok-4",
+            source="curated",
+            refer_to_docs=False,
+            activation_action=ProviderActivation(Provider.XAI),
+        )
+
+    def login() -> None:
+        nonlocal logins
+        logins += 1
+
+    def access_token() -> str:
+        nonlocal refreshes
+        refreshes += 1
+        return "refreshed-token"
+
+    handler = SimpleNamespace(
+        display_name="xAI",
+        status=lambda: {"present": True, "expired": True},
+        access_token=access_token,
+        login=login,
+    )
+    monkeypatch.setattr(
+        "fast_agent.ui.model_picker.run_model_picker_async",
+        fake_run_model_picker_async,
+    )
+    monkeypatch.setattr(
+        "fast_agent.auth.providers.get_oauth_provider",
+        lambda provider: handler,
+    )
+
+    selected = await _select_model_from_picker(request, config_payload={})
+
+    assert selected == "xai.grok-4"
+    assert refreshes == 1
+    assert logins == 0
+
+
+@pytest.mark.asyncio
+async def test_select_model_from_picker_reauthenticates_after_refresh_is_cleared(
+    monkeypatch,
+) -> None:
+    request = _make_request()
+    logins = 0
+
+    async def fake_run_model_picker_async(**kwargs):
+        del kwargs
+        return ModelPickerResult(
+            provider=Provider.XAI.config_name,
+            provider_available=False,
+            selected_model="xai.grok-4",
+            resolved_model="xai.grok-4",
+            source="curated",
+            refer_to_docs=False,
+            activation_action=ProviderActivation(Provider.XAI),
+        )
+
+    def login() -> None:
+        nonlocal logins
+        logins += 1
+
+    handler = SimpleNamespace(
+        display_name="xAI",
+        status=lambda: {"present": True, "expired": True},
+        access_token=lambda: None,
+        login=login,
+    )
+    monkeypatch.setattr(
+        "fast_agent.ui.model_picker.run_model_picker_async",
+        fake_run_model_picker_async,
+    )
+    monkeypatch.setattr(
+        "fast_agent.auth.providers.get_oauth_provider",
+        lambda provider: handler,
+    )
+
+    selected = await _select_model_from_picker(request, config_payload={})
+
+    assert selected == "xai.grok-4"
+    assert logins == 1
 
 
 @pytest.mark.asyncio

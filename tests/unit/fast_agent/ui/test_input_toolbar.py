@@ -2,12 +2,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
+from prompt_toolkit.formatted_text import HTML, to_formatted_text
+
 from fast_agent.agents.workflow.parallel_agent import ParallelAgent
 from fast_agent.llm.provider_types import Provider
 from fast_agent.ui import notification_tracker
-from fast_agent.ui.attachment_indicator import DraftAttachmentSummary
 from fast_agent.ui.prompt.attachment_tokens import build_local_attachment_token
-from fast_agent.ui.prompt.input_toolbar import (
+from fast_agent.ui.prompt.status_bar.attachment import DraftAttachmentSummary
+from fast_agent.ui.prompt.status_bar.renderer import (
     AttachmentResourceSnapshot,
     ToolbarAgentState,
     ToolbarRenderCache,
@@ -44,6 +46,7 @@ class _StubAgent:
     usage_accumulator: object | None = None
     _llm: object | None = None
     context: object | None = None
+    shell_runtime: object | None = None
 
     @property
     def llm(self) -> object | None:
@@ -130,16 +133,26 @@ def test_build_copy_notice_segment_escapes_text_and_style() -> None:
 
 def test_format_toolbar_prefix_escapes_mode_text_and_style() -> None:
     prefix = _format_toolbar_prefix(
-        agent_identity_segment="agent",
+        agent_identity_segment=" agent",
         middle="",
         mode_style="bad'color",
         mode_text="mode<draft&1>",
     )
 
     assert prefix == (
-        " agent Mode: <style fg='bad&#x27;color' bg='ansiblack'> "
-        "mode&lt;draft&amp;1&gt; </style> | "
+        " agent Mode: <style fg='ansiblack' bg='bad&#x27;color'>mode&lt;draft&amp;1&gt;</style> | "
     )
+
+
+def test_format_toolbar_prefix_inverts_multiline_mode_without_padding() -> None:
+    prefix = _format_toolbar_prefix(
+        agent_identity_segment=" agent",
+        middle="model",
+        mode_style="ansired",
+        mode_text="MLT",
+    )
+
+    assert " | <style fg='ansired' bg='ansiblack'>MLT</style> | " in prefix
 
 
 def test_build_middle_segment_prefixes_overlay_models() -> None:
@@ -192,6 +205,88 @@ def test_build_middle_segment_renders_attachment_indicator() -> None:
     assert "▲2" in middle
     assert middle.index("TVD") < middle.index("▲2") < middle.index("RG") < middle.index("gpt-4.1")
     assert middle.index("gpt-4.1") < middle.index("FAST") < middle.index("WEB")
+    plain = "".join(fragment[1] for fragment in to_formatted_text(HTML(middle)))
+    assert "↻ | TVD" in plain
+    assert "gpt-4.1FASTWEB 003" in plain
+    assert "gpt-4.1FASTWEB | 003" not in plain
+
+
+def test_build_middle_segment_places_active_processes_before_attachments() -> None:
+    middle = _build_middle_segment(
+        ToolbarAgentState(
+            model_display="gpt-4.1",
+            model_name="gpt-4.1",
+            model_gauges="RG",
+            active_process_count=2,
+            turn_count=3,
+        ),
+        shortcut_text="",
+        attachment_summary=DraftAttachmentSummary(
+            count=1,
+            mime_types=("image/png",),
+            any_questionable=False,
+        ),
+    )
+
+    assert "▲1" in middle
+    assert "↻" in middle
+    assert "ansiyellow" in middle
+    assert "fg='ansiyellow' bg='ansiblack'" in middle
+    assert middle.index("↻") < middle.index("▲1") < middle.index("RG")
+    plain = "".join(fragment[1] for fragment in to_formatted_text(HTML(middle)))
+    assert "↻ | " in plain
+    assert "gpt-4.1 003" in plain
+    assert "gpt-4.1 | 003" not in plain
+    prefix = _format_toolbar_prefix(
+        agent_identity_segment="<style fg='ansiblue' bg='ansiblack'> dev[S]</style>",
+        middle=middle,
+        mode_style="ansigreen",
+        mode_text="NRM",
+    )
+    prefix_plain = "".join(fragment[1] for fragment in to_formatted_text(HTML(prefix)))
+    assert "dev[S] ↻ |" in prefix_plain
+    assert "dev[S]  ↻" not in prefix_plain
+
+
+def test_build_middle_segment_renders_muted_process_indicator_when_idle() -> None:
+    middle = _build_middle_segment(
+        ToolbarAgentState(
+            model_display="gpt-4.1",
+            active_process_count=0,
+            turn_count=3,
+        ),
+        shortcut_text="",
+    )
+
+    assert "↻" in middle
+    assert "ansibrightblack" in middle
+
+
+def test_build_middle_segment_warns_when_process_capacity_exceeds_seventy_five_percent() -> None:
+    at_threshold = _build_middle_segment(
+        ToolbarAgentState(
+            model_display="gpt-4.1",
+            active_process_count=24,
+            turn_count=3,
+        ),
+        shortcut_text="",
+    )
+    over_threshold = _build_middle_segment(
+        ToolbarAgentState(
+            model_display="gpt-4.1",
+            active_process_count=25,
+            turn_count=3,
+        ),
+        shortcut_text="",
+    )
+
+    assert "ansiyellow" in at_threshold
+    assert "ansired" not in at_threshold
+    assert "ansired" in over_threshold
+    assert "fg='ansiyellow' bg='ansiblack'" in at_threshold
+    assert "fg='ansired' bg='ansiblack'" in over_threshold
+    assert "↻24" not in at_threshold
+    assert "↻25" not in over_threshold
 
 
 def test_should_resolve_attachment_summary_only_for_attachment_tokens() -> None:
@@ -244,6 +339,32 @@ def test_toolbar_agent_state_cache_hits_until_history_changes() -> None:
 
     result = _resolve_toolbar_agent_state_cached("agent", provider, cache=cache)
     assert result.cache_hit is False
+
+
+def test_toolbar_agent_state_cache_refreshes_when_active_process_count_changes() -> None:
+    @dataclass
+    class _Runtime:
+        active_process_count: int = 0
+
+    runtime = _Runtime()
+    agent = _StubAgent(
+        config=_StubConfig(model="unknown.custom"),
+        message_history=[],
+        _llm=_MinimalToolbarLlm(),
+        shell_runtime=runtime,
+    )
+    provider = cast("AgentApp", _StubAgentProvider(agent))
+    cache = ToolbarRenderCache()
+
+    idle = _resolve_toolbar_agent_state_cached("agent", provider, cache=cache)
+    cached = _resolve_toolbar_agent_state_cached("agent", provider, cache=cache)
+    runtime.active_process_count = 1
+    active = _resolve_toolbar_agent_state_cached("agent", provider, cache=cache)
+
+    assert idle.state.active_process_count == 0
+    assert cached.cache_hit is True
+    assert active.cache_hit is False
+    assert active.state.active_process_count == 1
 
 
 def test_toolbar_agent_state_uses_protocol_default_capabilities() -> None:

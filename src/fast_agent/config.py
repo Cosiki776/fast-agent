@@ -57,6 +57,7 @@ from fast_agent.utils.type_narrowing import is_str_object_dict
 
 type TerminalImageSize = int | Literal["auto"] | str | None
 type ShellWriteTextFileMode = Literal["auto", "on", "off", "apply_patch"]
+type ShellToolProfile = Literal["native", "minimal_process"]
 
 SHELL_WRITE_TEXT_FILE_MODES: tuple[ShellWriteTextFileMode, ...] = (
     "auto",
@@ -271,6 +272,13 @@ class HarnessAppSettings(BaseModel):
 class ShellSettings(BaseModel):
     """Configuration for shell execution behavior."""
 
+    tool_profile: ShellToolProfile = Field(
+        default="minimal_process",
+        description=(
+            "Model-facing shell contract: 'minimal_process' exposes Bash and Process; "
+            "'native' retains the legacy execute/poll_process/terminate_process tools"
+        ),
+    )
     timeout_seconds: int = Field(
         default=90,
         description="Maximum seconds without command output before terminating",
@@ -295,8 +303,46 @@ class ShellSettings(BaseModel):
         description="Show shell command output on the console",
     )
     output_byte_limit: int | None = Field(
+        default=16_000,
+        description="Model-facing shell output preview bytes (None = model-based auto)",
+    )
+    output_byte_limit_selection: Literal["default", "explicit", "auto"] = Field(
+        default="default",
+        repr=False,
+        json_schema_extra={"internal": True},
+    )
+    retain_truncated_output: bool = Field(
+        default=True,
+        description=(
+            "Retain complete truncated shell output in a private session-scoped "
+            "temporary file and include its path in the model-facing truncation notice"
+        ),
+    )
+    retained_output_max_bytes: int = Field(
+        default=2 * 1024 * 1024,
+        ge=1,
+        description="Maximum bytes retained per shell process when retention is enabled",
+    )
+    retained_output_temp_directory: Path | None = Field(
         default=None,
-        description="Override model-based output byte limit (None = auto)",
+        description=(
+            "Parent directory for private retained-output session directories "
+            "(None = platform temporary directory)"
+        ),
+    )
+    # Stay below Anthropic's 5-minute cache TTL; pinned boundaries make warm polling unnecessary.
+    process_poll_max_wait_seconds: int = Field(
+        default=250,
+        ge=1,
+        le=600,
+        description="Maximum wait accepted by poll_process",
+    )
+    managed_process_poll_history_folding: Literal["auto", "on", "off"] = Field(
+        default="auto",
+        description=(
+            "Control repetitive quiet poll_process history folding: 'auto' uses "
+            "validated model metadata, 'on' forces folding, and 'off' disables it"
+        ),
     )
     missing_cwd_policy: Literal["ask", "create", "warn", "error"] = Field(
         default="warn",
@@ -328,10 +374,10 @@ class ShellSettings(BaseModel):
         default=None,
         description=(
             "Control which local file edit tool is exposed when shell runtime is enabled "
-            "('auto' uses apply_patch for Codex and GPT-5.2+ models, and exposes "
-            "write_text_file plus edit_file otherwise; 'on' always exposes write_text_file "
-            "plus edit_file; 'apply_patch' always exposes apply_patch; 'off' disables "
-            "local file edit tools)"
+            "('auto' uses apply_patch for Codex and GPT-5.2+ models, edit_file for "
+            "Anthropic-series models, and write_text_file plus edit_file otherwise; "
+            "'on' always exposes write_text_file plus edit_file; 'apply_patch' always "
+            "exposes apply_patch; 'off' disables local file edit tools)"
         ),
     )
     model_config = ConfigDict(extra="ignore")
@@ -382,6 +428,31 @@ class ShellSettings(BaseModel):
         if isinstance(value, str):
             return int(value.strip())
         return int(value)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _capture_output_byte_limit_selection(cls, value: Any) -> Any:
+        if not isinstance(value, dict):
+            return value
+        if "output_byte_limit_selection" in value or "output_byte_limit" not in value:
+            return value
+        updated = dict(value)
+        updated["output_byte_limit_selection"] = (
+            "auto" if value["output_byte_limit"] is None else "explicit"
+        )
+        return updated
+
+    @field_validator("retained_output_max_bytes", mode="before")
+    @classmethod
+    def _coerce_retained_output_max_bytes(cls, value: Any) -> int:
+        _reject_bool_integer_field(value, field_name="retained_output_max_bytes")
+        return int(value.strip()) if isinstance(value, str) else int(value)
+
+    @field_validator("process_poll_max_wait_seconds", mode="before")
+    @classmethod
+    def _coerce_process_poll_max_wait_seconds(cls, value: Any) -> int:
+        _reject_bool_integer_field(value, field_name="process_poll_max_wait_seconds")
+        return int(value.strip()) if isinstance(value, str) else int(value)
 
     @field_validator("write_text_file_mode", mode="before")
     @classmethod
@@ -967,11 +1038,21 @@ class AnthropicSettings(BaseModel):
     )
     cache_mode: Literal["off", "prompt", "auto"] = Field(
         default="auto",
-        description="Caching mode: off (disabled), prompt (cache tools+system), auto (same as prompt)",
+        description=(
+            "Caching mode: off (disabled), prompt (cache tools+system), "
+            "auto (also advance through recent conversation turns)"
+        ),
     )
     cache_ttl: Literal["5m", "1h"] = Field(
         default="5m",
         description="Cache TTL: 5m (standard) or 1h (extended, additional cost)",
+    )
+    cache_diagnostics: bool = Field(
+        default=False,
+        description=(
+            "Enable first-party Anthropic cache-miss diagnosis for debugging. "
+            "Adds a beta request field and provider diagnostics to responses."
+        ),
     )
     reasoning: ReasoningEffortSetting | str | int | bool | None = Field(
         default=None,
@@ -1176,13 +1257,52 @@ class CodexResponsesSettings(ResponsesProviderSettingsBase):
 
 
 class DeepSeekSettings(BaseModel):
-    """Settings for using DeepSeek models in the fast-agent application."""
+    """Settings for using DeepSeek's Responses API."""
 
     api_key: str | None = Field(default=None, description="DeepSeek API key")
     base_url: str | None = Field(default=None, description="Override API endpoint")
     default_model: str | None = Field(
         default=None,
         description="Default model when DeepSeek provider is selected without an explicit model",
+    )
+    default_headers: dict[str, str] | None = Field(
+        default=None,
+        description="Custom headers for all API requests",
+    )
+    reasoning: ReasoningEffortSetting | str | int | bool | None = Field(
+        default=None,
+        description="DeepSeek reasoning effort: none, low, high, or max",
+    )
+    web_search: OpenAIWebSearchSettings = Field(default_factory=OpenAIWebSearchSettings)
+
+    model_config = ConfigDict(extra="allow", arbitrary_types_allowed=True)
+
+
+class ZaiSettings(BaseModel):
+    """Settings for using Z.ai models in the fast-agent application."""
+
+    api_key: str | None = Field(default=None, description="Z.ai API key")
+    base_url: str | None = Field(default=None, description="Override API endpoint")
+    default_model: str | None = Field(
+        default=None,
+        description="Default model when Z.ai provider is selected without an explicit model",
+    )
+    default_headers: dict[str, str] | None = Field(
+        default=None,
+        description="Custom headers for all API requests",
+    )
+
+    model_config = ConfigDict(extra="allow", arbitrary_types_allowed=True)
+
+
+class MoonshotSettings(BaseModel):
+    """Settings for using Moonshot models in the fast-agent application."""
+
+    api_key: str | None = Field(default=None, description="Moonshot API key")
+    base_url: str | None = Field(default=None, description="Override API endpoint")
+    default_model: str | None = Field(
+        default=None,
+        description="Default model when Moonshot provider is selected without an explicit model",
     )
     default_headers: dict[str, str] | None = Field(
         default=None,
@@ -1235,6 +1355,12 @@ class XAISettings(BaseModel):
     model_config = ConfigDict(extra="allow", arbitrary_types_allowed=True)
 
 
+class MetaAIWebSearchSettings(OpenAIWebSearchSettings):
+    """MetaAI Responses web_search (search grounding) settings."""
+
+    tool_type: Literal["web_search"] = "web_search"
+
+
 class MetaAISettings(BaseModel):
     """Settings for using MetaAI Muse models via the Responses API."""
 
@@ -1251,6 +1377,7 @@ class MetaAISettings(BaseModel):
         default=None,
         description="Custom headers for all API requests",
     )
+    web_search: MetaAIWebSearchSettings = Field(default_factory=MetaAIWebSearchSettings)
 
     model_config = ConfigDict(extra="allow", arbitrary_types_allowed=True)
 
@@ -1360,6 +1487,8 @@ class OpenTelemetrySettings(BaseModel):
     console_debug: bool = Field(default=False, description="Log spans to console")
     sample_rate: float = Field(
         default=1.0,
+        ge=0.0,
+        le=1.0,
         description="Sample rate for tracing (1.0 = sample everything)",
     )
 
@@ -1516,7 +1645,7 @@ class LoggerSettings(BaseModel):
     """Enable or disable the progress display"""
 
     path: str = "fast-agent-log.jsonl"
-    """Path to log file, if logger 'type' is 'file'."""
+    """Explicit log path. When omitted, file logs are written under the active fast-agent home."""
 
     batch_size: int = 100
     """Number of events to accumulate before processing"""
@@ -1803,7 +1932,9 @@ def load_layered_model_settings(
 
     resolved_home = resolve_fast_agent_home(cwd=start_path, cli_override=home)
     project_config = find_config_in_directory(start_path)
-    home_config = find_config_in_directory(resolved_home.path) if resolved_home is not None else None
+    home_config = (
+        find_config_in_directory(resolved_home.path) if resolved_home is not None else None
+    )
 
     config_paths: list[Path] = []
     for config_path in (project_config, home_config):
@@ -1979,7 +2110,13 @@ class Settings(BaseSettings):
     """Settings for using Codex Responses models in the fast-agent application"""
 
     deepseek: DeepSeekSettings | None = None
-    """Settings for using DeepSeek models in the fast-agent application"""
+    """Settings for using DeepSeek's Responses API"""
+
+    zai: ZaiSettings | None = None
+    """Settings for using Z.ai models in the fast-agent application"""
+
+    moonshot: MoonshotSettings | None = None
+    """Settings for using Moonshot models in the fast-agent application"""
 
     google: GoogleSettings | None = None
     """Settings for using DeepSeek models in the fast-agent application"""
@@ -2062,6 +2199,21 @@ class Settings(BaseSettings):
     _fast_agent_global_plugin_home: str | None = PrivateAttr(default=None)
     _fast_agent_no_home: bool = PrivateAttr(default=False)
     _fast_agent_settings_source: Literal["manual", "discovered"] = PrivateAttr(default="manual")
+    _logger_path_explicit: bool = PrivateAttr(default=False)
+
+    def __init__(self, **values: Any) -> None:
+        raw_logger = values.get("logger")
+        nested_model_path_explicit = (
+            "path" in raw_logger.model_fields_set
+            if isinstance(raw_logger, LoggerSettings)
+            else None
+        )
+        super().__init__(**values)
+        self._logger_path_explicit = (
+            nested_model_path_explicit
+            if nested_model_path_explicit is not None
+            else "path" in self.logger.model_fields_set
+        )
 
     @field_validator("commands", mode="before")
     @classmethod
@@ -2108,7 +2260,10 @@ class Settings(BaseSettings):
             if not name.strip():
                 raise ValueError("Environment names must be non-empty.")
 
-        if self.default_environment != "local" and self.default_environment not in self.environments:
+        if (
+            self.default_environment != "local"
+            and self.default_environment not in self.environments
+        ):
             valid_names = sorted({"local", *self.environments})
             choices = ", ".join(valid_names)
             raise ValueError(
@@ -2116,6 +2271,7 @@ class Settings(BaseSettings):
                 f"Valid environments: {choices}"
             )
         return self
+
 
 # Global settings object
 _settings: Settings | None = None

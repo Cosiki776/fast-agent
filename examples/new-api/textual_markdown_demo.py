@@ -21,7 +21,7 @@ from fast_agent.constants import REASONING
 from fast_agent.mcp.helpers.content_helpers import get_text
 from fast_agent.types import PromptMessageExtended
 from fast_agent.ui.console_display import ConsoleDisplay
-from fast_agent.ui.markdown_helpers import prepare_markdown_content
+from fast_agent.ui.markdown import prepare_markdown_content
 from fast_agent.ui.message_primitives import MESSAGE_CONFIGS, MessageType
 
 if TYPE_CHECKING:
@@ -267,9 +267,7 @@ class ChatDisplay(RichLog):
         for index, item in enumerate(items):
             sep = RichText(" | ", style="dim") if index > 0 else RichText()
             item_style = (
-                highlight_color
-                if highlight_indexes and index in highlight_indexes
-                else "dim"
+                highlight_color if highlight_indexes and index in highlight_indexes else "dim"
             )
             item_text = RichText(item, style=item_style)
 

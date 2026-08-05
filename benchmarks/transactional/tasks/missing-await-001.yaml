@@ -1,0 +1,10 @@
+id: missing-await-001
+repository: fixtures/async-service
+base_commit: 6d72fb1
+issue: An asynchronous failure path returns a coroutine instead of awaiting it.
+verification:
+  command: uv run pytest -q
+  timeout_seconds: 120
+budget:
+  max_llm_calls: 20
+  max_tool_calls: 80

@@ -1,0 +1,10 @@
+id: boundary-check-001
+repository: fixtures/order-service
+base_commit: 8c13ab2
+issue: Orders created exactly at the cutoff time are rejected.
+verification:
+  command: uv run pytest -q
+  timeout_seconds: 120
+budget:
+  max_llm_calls: 20
+  max_tool_calls: 80

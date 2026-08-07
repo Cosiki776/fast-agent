@@ -15,6 +15,9 @@ from fast_agent.transactional.context.reducers import (
     bounded_fallback_result,
 )
 from fast_agent.transactional.events import (
+    ToolAuthorized,
+    ToolCheckpointed,
+    ToolCheckpointFailed,
     ToolCommitted,
     ToolDenied,
     ToolExecutionFailed,
@@ -22,6 +25,7 @@ from fast_agent.transactional.events import (
     ToolFailed,
     ToolProposed,
     ToolResultStored,
+    ToolValidated,
 )
 from fast_agent.transactional.execution import (
     ToolCallNext,
@@ -41,6 +45,7 @@ if TYPE_CHECKING:
     from fast_agent.transactional.storage.event_store import SQLiteEventStore
 
 type ToolDenialResolver = Callable[[ToolExecutionRequest], str | None]
+type ToolCheckpointCreator = Callable[[ToolExecutionRequest], str]
 type TransactionIdFactory = Callable[[], TransactionId]
 
 _WORKSPACE_WRITE_TOOL_NAMES = frozenset(
@@ -49,6 +54,7 @@ _WORKSPACE_WRITE_TOOL_NAMES = frozenset(
         APPLY_PATCH_TOOL_NAME,
         "execute",
         "bash",
+        "process",
         "shell",
     }
 )
@@ -63,6 +69,7 @@ class TransactionCoordinator:
         artifact_store: FileArtifactStore,
         *,
         denial_reason: ToolDenialResolver | None = None,
+        checkpoint_creator: ToolCheckpointCreator | None = None,
         result_reducer: ToolResultReducer | None = None,
         run_budget: RunBudgetTracker | None = None,
         transaction_id_factory: TransactionIdFactory = new_transaction_id,
@@ -70,6 +77,7 @@ class TransactionCoordinator:
         self._event_store = event_store
         self._artifact_store = artifact_store
         self._denial_reason = denial_reason
+        self._checkpoint_creator = checkpoint_creator
         self._result_reducer = result_reducer
         self._run_budget = run_budget
         self._transaction_id_factory = transaction_id_factory
@@ -81,6 +89,7 @@ class TransactionCoordinator:
         /,
     ) -> ToolExecutionOutcome:
         transaction_id = self._transaction_id_factory()
+        effect = classify_tool_effect(request.tool_name)
         self._event_store.append(
             ToolProposed(
                 run_id=request.run_id,
@@ -88,7 +97,7 @@ class TransactionCoordinator:
                 tool_call_id=request.tool_call_id,
                 tool_name=request.tool_name,
                 arguments=request.arguments,
-                effect=classify_tool_effect(request.tool_name),
+                effect=effect,
             )
         )
 
@@ -118,6 +127,8 @@ class TransactionCoordinator:
                 )
 
         denial_reason = self._denial_reason(request) if self._denial_reason is not None else None
+        if effect is ToolEffect.EXTERNAL_UNKNOWN:
+            denial_reason = f"tool effect is unknown: {request.tool_name}"
         if denial_reason is not None:
             self._event_store.append(
                 ToolDenied(
@@ -136,6 +147,41 @@ class TransactionCoordinator:
                 )
             )
             return ToolExecutionOutcome(result=_denied_result(denial_reason))
+
+        if effect is ToolEffect.WORKSPACE_WRITE and self._checkpoint_creator is not None:
+            self._event_store.append(
+                ToolValidated(
+                    run_id=request.run_id,
+                    transaction_id=transaction_id,
+                    tool_call_id=request.tool_call_id,
+                )
+            )
+            self._event_store.append(
+                ToolAuthorized(
+                    run_id=request.run_id,
+                    transaction_id=transaction_id,
+                    tool_call_id=request.tool_call_id,
+                )
+            )
+            try:
+                checkpoint_id = self._checkpoint_creator(request)
+                if not checkpoint_id:
+                    raise ValueError("checkpoint creator returned an empty ID")
+                self._event_store.append(
+                    ToolCheckpointed(
+                        run_id=request.run_id,
+                        transaction_id=transaction_id,
+                        tool_call_id=request.tool_call_id,
+                        checkpoint_id=checkpoint_id,
+                    )
+                )
+            except Exception as exc:
+                self._record_checkpoint_failure(
+                    request=request,
+                    transaction_id=transaction_id,
+                    error=exc,
+                )
+                return ToolExecutionOutcome(result=_checkpoint_failed_result(exc))
 
         self._event_store.append(
             ToolExecutionStarted(
@@ -228,6 +274,35 @@ class TransactionCoordinator:
 
         return await self.coordinate(request, call_next)
 
+    def _record_checkpoint_failure(
+        self,
+        *,
+        request: ToolExecutionRequest,
+        transaction_id: TransactionId,
+        error: Exception,
+    ) -> None:
+        try:
+            self._event_store.append(
+                ToolCheckpointFailed(
+                    run_id=request.run_id,
+                    transaction_id=transaction_id,
+                    tool_call_id=request.tool_call_id,
+                    error_type=type(error).__name__,
+                    message=str(error),
+                )
+            )
+            self._event_store.append(
+                ToolFailed(
+                    run_id=request.run_id,
+                    transaction_id=transaction_id,
+                    tool_call_id=request.tool_call_id,
+                    reason="checkpoint failed",
+                )
+            )
+        except Exception:
+            # Checkpoint failure remains fail-closed even if its event cannot be persisted.
+            return
+
 
 def classify_tool_effect(tool_name: str) -> ToolEffect:
     """Classify the explicit first-phase local coding tool names."""
@@ -265,6 +340,23 @@ def _execution_failed_result(*, error_type: str, message: str) -> CallToolResult
             "status": "failed",
             "error_type": error_type,
             "message": message,
+        },
+        isError=True,
+    )
+
+
+def _checkpoint_failed_result(error: Exception) -> CallToolResult:
+    return CallToolResult(
+        content=[
+            TextContent(
+                type="text",
+                text=f"Tool execution stopped: checkpoint failed ({type(error).__name__}: {error})",
+            )
+        ],
+        structuredContent={
+            "status": "checkpoint_failed",
+            "error_type": type(error).__name__,
+            "message": str(error),
         },
         isError=True,
     )

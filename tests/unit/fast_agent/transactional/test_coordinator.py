@@ -18,6 +18,8 @@ from fast_agent.transactional.coordinator import (
     serialize_tool_result,
 )
 from fast_agent.transactional.events import (
+    ToolCheckpointed,
+    ToolCheckpointFailed,
     ToolEventKind,
     ToolProposed,
     ToolResultStored,
@@ -37,6 +39,7 @@ from fast_agent.transactional.storage.artifact_store import ArtifactId, FileArti
 from fast_agent.transactional.storage.event_store import SQLiteEventStore
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from pathlib import Path
 
     from fast_agent.transactional.coordinator import ToolDenialResolver
@@ -71,6 +74,7 @@ def _coordinator(
     denial_reason: ToolDenialResolver | None = None,
     result_reducer: ToolResultReducer | None = None,
     run_budget: RunBudgetTracker | None = None,
+    checkpoint_creator: Callable[[ToolExecutionRequest], str] | None = None,
 ) -> tuple[TransactionCoordinator, SQLiteEventStore, FileArtifactStore]:
     event_store = SQLiteEventStore(tmp_path / "events.sqlite3")
     artifact_store = FileArtifactStore(tmp_path / "artifacts")
@@ -78,6 +82,7 @@ def _coordinator(
         event_store,
         artifact_store,
         denial_reason=denial_reason,
+        checkpoint_creator=checkpoint_creator,
         result_reducer=result_reducer,
         run_budget=run_budget,
         transaction_id_factory=lambda: TRANSACTION_ID,
@@ -214,7 +219,135 @@ def test_effect_classifier_uses_explicit_first_phase_rules() -> None:
     assert classify_tool_effect("write_text_file") is ToolEffect.WORKSPACE_WRITE
     assert classify_tool_effect("apply_patch") is ToolEffect.WORKSPACE_WRITE
     assert classify_tool_effect("execute") is ToolEffect.WORKSPACE_WRITE
+    assert classify_tool_effect("process") is ToolEffect.WORKSPACE_WRITE
     assert classify_tool_effect("remote_tool") is ToolEffect.EXTERNAL_UNKNOWN
+
+
+@pytest.mark.asyncio
+async def test_write_executes_only_after_checkpoint_event_is_persisted(tmp_path: Path) -> None:
+    coordinator, event_store, _ = _coordinator(
+        tmp_path,
+        checkpoint_creator=lambda request: "checkpoint-1",
+    )
+    executions = 0
+
+    async def call_next() -> ToolExecutionOutcome:
+        nonlocal executions
+        executions += 1
+        assert [event.kind for event in _events(event_store)] == [
+            ToolEventKind.PROPOSED,
+            ToolEventKind.VALIDATED,
+            ToolEventKind.AUTHORIZED,
+            ToolEventKind.CHECKPOINTED,
+            ToolEventKind.EXECUTION_STARTED,
+        ]
+        return ToolExecutionOutcome(result=_result("written"))
+
+    await coordinator.coordinate(_request(), call_next)
+
+    assert executions == 1
+    checkpointed = _events(event_store)[3]
+    assert isinstance(checkpointed, ToolCheckpointed)
+    assert checkpointed.checkpoint_id == "checkpoint-1"
+    event_store.close()
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_creation_failure_is_fail_closed(tmp_path: Path) -> None:
+    def fail_checkpoint(request: ToolExecutionRequest) -> str:
+        raise OSError("snapshot disk unavailable")
+
+    coordinator, event_store, _ = _coordinator(
+        tmp_path,
+        checkpoint_creator=fail_checkpoint,
+    )
+    executions = 0
+
+    async def call_next() -> ToolExecutionOutcome:
+        nonlocal executions
+        executions += 1
+        return ToolExecutionOutcome(result=_result("unexpected"))
+
+    outcome = await coordinator.coordinate(_request(), call_next)
+
+    assert executions == 0
+    assert outcome.result.structuredContent == {
+        "status": "checkpoint_failed",
+        "error_type": "OSError",
+        "message": "snapshot disk unavailable",
+    }
+    assert [event.kind for event in _events(event_store)] == [
+        ToolEventKind.PROPOSED,
+        ToolEventKind.VALIDATED,
+        ToolEventKind.AUTHORIZED,
+        ToolEventKind.CHECKPOINT_FAILED,
+        ToolEventKind.FAILED,
+    ]
+    failed = _events(event_store)[3]
+    assert isinstance(failed, ToolCheckpointFailed)
+    event_store.close()
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_event_persistence_failure_is_fail_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    coordinator, event_store, _ = _coordinator(
+        tmp_path,
+        checkpoint_creator=lambda request: "checkpoint-1",
+    )
+    real_append = event_store.append
+
+    def fail_checkpoint_event(event: ToolEvent) -> object:
+        if isinstance(event, ToolCheckpointed):
+            raise OSError("event store unavailable")
+        return real_append(event)
+
+    monkeypatch.setattr(event_store, "append", fail_checkpoint_event)
+    executions = 0
+
+    async def call_next() -> ToolExecutionOutcome:
+        nonlocal executions
+        executions += 1
+        return ToolExecutionOutcome(result=_result("unexpected"))
+
+    outcome = await coordinator.coordinate(_request(), call_next)
+
+    assert executions == 0
+    assert outcome.result.structuredContent == {
+        "status": "checkpoint_failed",
+        "error_type": "OSError",
+        "message": "event store unavailable",
+    }
+    assert [event.kind for event in _events(event_store)] == [
+        ToolEventKind.PROPOSED,
+        ToolEventKind.VALIDATED,
+        ToolEventKind.AUTHORIZED,
+        ToolEventKind.CHECKPOINT_FAILED,
+        ToolEventKind.FAILED,
+    ]
+    event_store.close()
+
+
+@pytest.mark.asyncio
+async def test_unknown_effect_is_denied_without_execution(tmp_path: Path) -> None:
+    coordinator, event_store, _ = _coordinator(tmp_path)
+    executions = 0
+
+    async def call_next() -> ToolExecutionOutcome:
+        nonlocal executions
+        executions += 1
+        return ToolExecutionOutcome(result=_result("unexpected"))
+
+    outcome = await coordinator.coordinate(_request("unknown_local_tool"), call_next)
+
+    assert executions == 0
+    assert outcome.result.structuredContent == {
+        "status": "denied",
+        "reason": "tool effect is unknown: unknown_local_tool",
+    }
+    event_store.close()
 
 
 def test_raw_result_serialization_preserves_standard_mcp_fields() -> None:

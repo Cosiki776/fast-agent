@@ -30,6 +30,7 @@ from fast_agent.transactional.execution import (
     ToolExecutionRequest,
 )
 from fast_agent.transactional.models import (
+    RunId,
     ToolEffect,
     TransactionId,
     new_transaction_id,
@@ -45,12 +46,14 @@ from fast_agent.transactional.recovery.controller import (
     RecoveryHandoff,
     recovery_handoff_result,
 )
+from fast_agent.transactional.run_events import RunFailed, RunRecovered, RunRecoveryStarted
 from fast_agent.transactional.storage.artifact_store import ArtifactKind
 
 if TYPE_CHECKING:
     from fast_agent.transactional.budget import BudgetDimension, RunBudgetTracker
     from fast_agent.transactional.storage.artifact_store import FileArtifactStore
     from fast_agent.transactional.storage.event_store import SQLiteEventStore
+    from fast_agent.transactional.storage.run_event_store import SQLiteRunEventStore
 
 type ToolDenialResolver = Callable[[ToolExecutionRequest], str | None]
 type ToolCheckpointCreator = Callable[[ToolExecutionRequest], str]
@@ -72,6 +75,7 @@ class TransactionCoordinator:
         run_budget: RunBudgetTracker | None = None,
         effect_classifier: ToolEffectClassifier | None = None,
         recovery_controller: RecoveryController | None = None,
+        run_event_store: SQLiteRunEventStore | None = None,
         transaction_id_factory: TransactionIdFactory = new_transaction_id,
     ) -> None:
         self._event_store = event_store
@@ -83,6 +87,7 @@ class TransactionCoordinator:
         self._run_budget = run_budget
         self._effect_classifier = effect_classifier or LocalCodingEffectClassifier()
         self._recovery_controller = recovery_controller
+        self._run_event_store = run_event_store
         self._transaction_id_factory = transaction_id_factory
 
     async def coordinate(
@@ -118,6 +123,7 @@ class TransactionCoordinator:
                         reason=reason,
                     )
                 )
+                self._fail_run(request.run_id, "budget exhausted: tool execution")
                 self._event_store.append(
                     ToolFailed(
                         run_id=request.run_id,
@@ -320,6 +326,8 @@ class TransactionCoordinator:
             )
             return recovery_handoff_result(result, handoff)
         if decision.action is RecoveryAction.ABORT:
+            if decision.budget_exhausted:
+                self._fail_run(request.run_id, "budget exhausted: recovery attempts")
             return result
 
         restore = self._checkpoint_restorer
@@ -334,9 +342,18 @@ class TransactionCoordinator:
                 reason=f"repeated failure: {decision.failure.signature}",
             )
         )
+        if self._run_event_store is not None:
+            self._run_event_store.append(
+                RunRecoveryStarted(
+                    run_id=request.run_id,
+                    failure_signature=decision.failure.signature,
+                    checkpoint_id=restore_checkpoint,
+                )
+            )
         try:
             workspace_version = restore(restore_checkpoint)
         except Exception as exc:
+            self._fail_run(request.run_id, f"workspace divergence: {exc}")
             return _workspace_divergence_result(exc)
         self._event_store.append(
             ToolRolledBack(
@@ -346,6 +363,13 @@ class TransactionCoordinator:
                 checkpoint_id=restore_checkpoint,
             )
         )
+        if self._run_event_store is not None:
+            self._run_event_store.append(
+                RunRecovered(
+                    run_id=request.run_id,
+                    workspace_version=workspace_version,
+                )
+            )
         handoff = RecoveryHandoff(
             workspace_version=workspace_version,
             rolled_back=True,
@@ -356,6 +380,10 @@ class TransactionCoordinator:
             required_next_step="Re-localize the cause before making a different edit.",
         )
         return recovery_handoff_result(result, handoff)
+
+    def _fail_run(self, run_id: RunId, reason: str) -> None:
+        if self._run_event_store is not None:
+            self._run_event_store.append(RunFailed(run_id=run_id, reason=reason))
 
     def _record_checkpoint_failure(
         self,

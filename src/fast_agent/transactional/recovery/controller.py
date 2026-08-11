@@ -32,6 +32,7 @@ class RecoveryDecision:
     failure: FailureClassification
     failure_count: int
     checkpoint_id: str | None = None
+    budget_exhausted: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -86,15 +87,29 @@ class RecoveryController:
             return RecoveryDecision(RecoveryAction.ABORT, failure, count)
 
         if effect is ToolEffect.READ:
-            if count >= self._repeated_failure_threshold or not self._start_recovery():
+            if count >= self._repeated_failure_threshold:
                 return RecoveryDecision(RecoveryAction.ABORT, failure, count)
+            if not self._start_recovery():
+                return RecoveryDecision(
+                    RecoveryAction.ABORT,
+                    failure,
+                    count,
+                    budget_exhausted=True,
+                )
             return RecoveryDecision(RecoveryAction.RETRY_READ, failure, count)
 
         stable_checkpoint = self._first_checkpoints.get(failure.signature)
         if count < self._repeated_failure_threshold:
             return RecoveryDecision(RecoveryAction.CONTINUE, failure, count)
-        if stable_checkpoint is None or not self._start_recovery():
+        if stable_checkpoint is None:
             return RecoveryDecision(RecoveryAction.ABORT, failure, count)
+        if not self._start_recovery():
+            return RecoveryDecision(
+                RecoveryAction.ABORT,
+                failure,
+                count,
+                budget_exhausted=True,
+            )
         return RecoveryDecision(
             RecoveryAction.ROLLBACK_REPLAN,
             failure,

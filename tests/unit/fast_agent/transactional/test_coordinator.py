@@ -36,8 +36,10 @@ from fast_agent.transactional.models import (
     TransactionState,
 )
 from fast_agent.transactional.recovery.controller import RecoveryController
+from fast_agent.transactional.run_events import RunEventKind, RunStarted
 from fast_agent.transactional.storage.artifact_store import ArtifactId, FileArtifactStore
 from fast_agent.transactional.storage.event_store import SQLiteEventStore
+from fast_agent.transactional.storage.run_event_store import SQLiteRunEventStore
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -80,6 +82,7 @@ def _coordinator(
     effect_classifier: ToolEffectClassifier | None = None,
     recovery_controller: RecoveryController | None = None,
     checkpoint_restorer: Callable[[str], str] | None = None,
+    run_event_store: SQLiteRunEventStore | None = None,
     transaction_id_factory: Callable[[], TransactionId] = lambda: TRANSACTION_ID,
 ) -> tuple[TransactionCoordinator, SQLiteEventStore, FileArtifactStore]:
     event_store = SQLiteEventStore(tmp_path / "events.sqlite3")
@@ -94,6 +97,7 @@ def _coordinator(
         run_budget=run_budget,
         effect_classifier=effect_classifier,
         recovery_controller=recovery_controller,
+        run_event_store=run_event_store,
         transaction_id_factory=transaction_id_factory,
     )
     return coordinator, event_store, artifact_store
@@ -399,11 +403,14 @@ async def test_effect_classifier_failure_is_denied_fail_closed(
 async def test_repeated_write_failure_rolls_back_and_returns_handoff(tmp_path: Path) -> None:
     transaction_ids = iter((TransactionId("transaction-1"), TransactionId("transaction-2")))
     restored: list[str] = []
+    run_events = SQLiteRunEventStore(tmp_path / "events.sqlite3")
+    run_events.append(RunStarted(run_id=RUN_ID, profile="full"))
     coordinator, event_store, _ = _coordinator(
         tmp_path,
         checkpoint_creator=lambda request: f"checkpoint-{request.tool_call_id}",
         checkpoint_restorer=lambda checkpoint_id: restored.append(checkpoint_id) or "version-1",
         recovery_controller=RecoveryController(),
+        run_event_store=run_events,
         transaction_id_factory=lambda: next(transaction_ids),
     )
 
@@ -436,6 +443,12 @@ async def test_repeated_write_failure_rolls_back_and_returns_handoff(tmp_path: P
         ToolEventKind.ROLLED_BACK,
         ToolEventKind.FAILED,
     ]
+    assert [item.event.kind for item in run_events.events_for_run(RUN_ID)] == [
+        RunEventKind.STARTED,
+        RunEventKind.RECOVERY_STARTED,
+        RunEventKind.RECOVERED,
+    ]
+    run_events.close()
     event_store.close()
 
 

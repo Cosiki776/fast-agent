@@ -41,7 +41,7 @@ if TYPE_CHECKING:
     from pathlib import Path
     from types import TracebackType
 
-SCHEMA_VERSION: Final = 1
+SCHEMA_VERSION: Final = 2
 
 _CREATE_EVENTS_TABLE: Final = """
 CREATE TABLE IF NOT EXISTS tool_events (
@@ -69,6 +69,21 @@ _CREATE_TERMINAL_EVENT_INDEX: Final = """
 CREATE UNIQUE INDEX IF NOT EXISTS idx_tool_events_one_terminal
 ON tool_events (transaction_id)
 WHERE event_kind IN ('tool.committed', 'tool.failed')
+"""
+
+_CREATE_RUN_EVENTS_TABLE: Final = """
+CREATE TABLE IF NOT EXISTS run_events (
+    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NOT NULL,
+    event_kind TEXT NOT NULL,
+    occurred_at TEXT NOT NULL,
+    payload_json TEXT NOT NULL
+)
+"""
+
+_CREATE_RUN_EVENT_INDEX: Final = """
+CREATE INDEX IF NOT EXISTS idx_run_events_run_sequence
+ON run_events (run_id, sequence)
 """
 
 _SELECT_FOR_RUN: Final = """
@@ -229,7 +244,7 @@ class SQLiteEventStore:
 
     def _initialize_schema(self) -> None:
         version = self.schema_version
-        if version not in {0, SCHEMA_VERSION}:
+        if version not in {0, 1, SCHEMA_VERSION}:
             raise UnsupportedSchemaVersionError(
                 f"Event-store schema version {version} is not supported; "
                 f"expected {SCHEMA_VERSION}"
@@ -238,10 +253,13 @@ class SQLiteEventStore:
             return
 
         with self._connection:
-            self._connection.execute(_CREATE_EVENTS_TABLE)
-            self._connection.execute(_CREATE_RUN_SEQUENCE_INDEX)
-            self._connection.execute(_CREATE_TRANSACTION_SEQUENCE_INDEX)
-            self._connection.execute(_CREATE_TERMINAL_EVENT_INDEX)
+            if version == 0:
+                self._connection.execute(_CREATE_EVENTS_TABLE)
+                self._connection.execute(_CREATE_RUN_SEQUENCE_INDEX)
+                self._connection.execute(_CREATE_TRANSACTION_SEQUENCE_INDEX)
+                self._connection.execute(_CREATE_TERMINAL_EVENT_INDEX)
+            self._connection.execute(_CREATE_RUN_EVENTS_TABLE)
+            self._connection.execute(_CREATE_RUN_EVENT_INDEX)
             self._connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
     def _projection_for_append(

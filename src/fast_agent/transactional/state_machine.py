@@ -18,6 +18,7 @@ _STATE_BY_EVENT_KIND: Final[dict[ToolEventKind, TransactionState]] = {
     ToolEventKind.VALIDATED: TransactionState.VALIDATED,
     ToolEventKind.AUTHORIZED: TransactionState.AUTHORIZED,
     ToolEventKind.CHECKPOINTED: TransactionState.CHECKPOINTED,
+    ToolEventKind.CHECKPOINT_FAILED: TransactionState.CHECKPOINT_FAILED,
     ToolEventKind.EXECUTION_STARTED: TransactionState.EXECUTING,
     ToolEventKind.RESULT_STORED: TransactionState.RESULT_STORED,
     ToolEventKind.COMMITTED: TransactionState.COMMITTED,
@@ -53,10 +54,12 @@ _ALLOWED_TRANSITIONS: Final[
     TransactionState.AUTHORIZED: frozenset(
         {
             TransactionState.CHECKPOINTED,
+            TransactionState.CHECKPOINT_FAILED,
             TransactionState.EXECUTING,
         }
     ),
     TransactionState.CHECKPOINTED: frozenset({TransactionState.EXECUTING}),
+    TransactionState.CHECKPOINT_FAILED: frozenset({TransactionState.FAILED}),
     TransactionState.EXECUTING: frozenset(
         {
             TransactionState.RESULT_STORED,

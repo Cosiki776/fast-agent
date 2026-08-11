@@ -22,6 +22,7 @@ class ToolEventKind(StrEnum):
     VALIDATED = "tool.validated"
     AUTHORIZED = "tool.authorized"
     CHECKPOINTED = "tool.checkpointed"
+    CHECKPOINT_FAILED = "tool.checkpoint_failed"
     EXECUTION_STARTED = "tool.execution_started"
     RESULT_STORED = "tool.result_stored"
     COMMITTED = "tool.committed"
@@ -71,6 +72,14 @@ class ToolCheckpointed(ToolEventBase):
     kind: ClassVar[ToolEventKind] = ToolEventKind.CHECKPOINTED
 
     checkpoint_id: str
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class ToolCheckpointFailed(ToolEventBase):
+    kind: ClassVar[ToolEventKind] = ToolEventKind.CHECKPOINT_FAILED
+
+    error_type: str
+    message: str
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -139,6 +148,7 @@ type ToolEvent = (
     | ToolValidated
     | ToolAuthorized
     | ToolCheckpointed
+    | ToolCheckpointFailed
     | ToolExecutionStarted
     | ToolResultStored
     | ToolCommitted

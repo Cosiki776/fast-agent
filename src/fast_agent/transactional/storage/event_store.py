@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Final, Self, TypedDict
 from fast_agent.transactional.events import (
     ToolAuthorized,
     ToolCheckpointed,
+    ToolCheckpointFailed,
     ToolCommitted,
     ToolDenied,
     ToolEvent,
@@ -279,6 +280,11 @@ def _payload_for_event(event: ToolEvent) -> dict[str, JsonValue]:
         }
     if isinstance(event, ToolCheckpointed):
         return {"checkpoint_id": event.checkpoint_id}
+    if isinstance(event, ToolCheckpointFailed | ToolExecutionFailed):
+        return {
+            "error_type": event.error_type,
+            "message": event.message,
+        }
     if isinstance(event, ToolResultStored):
         return {
             "artifact_id": event.artifact_id,
@@ -286,11 +292,6 @@ def _payload_for_event(event: ToolEvent) -> dict[str, JsonValue]:
         }
     if isinstance(event, ToolValidationFailed | ToolDenied | ToolRollbackStarted | ToolFailed):
         return {"reason": event.reason}
-    if isinstance(event, ToolExecutionFailed):
-        return {
-            "error_type": event.error_type,
-            "message": event.message,
-        }
     if isinstance(event, ToolRolledBack):
         return {"checkpoint_id": event.checkpoint_id}
     if isinstance(
@@ -364,6 +365,12 @@ def _event_from_record(
         return ToolCheckpointed(
             **_identity_kwargs(identity),
             checkpoint_id=_payload_str(payload, "checkpoint_id"),
+        )
+    if kind is ToolEventKind.CHECKPOINT_FAILED:
+        return ToolCheckpointFailed(
+            **_identity_kwargs(identity),
+            error_type=_payload_str(payload, "error_type"),
+            message=_payload_str(payload, "message"),
         )
     if kind is ToolEventKind.EXECUTION_STARTED:
         return ToolExecutionStarted(**_identity_kwargs(identity))

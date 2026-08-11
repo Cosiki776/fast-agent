@@ -39,6 +39,7 @@ class TransactionState(StrEnum):
     VALIDATED = "validated"
     AUTHORIZED = "authorized"
     CHECKPOINTED = "checkpointed"
+    CHECKPOINT_FAILED = "checkpoint_failed"
     EXECUTING = "executing"
     RESULT_STORED = "result_stored"
     COMMITTED = "committed"

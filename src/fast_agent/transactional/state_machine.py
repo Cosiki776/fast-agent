@@ -69,6 +69,7 @@ _ALLOWED_TRANSITIONS: Final[
     TransactionState.RESULT_STORED: frozenset(
         {
             TransactionState.COMMITTED,
+            TransactionState.ROLLING_BACK,
             TransactionState.FAILED,
         }
     ),

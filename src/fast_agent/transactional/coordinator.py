@@ -20,6 +20,8 @@ from fast_agent.transactional.events import (
     ToolFailed,
     ToolProposed,
     ToolResultStored,
+    ToolRollbackStarted,
+    ToolRolledBack,
     ToolValidated,
 )
 from fast_agent.transactional.execution import (
@@ -37,6 +39,12 @@ from fast_agent.transactional.recovery.classifier import (
     ToolEffectClassifier,
     classify_local_tool_effect,
 )
+from fast_agent.transactional.recovery.controller import (
+    RecoveryAction,
+    RecoveryController,
+    RecoveryHandoff,
+    recovery_handoff_result,
+)
 from fast_agent.transactional.storage.artifact_store import ArtifactKind
 
 if TYPE_CHECKING:
@@ -46,6 +54,7 @@ if TYPE_CHECKING:
 
 type ToolDenialResolver = Callable[[ToolExecutionRequest], str | None]
 type ToolCheckpointCreator = Callable[[ToolExecutionRequest], str]
+type ToolCheckpointRestorer = Callable[[str], str]
 type TransactionIdFactory = Callable[[], TransactionId]
 
 class TransactionCoordinator:
@@ -58,18 +67,22 @@ class TransactionCoordinator:
         *,
         denial_reason: ToolDenialResolver | None = None,
         checkpoint_creator: ToolCheckpointCreator | None = None,
+        checkpoint_restorer: ToolCheckpointRestorer | None = None,
         result_reducer: ToolResultReducer | None = None,
         run_budget: RunBudgetTracker | None = None,
         effect_classifier: ToolEffectClassifier | None = None,
+        recovery_controller: RecoveryController | None = None,
         transaction_id_factory: TransactionIdFactory = new_transaction_id,
     ) -> None:
         self._event_store = event_store
         self._artifact_store = artifact_store
         self._denial_reason = denial_reason
         self._checkpoint_creator = checkpoint_creator
+        self._checkpoint_restorer = checkpoint_restorer
         self._result_reducer = result_reducer
         self._run_budget = run_budget
         self._effect_classifier = effect_classifier or LocalCodingEffectClassifier()
+        self._recovery_controller = recovery_controller
         self._transaction_id_factory = transaction_id_factory
 
     async def coordinate(
@@ -80,6 +93,7 @@ class TransactionCoordinator:
     ) -> ToolExecutionOutcome:
         transaction_id = self._transaction_id_factory()
         effect = self._classify_effect(request)
+        checkpoint_id: str | None = None
         self._event_store.append(
             ToolProposed(
                 run_id=request.run_id,
@@ -236,6 +250,13 @@ class TransactionCoordinator:
                 reduced_result = bounded_fallback_result(result, artifact.artifact_id)
 
         if is_error:
+            recovered_result = self._recover_failed_result(
+                request=request,
+                transaction_id=transaction_id,
+                effect=effect,
+                checkpoint_id=checkpoint_id,
+                result=reduced_result,
+            )
             self._event_store.append(
                 ToolFailed(
                     run_id=request.run_id,
@@ -244,6 +265,7 @@ class TransactionCoordinator:
                     reason="tool returned an error result",
                 )
             )
+            return ToolExecutionOutcome(result=recovered_result)
         else:
             self._event_store.append(
                 ToolCommitted(
@@ -270,6 +292,70 @@ class TransactionCoordinator:
         except Exception:
             return ToolEffect.EXTERNAL_UNKNOWN
         return effect if isinstance(effect, ToolEffect) else ToolEffect.EXTERNAL_UNKNOWN
+
+    def _recover_failed_result(
+        self,
+        *,
+        request: ToolExecutionRequest,
+        transaction_id: TransactionId,
+        effect: ToolEffect,
+        checkpoint_id: str | None,
+        result: CallToolResult,
+    ) -> CallToolResult:
+        controller = self._recovery_controller
+        if controller is None:
+            return result
+        decision = controller.decide(request, effect, result, checkpoint_id)
+        if decision.action is RecoveryAction.CONTINUE:
+            return result
+        if decision.action is RecoveryAction.RETRY_READ:
+            handoff = RecoveryHandoff(
+                workspace_version="unchanged",
+                rolled_back=False,
+                reverted_files=(),
+                failed_hypothesis=decision.failure.summary,
+                evidence=(f"failure observed {decision.failure_count} time(s)",),
+                forbidden_repeat=(),
+                required_next_step="Check the read arguments, then retry once.",
+            )
+            return recovery_handoff_result(result, handoff)
+        if decision.action is RecoveryAction.ABORT:
+            return result
+
+        restore = self._checkpoint_restorer
+        restore_checkpoint = decision.checkpoint_id
+        if restore is None or restore_checkpoint is None:
+            return result
+        self._event_store.append(
+            ToolRollbackStarted(
+                run_id=request.run_id,
+                transaction_id=transaction_id,
+                tool_call_id=request.tool_call_id,
+                reason=f"repeated failure: {decision.failure.signature}",
+            )
+        )
+        try:
+            workspace_version = restore(restore_checkpoint)
+        except Exception as exc:
+            return _workspace_divergence_result(exc)
+        self._event_store.append(
+            ToolRolledBack(
+                run_id=request.run_id,
+                transaction_id=transaction_id,
+                tool_call_id=request.tool_call_id,
+                checkpoint_id=restore_checkpoint,
+            )
+        )
+        handoff = RecoveryHandoff(
+            workspace_version=workspace_version,
+            rolled_back=True,
+            reverted_files=(),
+            failed_hypothesis=decision.failure.summary,
+            evidence=(f"same failure observed {decision.failure_count} times",),
+            forbidden_repeat=(decision.failure.summary,),
+            required_next_step="Re-localize the cause before making a different edit.",
+        )
+        return recovery_handoff_result(result, handoff)
 
     def _record_checkpoint_failure(
         self,
@@ -367,5 +453,17 @@ def _budget_exhausted_result(
             )
         ],
         structuredContent={"status": "budget_exhausted", "dimensions": exhausted},
+        isError=True,
+    )
+
+
+def _workspace_divergence_result(error: Exception) -> CallToolResult:
+    return CallToolResult(
+        content=[TextContent(type="text", text=f"Recovery stopped: workspace divergence ({error})")],
+        structuredContent={
+            "status": "workspace_divergence",
+            "error_type": type(error).__name__,
+            "message": str(error),
+        },
         isError=True,
     )

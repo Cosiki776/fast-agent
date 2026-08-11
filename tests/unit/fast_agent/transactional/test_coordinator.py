@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import pytest
 from mcp.types import CallToolResult, TextContent
@@ -44,6 +44,7 @@ if TYPE_CHECKING:
 
     from fast_agent.transactional.coordinator import ToolDenialResolver
     from fast_agent.transactional.events import ToolEvent
+    from fast_agent.transactional.recovery.classifier import ToolEffectClassifier
 
 
 RUN_ID = RunId("run-1")
@@ -75,6 +76,7 @@ def _coordinator(
     result_reducer: ToolResultReducer | None = None,
     run_budget: RunBudgetTracker | None = None,
     checkpoint_creator: Callable[[ToolExecutionRequest], str] | None = None,
+    effect_classifier: ToolEffectClassifier | None = None,
 ) -> tuple[TransactionCoordinator, SQLiteEventStore, FileArtifactStore]:
     event_store = SQLiteEventStore(tmp_path / "events.sqlite3")
     artifact_store = FileArtifactStore(tmp_path / "artifacts")
@@ -85,6 +87,7 @@ def _coordinator(
         checkpoint_creator=checkpoint_creator,
         result_reducer=result_reducer,
         run_budget=run_budget,
+        effect_classifier=effect_classifier,
         transaction_id_factory=lambda: TRANSACTION_ID,
     )
     return coordinator, event_store, artifact_store
@@ -347,6 +350,42 @@ async def test_unknown_effect_is_denied_without_execution(tmp_path: Path) -> Non
         "status": "denied",
         "reason": "tool effect is unknown: unknown_local_tool",
     }
+    event_store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["raises", "invalid"])
+async def test_effect_classifier_failure_is_denied_fail_closed(
+    tmp_path: Path,
+    mode: str,
+) -> None:
+    def raises(request: ToolExecutionRequest) -> ToolEffect:
+        del request
+        raise RuntimeError("classifier unavailable")
+
+    def invalid(request: ToolExecutionRequest) -> str:
+        del request
+        return "read"
+
+    classifier = raises if mode == "raises" else cast("ToolEffectClassifier", invalid)
+    coordinator, event_store, _ = _coordinator(tmp_path, effect_classifier=classifier)
+    executions = 0
+
+    async def call_next() -> ToolExecutionOutcome:
+        nonlocal executions
+        executions += 1
+        return ToolExecutionOutcome(result=_result("unexpected"))
+
+    outcome = await coordinator.coordinate(_request("remote_tool"), call_next)
+
+    assert executions == 0
+    assert outcome.result.structuredContent == {
+        "status": "denied",
+        "reason": "tool effect is unknown: remote_tool",
+    }
+    proposed = _events(event_store)[0]
+    assert isinstance(proposed, ToolProposed)
+    assert proposed.effect is ToolEffect.EXTERNAL_UNKNOWN
     event_store.close()
 
 

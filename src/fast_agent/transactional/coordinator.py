@@ -5,11 +5,6 @@ from typing import TYPE_CHECKING
 
 from mcp.types import CallToolResult, TextContent
 
-from fast_agent.tools.apply_patch_tool import APPLY_PATCH_TOOL_NAME
-from fast_agent.tools.filesystem_tool_definitions import (
-    READ_TEXT_FILE_TOOL_NAME,
-    WRITE_TEXT_FILE_TOOL_NAME,
-)
 from fast_agent.transactional.context.reducers import (
     ToolResultReducer,
     bounded_fallback_result,
@@ -37,6 +32,11 @@ from fast_agent.transactional.models import (
     TransactionId,
     new_transaction_id,
 )
+from fast_agent.transactional.recovery.classifier import (
+    LocalCodingEffectClassifier,
+    ToolEffectClassifier,
+    classify_local_tool_effect,
+)
 from fast_agent.transactional.storage.artifact_store import ArtifactKind
 
 if TYPE_CHECKING:
@@ -47,18 +47,6 @@ if TYPE_CHECKING:
 type ToolDenialResolver = Callable[[ToolExecutionRequest], str | None]
 type ToolCheckpointCreator = Callable[[ToolExecutionRequest], str]
 type TransactionIdFactory = Callable[[], TransactionId]
-
-_WORKSPACE_WRITE_TOOL_NAMES = frozenset(
-    {
-        WRITE_TEXT_FILE_TOOL_NAME,
-        APPLY_PATCH_TOOL_NAME,
-        "execute",
-        "bash",
-        "process",
-        "shell",
-    }
-)
-
 
 class TransactionCoordinator:
     """Order one tool call across transaction persistence boundaries."""
@@ -72,6 +60,7 @@ class TransactionCoordinator:
         checkpoint_creator: ToolCheckpointCreator | None = None,
         result_reducer: ToolResultReducer | None = None,
         run_budget: RunBudgetTracker | None = None,
+        effect_classifier: ToolEffectClassifier | None = None,
         transaction_id_factory: TransactionIdFactory = new_transaction_id,
     ) -> None:
         self._event_store = event_store
@@ -80,6 +69,7 @@ class TransactionCoordinator:
         self._checkpoint_creator = checkpoint_creator
         self._result_reducer = result_reducer
         self._run_budget = run_budget
+        self._effect_classifier = effect_classifier or LocalCodingEffectClassifier()
         self._transaction_id_factory = transaction_id_factory
 
     async def coordinate(
@@ -89,7 +79,7 @@ class TransactionCoordinator:
         /,
     ) -> ToolExecutionOutcome:
         transaction_id = self._transaction_id_factory()
-        effect = classify_tool_effect(request.tool_name)
+        effect = self._classify_effect(request)
         self._event_store.append(
             ToolProposed(
                 run_id=request.run_id,
@@ -274,6 +264,13 @@ class TransactionCoordinator:
 
         return await self.coordinate(request, call_next)
 
+    def _classify_effect(self, request: ToolExecutionRequest) -> ToolEffect:
+        try:
+            effect = self._effect_classifier(request)
+        except Exception:
+            return ToolEffect.EXTERNAL_UNKNOWN
+        return effect if isinstance(effect, ToolEffect) else ToolEffect.EXTERNAL_UNKNOWN
+
     def _record_checkpoint_failure(
         self,
         *,
@@ -307,11 +304,7 @@ class TransactionCoordinator:
 def classify_tool_effect(tool_name: str) -> ToolEffect:
     """Classify the explicit first-phase local coding tool names."""
 
-    if tool_name == READ_TEXT_FILE_TOOL_NAME:
-        return ToolEffect.READ
-    if tool_name in _WORKSPACE_WRITE_TOOL_NAMES:
-        return ToolEffect.WORKSPACE_WRITE
-    return ToolEffect.EXTERNAL_UNKNOWN
+    return classify_local_tool_effect(tool_name)
 
 
 def serialize_tool_result(result: CallToolResult) -> bytes:

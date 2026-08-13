@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import pytest
 from mcp.types import CallToolResult, TextContent
@@ -35,8 +35,11 @@ from fast_agent.transactional.models import (
     TransactionId,
     TransactionState,
 )
+from fast_agent.transactional.recovery.controller import RecoveryController
+from fast_agent.transactional.run_events import RunEventKind, RunStarted
 from fast_agent.transactional.storage.artifact_store import ArtifactId, FileArtifactStore
 from fast_agent.transactional.storage.event_store import SQLiteEventStore
+from fast_agent.transactional.storage.run_event_store import SQLiteRunEventStore
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -44,6 +47,7 @@ if TYPE_CHECKING:
 
     from fast_agent.transactional.coordinator import ToolDenialResolver
     from fast_agent.transactional.events import ToolEvent
+    from fast_agent.transactional.recovery.classifier import ToolEffectClassifier
 
 
 RUN_ID = RunId("run-1")
@@ -75,6 +79,11 @@ def _coordinator(
     result_reducer: ToolResultReducer | None = None,
     run_budget: RunBudgetTracker | None = None,
     checkpoint_creator: Callable[[ToolExecutionRequest], str] | None = None,
+    effect_classifier: ToolEffectClassifier | None = None,
+    recovery_controller: RecoveryController | None = None,
+    checkpoint_restorer: Callable[[str], str] | None = None,
+    run_event_store: SQLiteRunEventStore | None = None,
+    transaction_id_factory: Callable[[], TransactionId] = lambda: TRANSACTION_ID,
 ) -> tuple[TransactionCoordinator, SQLiteEventStore, FileArtifactStore]:
     event_store = SQLiteEventStore(tmp_path / "events.sqlite3")
     artifact_store = FileArtifactStore(tmp_path / "artifacts")
@@ -83,9 +92,13 @@ def _coordinator(
         artifact_store,
         denial_reason=denial_reason,
         checkpoint_creator=checkpoint_creator,
+        checkpoint_restorer=checkpoint_restorer,
         result_reducer=result_reducer,
         run_budget=run_budget,
-        transaction_id_factory=lambda: TRANSACTION_ID,
+        effect_classifier=effect_classifier,
+        recovery_controller=recovery_controller,
+        run_event_store=run_event_store,
+        transaction_id_factory=transaction_id_factory,
     )
     return coordinator, event_store, artifact_store
 
@@ -347,6 +360,137 @@ async def test_unknown_effect_is_denied_without_execution(tmp_path: Path) -> Non
         "status": "denied",
         "reason": "tool effect is unknown: unknown_local_tool",
     }
+    event_store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["raises", "invalid"])
+async def test_effect_classifier_failure_is_denied_fail_closed(
+    tmp_path: Path,
+    mode: str,
+) -> None:
+    def raises(request: ToolExecutionRequest) -> ToolEffect:
+        del request
+        raise RuntimeError("classifier unavailable")
+
+    def invalid(request: ToolExecutionRequest) -> str:
+        del request
+        return "read"
+
+    classifier = raises if mode == "raises" else cast("ToolEffectClassifier", invalid)
+    coordinator, event_store, _ = _coordinator(tmp_path, effect_classifier=classifier)
+    executions = 0
+
+    async def call_next() -> ToolExecutionOutcome:
+        nonlocal executions
+        executions += 1
+        return ToolExecutionOutcome(result=_result("unexpected"))
+
+    outcome = await coordinator.coordinate(_request("remote_tool"), call_next)
+
+    assert executions == 0
+    assert outcome.result.structuredContent == {
+        "status": "denied",
+        "reason": "tool effect is unknown: remote_tool",
+    }
+    proposed = _events(event_store)[0]
+    assert isinstance(proposed, ToolProposed)
+    assert proposed.effect is ToolEffect.EXTERNAL_UNKNOWN
+    event_store.close()
+
+
+@pytest.mark.asyncio
+async def test_repeated_write_failure_rolls_back_and_returns_handoff(tmp_path: Path) -> None:
+    transaction_ids = iter((TransactionId("transaction-1"), TransactionId("transaction-2")))
+    restored: list[str] = []
+    run_events = SQLiteRunEventStore(tmp_path / "events.sqlite3")
+    run_events.append(RunStarted(run_id=RUN_ID, profile="full"))
+    coordinator, event_store, _ = _coordinator(
+        tmp_path,
+        checkpoint_creator=lambda request: f"checkpoint-{request.tool_call_id}",
+        checkpoint_restorer=lambda checkpoint_id: restored.append(checkpoint_id) or "version-1",
+        recovery_controller=RecoveryController(),
+        run_event_store=run_events,
+        transaction_id_factory=lambda: next(transaction_ids),
+    )
+
+    async def call_next() -> ToolExecutionOutcome:
+        return ToolExecutionOutcome(result=_result("same assertion failed", is_error=True))
+
+    await coordinator.coordinate(_request(), call_next)
+    second_request = ToolExecutionRequest(
+        run_id=RUN_ID,
+        tool_call_id=ToolCallId("call-2"),
+        tool_name="write_text_file",
+        arguments={"path": "notes.txt", "content": "second attempt"},
+    )
+    outcome = await coordinator.coordinate(second_request, call_next)
+
+    assert restored == ["checkpoint-call-1"]
+    assert outcome.result.structuredContent is not None
+    assert outcome.result.structuredContent["status"] == "recovery_handoff"
+    assert [
+        item.event.kind
+        for item in event_store.events_for_transaction(TransactionId("transaction-2"))
+    ] == [
+        ToolEventKind.PROPOSED,
+        ToolEventKind.VALIDATED,
+        ToolEventKind.AUTHORIZED,
+        ToolEventKind.CHECKPOINTED,
+        ToolEventKind.EXECUTION_STARTED,
+        ToolEventKind.RESULT_STORED,
+        ToolEventKind.ROLLBACK_STARTED,
+        ToolEventKind.ROLLED_BACK,
+        ToolEventKind.FAILED,
+    ]
+    assert [item.event.kind for item in run_events.events_for_run(RUN_ID)] == [
+        RunEventKind.STARTED,
+        RunEventKind.RECOVERY_STARTED,
+        RunEventKind.RECOVERED,
+    ]
+    run_events.close()
+    event_store.close()
+
+
+@pytest.mark.asyncio
+async def test_restore_mismatch_stops_with_workspace_divergence(tmp_path: Path) -> None:
+    transaction_ids = iter((TransactionId("transaction-1"), TransactionId("transaction-2")))
+
+    def fail_restore(checkpoint_id: str) -> str:
+        del checkpoint_id
+        raise RuntimeError("hash mismatch")
+
+    coordinator, event_store, _ = _coordinator(
+        tmp_path,
+        checkpoint_creator=lambda request: f"checkpoint-{request.tool_call_id}",
+        checkpoint_restorer=fail_restore,
+        recovery_controller=RecoveryController(),
+        transaction_id_factory=lambda: next(transaction_ids),
+    )
+
+    async def call_next() -> ToolExecutionOutcome:
+        return ToolExecutionOutcome(result=_result("same assertion failed", is_error=True))
+
+    await coordinator.coordinate(_request(), call_next)
+    outcome = await coordinator.coordinate(
+        ToolExecutionRequest(
+            run_id=RUN_ID,
+            tool_call_id=ToolCallId("call-2"),
+            tool_name="write_text_file",
+            arguments={},
+        ),
+        call_next,
+    )
+
+    assert outcome.result.structuredContent == {
+        "status": "workspace_divergence",
+        "error_type": "RuntimeError",
+        "message": "hash mismatch",
+    }
+    assert [
+        item.event.kind
+        for item in event_store.events_for_transaction(TransactionId("transaction-2"))
+    ][-2:] == [ToolEventKind.ROLLBACK_STARTED, ToolEventKind.FAILED]
     event_store.close()
 
 

@@ -33,9 +33,7 @@ _STATE_BY_EVENT_KIND: Final[dict[ToolEventKind, TransactionState]] = {
 # The first vertical slice executes directly after proposal. Validation,
 # authorization, and checkpointing remain valid optional stages until their
 # dedicated runtime components are connected.
-_ALLOWED_TRANSITIONS: Final[
-    dict[TransactionState | None, frozenset[TransactionState]]
-] = {
+_ALLOWED_TRANSITIONS: Final[dict[TransactionState | None, frozenset[TransactionState]]] = {
     None: frozenset({TransactionState.PROPOSED}),
     TransactionState.PROPOSED: frozenset(
         {
@@ -91,6 +89,7 @@ _ALLOWED_TRANSITIONS: Final[
     TransactionState.COMMITTED: frozenset(),
     TransactionState.FAILED: frozenset(),
 }
+
 
 class TransactionStateError(ValueError):
     """Base error for an invalid transaction event stream."""
@@ -201,8 +200,7 @@ def _validate_event_identity(
 ) -> None:
     if event.run_id != projection.run_id:
         raise TransactionIdentityError(
-            f"Event run ID '{event.run_id}' does not match transaction "
-            f"run ID '{projection.run_id}'"
+            f"Event run ID '{event.run_id}' does not match transaction run ID '{projection.run_id}'"
         )
     if event.transaction_id != projection.transaction_id:
         raise TransactionIdentityError(
@@ -211,6 +209,5 @@ def _validate_event_identity(
         )
     if event.tool_call_id != projection.tool_call_id:
         raise TransactionIdentityError(
-            f"Event tool call ID '{event.tool_call_id}' does not match "
-            f"'{projection.tool_call_id}'"
+            f"Event tool call ID '{event.tool_call_id}' does not match '{projection.tool_call_id}'"
         )

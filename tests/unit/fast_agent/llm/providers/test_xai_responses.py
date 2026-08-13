@@ -3,12 +3,14 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from mcp.types import TextContent
+from mcp_types import TextContent
 from openai.types.responses import ResponseUsage
 from openai.types.responses.response_usage import InputTokensDetails, OutputTokensDetails
 
 from fast_agent.config import Settings, XAISettings, XAIWebSearchSettings
+from fast_agent.constants import OPENAI_ASSISTANT_MESSAGE_ITEMS
 from fast_agent.context import Context
+from fast_agent.core.exceptions import ModelConfigError
 from fast_agent.llm.provider.openai.responses import ResponsesLLM
 from fast_agent.llm.provider.openai.responses_websocket import (
     ResponsesWebSocketError,
@@ -18,11 +20,14 @@ from fast_agent.llm.provider.openai.responses_websocket import (
 from fast_agent.llm.provider.openai.tool_stream_state import OpenAIToolStreamState
 from fast_agent.llm.provider.openai.xai_responses import (
     DEFAULT_XAI_MODEL,
+    GROK_45_HIGH_STREAMING_TIMEOUT,
     XAIResponsesLLM,
 )
 from fast_agent.llm.provider_types import Provider
 from fast_agent.llm.reasoning_effort import ReasoningEffortSetting
+from fast_agent.llm.request_params import RequestParams
 from fast_agent.llm.usage_tracking import UsageSchema
+from fast_agent.mcp.prompt_message_extended import PromptMessageExtended
 
 REPO_ROOT = Path(__file__).resolve().parents[5]
 
@@ -97,6 +102,54 @@ def test_xai_responses_default_model_used_when_model_missing() -> None:
     assert llm.default_request_params.model == DEFAULT_XAI_MODEL
 
 
+@pytest.mark.parametrize(
+    ("model", "reasoning_effort", "expected_timeout"),
+    [
+        ("grok-4.5", "high", GROK_45_HIGH_STREAMING_TIMEOUT),
+        ("grok-4.5", "medium", 120.0),
+        ("grok-4.5", "low", 120.0),
+        ("grok-4.3", "high", 120.0),
+    ],
+)
+def test_xai_grok_45_high_reasoning_gets_extended_streaming_timeout(
+    model: str,
+    reasoning_effort: str,
+    expected_timeout: float,
+) -> None:
+    llm = XAIResponsesLLM(
+        context=Context(config=Settings(xai=XAISettings(api_key="test-key"))),
+        model=model,
+        reasoning_effort=reasoning_effort,
+    )
+
+    assert llm.default_request_params.streaming_timeout == expected_timeout
+
+
+@pytest.mark.parametrize("streaming_timeout", [45.0, None])
+def test_xai_explicit_streaming_timeout_overrides_high_reasoning_default(
+    streaming_timeout: float | None,
+) -> None:
+    llm = XAIResponsesLLM(
+        context=Context(config=Settings(xai=XAISettings(api_key="test-key"))),
+        model="grok-4.5",
+        reasoning_effort="high",
+        request_params=RequestParams(streaming_timeout=streaming_timeout),
+    )
+
+    assert llm.default_request_params.streaming_timeout == streaming_timeout
+
+
+def test_xai_implicit_request_timeout_does_not_block_high_reasoning_default() -> None:
+    llm = XAIResponsesLLM(
+        context=Context(config=Settings(xai=XAISettings(api_key="test-key"))),
+        model="grok-4.5",
+        reasoning_effort="high",
+        request_params=RequestParams(model="grok-4.5", use_history=False),
+    )
+
+    assert llm.default_request_params.streaming_timeout == GROK_45_HIGH_STREAMING_TIMEOUT
+
+
 def test_xai_responses_uses_xai_config_fallback() -> None:
     settings = Settings(
         xai=XAISettings(
@@ -136,6 +189,15 @@ def test_xai_responses_websocket_headers_are_not_openai_beta_headers() -> None:
     assert headers["Authorization"] == "Bearer test-key"
     assert headers["X-Test"] == "1"
     assert "OpenAI-Beta" not in headers
+
+
+def test_xai_websocket_disables_client_generated_keepalive_pings() -> None:
+    llm = XAIResponsesLLM(
+        context=Context(config=Settings(xai=XAISettings(api_key="test-key"))),
+        model="grok-4.3",
+    )
+
+    assert llm._websocket_keepalive_options() == {"ping_interval": None}
 
 
 @pytest.mark.asyncio
@@ -202,8 +264,8 @@ def test_xai_responses_builds_parallel_response_payload_with_default_reasoning()
     assert args["store"] is False
     assert args["input"] == input_items
     assert args["parallel_tool_calls"] is True
-    assert "include" not in args
-    assert args["reasoning"] == {"effort": "low"}
+    assert args["include"] == ["reasoning.encrypted_content"]
+    assert args["reasoning"] == {"effort": "high"}
     assert "service_tier" not in args
     assert "stream" not in args
     assert "background" not in args
@@ -229,24 +291,148 @@ def test_xai_responses_builds_payload_with_selected_reasoning_effort() -> None:
     assert args["reasoning"] == {"effort": "high"}
 
 
-def test_xai_responses_builds_payload_with_reasoning_none() -> None:
+@pytest.mark.parametrize("model", ["grok-4.5", "grok-4.6"])
+def test_xai_responses_builds_experimental_streaming_payload(model: str) -> None:
+    llm = XAIResponsesLLM(
+        context=Context(
+            config=Settings(
+                xai=XAISettings(
+                    api_key="test-key",
+                    reasoning_summary="concise",
+                    stream_tool_calls=True,
+                )
+            )
+        ),
+        model=model,
+    )
+
+    args = llm._build_response_args([], llm.default_request_params, tools=None)
+
+    assert args["reasoning"] == {"effort": "high", "summary": "concise"}
+    assert args["extra_body"] == {"stream_tool_calls": True}
+
+
+def test_xai_responses_flattens_stream_tool_calls_for_websocket() -> None:
+    llm = XAIResponsesLLM(
+        context=Context(
+            config=Settings(xai=XAISettings(api_key="test-key", stream_tool_calls=True))
+        ),
+        model="grok-4.6",
+    )
+    args = llm._build_response_args([], llm.default_request_params, tools=None)
+
+    llm._prepare_websocket_arguments(args)
+
+    assert args["stream_tool_calls"] is True
+    assert "extra_body" not in args
+
+
+def test_xai_responses_rejects_unverified_experimental_model() -> None:
+    llm = XAIResponsesLLM(
+        context=Context(
+            config=Settings(xai=XAISettings(api_key="test-key", stream_tool_calls=True))
+        ),
+        model="grok-4.3",
+    )
+
+    with pytest.raises(ModelConfigError, match="supported only for grok-4.5, grok-4.6"):
+        llm._build_response_args([], llm.default_request_params, tools=None)
+
+
+def test_xai_grok_46_builds_payload_with_xhigh_reasoning() -> None:
     llm = XAIResponsesLLM(
         context=Context(config=Settings(xai=XAISettings(api_key="test-key"))),
-        model="grok-4.3",
-        reasoning_effort="none",
+        model="grok-4.6",
+        reasoning_effort="xhigh",
     )
-    input_items = [
-        {
+
+    args = llm._build_response_args([], llm.default_request_params, tools=None)
+
+    assert llm.reasoning_effort == ReasoningEffortSetting(kind="effort", value="xhigh")
+    assert args["reasoning"] == {"effort": "xhigh"}
+
+
+def test_xai_prompt_cache_key_is_stable_per_conversation_and_rotates_on_clear() -> None:
+    llm = XAIResponsesLLM(
+        context=Context(config=Settings(xai=XAISettings(api_key="test-key"))),
+        model="grok-4.6",
+    )
+
+    first = llm._build_response_args([], llm.default_request_params, tools=None)
+    second = llm._build_response_args([], llm.default_request_params, tools=None)
+    first_key = first["prompt_cache_key"]
+
+    assert isinstance(first_key, str)
+    assert first_key
+    assert second["prompt_cache_key"] == first_key
+    assert "extra_body" not in first
+
+    planned = llm._new_ws_request_planner().plan(first)
+    assert planned.arguments["prompt_cache_key"] == first_key
+
+    llm.clear()
+    after_clear = llm._build_response_args([], llm.default_request_params, tools=None)
+    assert after_clear["prompt_cache_key"] != first_key
+
+
+@pytest.mark.parametrize("model", ["grok-4.5", "grok-4.6"])
+def test_xai_replays_distinct_assistant_messages_when_provider_reuses_item_id(
+    model: str,
+) -> None:
+    llm = XAIResponsesLLM(
+        context=Context(config=Settings(xai=XAISettings(api_key="test-key"))),
+        model=model,
+    )
+    messages: list[PromptMessageExtended] = []
+    for user_text, assistant_text in (
+        ("good evening", "Hello."),
+        ("write an essay", "The essay."),
+        ("was that fun?", "Yes."),
+    ):
+        messages.append(
+            PromptMessageExtended(
+                role="user",
+                content=[TextContent(type="text", text=user_text)],
+            )
+        )
+        raw_item = {
             "type": "message",
-            "role": "user",
-            "content": [{"type": "input_text", "text": "hello"}],
+            "id": "msg_reused",
+            "role": "assistant",
+            "status": "completed",
+            "content": [{"type": "output_text", "text": assistant_text}],
         }
-    ]
+        messages.append(
+            PromptMessageExtended(
+                role="assistant",
+                content=[TextContent(type="text", text=assistant_text)],
+                channels={
+                    OPENAI_ASSISTANT_MESSAGE_ITEMS: [
+                        TextContent(type="text", text=json.dumps(raw_item))
+                    ]
+                },
+            )
+        )
 
+    input_items = llm._convert_to_provider_format(messages)
     args = llm._build_response_args(input_items, llm.default_request_params, tools=None)
+    planned = llm._new_ws_request_planner().plan(args)
+    replayed = planned.arguments["input"]
 
-    assert llm.reasoning_effort == ReasoningEffortSetting(kind="effort", value="none")
-    assert args["reasoning"] == {"effort": "none"}
+    assert [item["role"] for item in replayed] == [
+        "user",
+        "assistant",
+        "user",
+        "assistant",
+        "user",
+        "assistant",
+    ]
+    assert [item["content"][0]["text"] for item in replayed if item["role"] == "assistant"] == [
+        "Hello.",
+        "The essay.",
+        "Yes.",
+    ]
+    assert all("id" not in item for item in replayed if item["role"] == "assistant")
 
 
 def test_xai_responses_advertises_web_search() -> None:
@@ -282,7 +468,7 @@ def test_xai_responses_builds_web_search_tool_when_enabled() -> None:
     args = llm._build_response_args(input_items, llm.default_request_params, tools=None)
 
     assert args["tools"] == [{"type": "web_search"}]
-    assert "include" not in args
+    assert args["include"] == ["reasoning.encrypted_content"]
 
 
 def test_xai_responses_builds_xai_web_search_options() -> None:

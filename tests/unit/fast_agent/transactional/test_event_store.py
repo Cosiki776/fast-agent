@@ -154,12 +154,12 @@ def test_append_query_and_reopen_preserve_fact_sequence(tmp_path: Path) -> None:
         ]
 
     with SQLiteEventStore(database_path) as reopened:
-        assert [item.event for item in reopened.events_for_transaction(
-            successful.transaction_id
-        )] == success_events
-        assert [item.event for item in reopened.events_for_transaction(
-            failed.transaction_id
-        )] == failure_events
+        assert [
+            item.event for item in reopened.events_for_transaction(successful.transaction_id)
+        ] == success_events
+        assert [
+            item.event for item in reopened.events_for_transaction(failed.transaction_id)
+        ] == failure_events
 
 
 def test_all_event_payload_shapes_round_trip(tmp_path: Path) -> None:
@@ -177,9 +177,7 @@ def test_all_event_payload_shapes_round_trip(tmp_path: Path) -> None:
 
         for events in paths:
             transaction_id = events[0].transaction_id
-            assert [
-                item.event for item in store.events_for_transaction(transaction_id)
-            ] == events
+            assert [item.event for item in store.events_for_transaction(transaction_id)] == events
 
 
 def test_replay_uses_persisted_event_order(tmp_path: Path) -> None:

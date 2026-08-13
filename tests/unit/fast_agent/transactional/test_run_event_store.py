@@ -89,9 +89,7 @@ def test_schema_v1_migrates_without_losing_tool_events(tmp_path: Path) -> None:
 
     with SQLiteEventStore(path) as migrated:
         assert migrated.schema_version == SCHEMA_VERSION == 2
-        assert [
-            item.event.kind for item in migrated.events_for_transaction(transaction_id)
-        ] == [
+        assert [item.event.kind for item in migrated.events_for_transaction(transaction_id)] == [
             ToolProposed.kind,
             ToolExecutionStarted.kind,
             ToolResultStored.kind,

@@ -96,9 +96,7 @@ class FileArtifactStore:
                 sha256=digest,
                 byte_size=len(content),
                 media_types=tuple(sorted({*existing.media_types, media_type})),
-                kinds=tuple(
-                    sorted({*existing.kinds, kind}, key=lambda item: item.value)
-                ),
+                kinds=tuple(sorted({*existing.kinds, kind}, key=lambda item: item.value)),
             )
 
         _store_content(object_path, content, digest)
@@ -227,9 +225,7 @@ def _decode_metadata(
     if byte_size < 0:
         raise ArtifactCorruptionError("Artifact metadata byte size must not be negative")
     if not media_types or any(not media_type for media_type in media_types):
-        raise ArtifactCorruptionError(
-            "Artifact metadata must contain non-empty media types"
-        )
+        raise ArtifactCorruptionError("Artifact metadata must contain non-empty media types")
     if not kinds:
         raise ArtifactCorruptionError("Artifact metadata must contain artifact kinds")
 
@@ -262,9 +258,7 @@ def _metadata_object(value: object) -> dict[str, object]:
     result: dict[str, object] = {}
     for key, item in value.items():
         if not isinstance(key, str):
-            raise ArtifactCorruptionError(
-                "Artifact metadata must contain only string keys"
-            )
+            raise ArtifactCorruptionError("Artifact metadata must contain only string keys")
         result[key] = item
     return result
 
@@ -286,14 +280,10 @@ def _metadata_int(payload: Mapping[str, object], key: str) -> int:
 def _metadata_strings(payload: Mapping[str, object], key: str) -> tuple[str, ...]:
     value = payload.get(key)
     if not isinstance(value, list):
-        raise ArtifactCorruptionError(
-            f"Artifact metadata field '{key}' must be a string list"
-        )
+        raise ArtifactCorruptionError(f"Artifact metadata field '{key}' must be a string list")
     result: list[str] = []
     for item in value:
         if not isinstance(item, str):
-            raise ArtifactCorruptionError(
-                f"Artifact metadata field '{key}' must be a string list"
-            )
+            raise ArtifactCorruptionError(f"Artifact metadata field '{key}' must be a string list")
         result.append(item)
     return tuple(result)

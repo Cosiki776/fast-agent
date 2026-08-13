@@ -100,7 +100,7 @@ def classify_local_tool_effect(tool_name: str) -> ToolEffect:
 
 
 def _failure_fields(result: CallToolResult) -> tuple[str, str, str]:
-    structured = result.structuredContent
+    structured = result.structured_content
     status = _string_field(structured, "status")
     error_type = _string_field(structured, "error_type")
     message = _string_field(structured, "message") or _result_text(result)

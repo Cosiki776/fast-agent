@@ -60,6 +60,7 @@ type ToolCheckpointCreator = Callable[[ToolExecutionRequest], str]
 type ToolCheckpointRestorer = Callable[[str], str]
 type TransactionIdFactory = Callable[[], TransactionId]
 
+
 class TransactionCoordinator:
     """Order one tool call across transaction persistence boundaries."""
 
@@ -235,7 +236,7 @@ class TransactionCoordinator:
         )
         if self._run_budget is not None:
             self._run_budget.record_artifact_output(len(serialized_result))
-        is_error = bool(result.isError)
+        is_error = result.is_error
         self._event_store.append(
             ToolResultStored(
                 run_id=request.run_id,
@@ -430,8 +431,8 @@ def serialize_tool_result(result: CallToolResult) -> bytes:
 def _denied_result(reason: str) -> CallToolResult:
     return CallToolResult(
         content=[TextContent(type="text", text=f"Tool execution denied: {reason}")],
-        structuredContent={"status": "denied", "reason": reason},
-        isError=True,
+        structured_content={"status": "denied", "reason": reason},
+        is_error=True,
     )
 
 
@@ -443,12 +444,12 @@ def _execution_failed_result(*, error_type: str, message: str) -> CallToolResult
                 text=f"Tool execution failed ({error_type}): {message}",
             )
         ],
-        structuredContent={
+        structured_content={
             "status": "failed",
             "error_type": error_type,
             "message": message,
         },
-        isError=True,
+        is_error=True,
     )
 
 
@@ -460,12 +461,12 @@ def _checkpoint_failed_result(error: Exception) -> CallToolResult:
                 text=f"Tool execution stopped: checkpoint failed ({type(error).__name__}: {error})",
             )
         ],
-        structuredContent={
+        structured_content={
             "status": "checkpoint_failed",
             "error_type": type(error).__name__,
             "message": str(error),
         },
-        isError=True,
+        is_error=True,
     )
 
 
@@ -480,18 +481,20 @@ def _budget_exhausted_result(
                 text=f"Tool execution stopped: budget exhausted ({', '.join(exhausted)})",
             )
         ],
-        structuredContent={"status": "budget_exhausted", "dimensions": exhausted},
-        isError=True,
+        structured_content={"status": "budget_exhausted", "dimensions": exhausted},
+        is_error=True,
     )
 
 
 def _workspace_divergence_result(error: Exception) -> CallToolResult:
     return CallToolResult(
-        content=[TextContent(type="text", text=f"Recovery stopped: workspace divergence ({error})")],
-        structuredContent={
+        content=[
+            TextContent(type="text", text=f"Recovery stopped: workspace divergence ({error})")
+        ],
+        structured_content={
             "status": "workspace_divergence",
             "error_type": type(error).__name__,
             "message": str(error),
         },
-        isError=True,
+        is_error=True,
     )

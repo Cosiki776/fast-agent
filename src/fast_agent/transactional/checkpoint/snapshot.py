@@ -162,7 +162,10 @@ class WorkspaceSnapshotManager:
 
     def agent_delta(self, snapshot: WorkspaceSnapshot, worktree: WorktreeMetadata) -> AgentDelta:
         self._validate_worktree(snapshot, worktree)
-        current = {entry.path: entry for entry in self._files_at(worktree.worktree_path, snapshot.base_commit)}
+        current = {
+            entry.path: entry
+            for entry in self._files_at(worktree.worktree_path, snapshot.base_commit)
+        }
         initial = {entry.path: entry for entry in snapshot.files}
         added: list[str] = []
         modified: list[str] = []
@@ -176,7 +179,11 @@ class WorkspaceSnapshotManager:
                 added.append(path)
             elif before_exists and not after_exists:
                 deleted.append(path)
-            elif before is not None and after is not None and _file_identity(before) != _file_identity(after):
+            elif (
+                before is not None
+                and after is not None
+                and _file_identity(before) != _file_identity(after)
+            ):
                 modified.append(path)
         return AgentDelta(tuple(added), tuple(modified), tuple(deleted))
 
@@ -250,7 +257,9 @@ def _capture_files(
     tracked = set(git_paths(root, "ls-files", "--cached", "-z"))
     untracked = set(git_paths(root, "ls-files", "--others", "--exclude-standard", "-z"))
     kinds = {
-        path: SnapshotFileKind.TRACKED if path in base_paths | tracked else SnapshotFileKind.UNTRACKED
+        path: SnapshotFileKind.TRACKED
+        if path in base_paths | tracked
+        else SnapshotFileKind.UNTRACKED
         for path in base_paths | tracked | untracked
     }
     excluded = tuple(sorted(path for path in kinds if not path_filter(path)))
@@ -399,4 +408,6 @@ def _validate_supported_workspace(root: Path) -> None:
         None,
     )
     if nested is not None:
-        raise UnsupportedWorkspaceError(f"Nested Git repositories are not supported: {nested.parent}")
+        raise UnsupportedWorkspaceError(
+            f"Nested Git repositories are not supported: {nested.parent}"
+        )

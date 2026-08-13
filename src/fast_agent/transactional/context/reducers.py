@@ -7,6 +7,8 @@ from typing import TYPE_CHECKING, Protocol
 
 from mcp.types import CallToolResult, TextContent
 
+from fast_agent.mcp.tool_result_metadata import tool_result_display_metadata
+
 if TYPE_CHECKING:
     from collections.abc import Iterable
 
@@ -176,7 +178,7 @@ def _reduced_result(
     return result.model_copy(
         update={
             "content": [TextContent(type="text", text=text)],
-            "structuredContent": None,
+            "structured_content": None,
         }
     )
 
@@ -205,8 +207,7 @@ def _result_text(result: CallToolResult) -> str:
 
 
 def _exit_code(result: CallToolResult, text: str) -> int | str:
-    model_extra = result.model_extra
-    value = model_extra.get("exit_code") if model_extra is not None else None
+    value = tool_result_display_metadata(result).get("exit_code")
     if type(value) is int:
         return value
     match = _EXIT_CODE_PATTERN.search(text)
@@ -225,7 +226,9 @@ def _is_pytest_command(tokens: list[str]) -> bool:
 
 
 def _is_git_diff_command(tokens: list[str]) -> bool:
-    return any(left == "git" and right == "diff" for left, right in zip(tokens, tokens[1:]))
+    return any(
+        left == "git" and right == "diff" for left, right in zip(tokens, tokens[1:], strict=False)
+    )
 
 
 def _unique_matches(

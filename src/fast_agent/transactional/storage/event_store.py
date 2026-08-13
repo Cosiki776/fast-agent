@@ -246,8 +246,7 @@ class SQLiteEventStore:
         version = self.schema_version
         if version not in {0, 1, SCHEMA_VERSION}:
             raise UnsupportedSchemaVersionError(
-                f"Event-store schema version {version} is not supported; "
-                f"expected {SCHEMA_VERSION}"
+                f"Event-store schema version {version} is not supported; expected {SCHEMA_VERSION}"
             )
         if version == SCHEMA_VERSION:
             return
@@ -352,9 +351,7 @@ def _identity_from_row(row: sqlite3.Row) -> _EventIdentity:
 
     return _EventIdentity(
         run_id=RunId(_require_str(row["run_id"], "run ID")),
-        transaction_id=TransactionId(
-            _require_str(row["transaction_id"], "transaction ID")
-        ),
+        transaction_id=TransactionId(_require_str(row["transaction_id"], "transaction ID")),
         tool_call_id=ToolCallId(_require_str(row["tool_call_id"], "tool call ID")),
         occurred_at=occurred_at,
     )

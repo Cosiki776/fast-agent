@@ -30,7 +30,7 @@ def test_development_task_manifests_are_frozen_and_complete() -> None:
     assert {task.budget.max_tool_calls for task in tasks} == {80}
     assert all(task.verification.command == "uv run pytest -q" for task in tasks)
     with pytest.raises(ValidationError, match="frozen"):
-        tasks[0].issue = "changed"
+        tasks[0].issue = "changed"  # ty: ignore[invalid-assignment]  # frozen mutation is under test
 
 
 def test_manifest_loader_rejects_unknown_fields(tmp_path: Path) -> None:
@@ -80,9 +80,7 @@ async def test_ab_runner_uses_same_manifest_and_records_required_metrics() -> No
             output_tokens=None,
             full_output_bytes=20_000,
             model_visible_output_bytes=(20_000 if profile is BenchmarkProfile.BASELINE else 800),
-            reducer_latency_seconds=(
-                None if profile is BenchmarkProfile.BASELINE else 0.002
-            ),
+            reducer_latency_seconds=(None if profile is BenchmarkProfile.BASELINE else 0.002),
         )
 
     result = await TransactionalBenchmarkRunner(execute, clock=clock).run_ab(task)

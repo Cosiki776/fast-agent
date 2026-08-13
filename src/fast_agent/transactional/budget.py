@@ -149,9 +149,7 @@ class RunBudgetTracker:
 
     def _before_action(self, dimensions: Iterable[BudgetDimension]) -> BudgetDecision:
         checked = tuple(dimensions)
-        exhausted = tuple(
-            dimension for dimension in checked if self._hard_limit_reached(dimension)
-        )
+        exhausted = tuple(dimension for dimension in checked if self._hard_limit_reached(dimension))
         if exhausted:
             return BudgetDecision(allowed=False, exhausted=exhausted)
         return BudgetDecision(allowed=True, warnings=self._warnings(checked))
@@ -160,9 +158,7 @@ class RunBudgetTracker:
         self,
         dimensions: Iterable[BudgetDimension],
     ) -> tuple[BudgetDimension, ...]:
-        return tuple(
-            dimension for dimension in dimensions if self._soft_limit_reached(dimension)
-        )
+        return tuple(dimension for dimension in dimensions if self._soft_limit_reached(dimension))
 
     def _hard_limit_reached(self, dimension: BudgetDimension) -> bool:
         limit = self._limit(dimension)

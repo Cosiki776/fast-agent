@@ -16,7 +16,7 @@ from fast_agent.transactional.models import RunId, ToolCallId
 def _text_result(text: str, *, is_error: bool = False) -> CallToolResult:
     return CallToolResult(
         content=[TextContent(type="text", text=text)],
-        isError=is_error,
+        is_error=is_error,
     )
 
 
@@ -89,7 +89,7 @@ async def test_interceptor_can_return_synthetic_result_without_execution() -> No
     outcome = await execute_with_interceptor(_request(), execute, deny)
 
     assert executed is False
-    assert outcome.result.isError is True
+    assert outcome.result.is_error is True
 
 
 @pytest.mark.asyncio
@@ -117,4 +117,4 @@ async def test_call_next_rejects_second_execution() -> None:
     outcome = await execute_with_interceptor(_request(), execute, call_twice)
 
     assert calls == 1
-    assert outcome.result.isError is False
+    assert outcome.result.is_error is False

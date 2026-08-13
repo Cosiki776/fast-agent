@@ -92,7 +92,7 @@ async def test_real_write_tool_commits_after_raw_result_is_stored(tmp_path: Path
         assert output_path.read_text(encoding="utf-8") == "transactional write"
         assert message.tool_results is not None
         tool_result = message.tool_results["write-call"]
-        assert tool_result.isError is False
+        assert tool_result.is_error is False
         assert _event_kinds(event_store) == [
             ToolEventKind.PROPOSED,
             ToolEventKind.EXECUTION_STARTED,
@@ -139,8 +139,8 @@ async def test_denied_write_returns_tool_result_without_touching_workspace(
         assert output_path.exists() is False
         assert message.tool_results is not None
         tool_result = message.tool_results["denied-call"]
-        assert tool_result.isError is True
-        assert tool_result.structuredContent == {
+        assert tool_result.is_error is True
+        assert tool_result.structured_content == {
             "status": "denied",
             "reason": "workspace writes are disabled",
         }
@@ -165,7 +165,7 @@ async def test_failed_read_returns_stored_error_result(tmp_path: Path) -> None:
 
         assert message.tool_results is not None
         tool_result = message.tool_results["read-call"]
-        assert tool_result.isError is True
+        assert tool_result.is_error is True
         assert _event_kinds(event_store) == [
             ToolEventKind.PROPOSED,
             ToolEventKind.EXECUTION_STARTED,

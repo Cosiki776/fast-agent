@@ -74,7 +74,7 @@ def test_tool_events_are_frozen_after_creation() -> None:
     event = proposed_event()
 
     with pytest.raises(FrozenInstanceError, match="cannot assign to field 'tool_name'"):
-        setattr(event, "tool_name", "bash")
+        event.tool_name = "bash"  # ty: ignore[invalid-assignment]  # frozen mutation is under test
 
 
 @pytest.mark.parametrize(

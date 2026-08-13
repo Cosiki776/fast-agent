@@ -67,8 +67,8 @@ def _request(tool_name: str = "write_text_file") -> ToolExecutionRequest:
 def _result(text: str, *, is_error: bool = False) -> CallToolResult:
     return CallToolResult(
         content=[TextContent(type="text", text=text)],
-        structuredContent={"text": text},
-        isError=is_error,
+        structured_content={"text": text},
+        is_error=is_error,
     )
 
 
@@ -190,8 +190,8 @@ async def test_denial_returns_synthetic_result_without_execution(tmp_path: Path)
     outcome = await coordinator.coordinate(_request(), call_next)
 
     assert executed is False
-    assert outcome.result.isError is True
-    assert outcome.result.structuredContent == {
+    assert outcome.result.is_error is True
+    assert outcome.result.structured_content == {
         "status": "denied",
         "reason": "write access disabled",
     }
@@ -212,8 +212,8 @@ async def test_exception_becomes_explicit_failed_tool_result(tmp_path: Path) -> 
 
     outcome = await coordinator.coordinate(_request(), call_next)
 
-    assert outcome.result.isError is True
-    assert outcome.result.structuredContent == {
+    assert outcome.result.is_error is True
+    assert outcome.result.structured_content == {
         "status": "failed",
         "error_type": "OSError",
         "message": "disk unavailable",
@@ -284,7 +284,7 @@ async def test_checkpoint_creation_failure_is_fail_closed(tmp_path: Path) -> Non
     outcome = await coordinator.coordinate(_request(), call_next)
 
     assert executions == 0
-    assert outcome.result.structuredContent == {
+    assert outcome.result.structured_content == {
         "status": "checkpoint_failed",
         "error_type": "OSError",
         "message": "snapshot disk unavailable",
@@ -328,7 +328,7 @@ async def test_checkpoint_event_persistence_failure_is_fail_closed(
     outcome = await coordinator.coordinate(_request(), call_next)
 
     assert executions == 0
-    assert outcome.result.structuredContent == {
+    assert outcome.result.structured_content == {
         "status": "checkpoint_failed",
         "error_type": "OSError",
         "message": "event store unavailable",
@@ -356,7 +356,7 @@ async def test_unknown_effect_is_denied_without_execution(tmp_path: Path) -> Non
     outcome = await coordinator.coordinate(_request("unknown_local_tool"), call_next)
 
     assert executions == 0
-    assert outcome.result.structuredContent == {
+    assert outcome.result.structured_content == {
         "status": "denied",
         "reason": "tool effect is unknown: unknown_local_tool",
     }
@@ -389,7 +389,7 @@ async def test_effect_classifier_failure_is_denied_fail_closed(
     outcome = await coordinator.coordinate(_request("remote_tool"), call_next)
 
     assert executions == 0
-    assert outcome.result.structuredContent == {
+    assert outcome.result.structured_content == {
         "status": "denied",
         "reason": "tool effect is unknown: remote_tool",
     }
@@ -427,8 +427,8 @@ async def test_repeated_write_failure_rolls_back_and_returns_handoff(tmp_path: P
     outcome = await coordinator.coordinate(second_request, call_next)
 
     assert restored == ["checkpoint-call-1"]
-    assert outcome.result.structuredContent is not None
-    assert outcome.result.structuredContent["status"] == "recovery_handoff"
+    assert outcome.result.structured_content is not None
+    assert outcome.result.structured_content["status"] == "recovery_handoff"
     assert [
         item.event.kind
         for item in event_store.events_for_transaction(TransactionId("transaction-2"))
@@ -482,7 +482,7 @@ async def test_restore_mismatch_stops_with_workspace_divergence(tmp_path: Path) 
         call_next,
     )
 
-    assert outcome.result.structuredContent == {
+    assert outcome.result.structured_content == {
         "status": "workspace_divergence",
         "error_type": "RuntimeError",
         "message": "hash mismatch",
@@ -501,6 +501,7 @@ def test_raw_result_serialization_preserves_standard_mcp_fields() -> None:
         "content": [{"type": "text", "text": "完成"}],
         "structuredContent": {"text": "完成"},
         "isError": False,
+        "resultType": "complete",
     }
 
 
@@ -581,8 +582,8 @@ async def test_exhausted_tool_budget_returns_explicit_result_without_execution(
     outcome = await coordinator.coordinate(_request(), call_next)
 
     assert executed is False
-    assert outcome.result.isError is True
-    assert outcome.result.structuredContent == {
+    assert outcome.result.is_error is True
+    assert outcome.result.structured_content == {
         "status": "budget_exhausted",
         "dimensions": ["tool_calls"],
     }

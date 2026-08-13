@@ -96,9 +96,7 @@ def _execution_agent(
     coordinator = TransactionCoordinator(
         event_store,
         artifact_store,
-        result_reducer=CodingToolResultReducer(
-            ReducerLimits(max_result_bytes=512, max_items=6)
-        ),
+        result_reducer=CodingToolResultReducer(ReducerLimits(max_result_bytes=512, max_items=6)),
         transaction_id_factory=lambda: TRANSACTION_ID,
     )
     settings = Settings(
@@ -142,16 +140,20 @@ async def test_bounded_shell_result_enters_next_llm_request(tmp_path: Path) -> N
     llm = _LongShellThenDoneLlm(command)
     harness._llm = llm
     try:
-        with suppress_interactive_display(), patch.object(
-            execution_agent,
-            "_available_tool_names_for_run_tools",
-            new=AsyncMock(return_value=["bash"]),
-        ), patch.object(
-            harness.display,
-            "show_assistant_message",
-            new=AsyncMock(),
-        ), patch.object(execution_agent.display, "show_tool_call"), patch.object(
-            execution_agent.display, "show_tool_result"
+        with (
+            suppress_interactive_display(),
+            patch.object(
+                execution_agent,
+                "_available_tool_names_for_run_tools",
+                new=AsyncMock(return_value=["bash"]),
+            ),
+            patch.object(
+                harness.display,
+                "show_assistant_message",
+                new=AsyncMock(),
+            ),
+            patch.object(execution_agent.display, "show_tool_call"),
+            patch.object(execution_agent.display, "show_tool_result"),
         ):
             response = await harness.generate_impl(
                 [Prompt.user("Run the diagnostic shell command")],
@@ -159,7 +161,7 @@ async def test_bounded_shell_result_enters_next_llm_request(tmp_path: Path) -> N
                     Tool(
                         name="bash",
                         description="Run a shell command",
-                        inputSchema={
+                        input_schema={
                             "type": "object",
                             "properties": {"command": {"type": "string"}},
                             "required": ["command"],

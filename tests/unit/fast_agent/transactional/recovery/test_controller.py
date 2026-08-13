@@ -25,8 +25,8 @@ def _request(tool_name: str = "write_text_file") -> ToolExecutionRequest:
 def _failed_result(message: str = "same assertion failed") -> CallToolResult:
     return CallToolResult(
         content=[TextContent(type="text", text=message)],
-        structuredContent={"status": "failed", "message": message},
-        isError=True,
+        structured_content={"status": "failed", "message": message},
+        is_error=True,
     )
 
 
@@ -62,16 +62,16 @@ def test_policy_and_divergence_failures_abort_without_recovery() -> None:
     controller = RecoveryController()
     denied = CallToolResult(
         content=[TextContent(type="text", text="denied")],
-        structuredContent={"status": "denied", "message": "denied"},
-        isError=True,
+        structured_content={"status": "denied", "message": "denied"},
+        is_error=True,
     )
     diverged = CallToolResult(
         content=[TextContent(type="text", text="restore mismatch")],
-        structuredContent={
+        structured_content={
             "status": "workspace_divergence",
             "message": "restore mismatch",
         },
-        isError=True,
+        is_error=True,
     )
 
     assert (
@@ -100,5 +100,5 @@ def test_handoff_result_is_bounded_and_machine_readable() -> None:
     content = result.content[0]
     assert isinstance(content, TextContent)
     assert len(content.text.encode()) <= 512
-    assert result.structuredContent is not None
-    assert result.structuredContent["status"] == "recovery_handoff"
+    assert result.structured_content is not None
+    assert result.structured_content["status"] == "recovery_handoff"

@@ -183,7 +183,9 @@ def _validate_supported_repository(root: Path) -> None:
         None,
     )
     if nested is not None:
-        raise UnsupportedWorkspaceError(f"Nested Git repositories are not supported: {nested.parent}")
+        raise UnsupportedWorkspaceError(
+            f"Nested Git repositories are not supported: {nested.parent}"
+        )
 
 
 def _workspace_file(root: Path, relative_path: str, kind: WorkspaceFileKind) -> WorkspaceFile:

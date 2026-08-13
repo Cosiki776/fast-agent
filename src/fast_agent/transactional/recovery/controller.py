@@ -137,8 +137,8 @@ def recovery_handoff_result(
     )
     return CallToolResult(
         content=[TextContent(type="text", text=text)],
-        structuredContent={"status": "recovery_handoff", "handoff": asdict(handoff)},
-        isError=True,
+        structured_content={"status": "recovery_handoff", "handoff": asdict(handoff)},
+        is_error=True,
     )
 
 

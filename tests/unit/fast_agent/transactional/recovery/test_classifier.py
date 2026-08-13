@@ -26,8 +26,8 @@ def _error(status: str, message: str, *, error_type: str = "") -> CallToolResult
         structured["error_type"] = error_type
     return CallToolResult(
         content=[TextContent(type="text", text=message)],
-        structuredContent=structured,
-        isError=True,
+        structured_content=structured,
+        is_error=True,
     )
 
 

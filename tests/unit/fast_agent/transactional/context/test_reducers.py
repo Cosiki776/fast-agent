@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from mcp.types import CallToolResult, TextContent
 
+from fast_agent.mcp.tool_result_metadata import update_tool_result_display_metadata
 from fast_agent.transactional.context.reducers import (
     CodingToolResultReducer,
     ReducerLimits,
@@ -25,10 +26,9 @@ def _request(command: str) -> ToolExecutionRequest:
 def _result(text: str, *, exit_code: int) -> CallToolResult:
     result = CallToolResult(
         content=[TextContent(type="text", text=text)],
-        isError=exit_code != 0,
+        is_error=exit_code != 0,
     )
-    assert result.model_extra is not None
-    result.model_extra["exit_code"] = exit_code
+    update_tool_result_display_metadata(result, {"exit_code": exit_code})
     return result
 
 
@@ -63,7 +63,7 @@ def test_pytest_reducer_extracts_failures_and_bounds_long_output() -> None:
     assert "AssertionError: expected accepted order" in text
     assert f"full_output_artifact: {ARTIFACT_ID}" in text
     assert "captured log line 19999" not in text
-    assert reduced.isError is True
+    assert reduced.is_error is True
 
 
 def test_git_diff_reducer_reports_files_counts_and_bounded_hunks() -> None:
@@ -107,9 +107,7 @@ def test_shell_fallback_preserves_exit_code_and_head_tail() -> None:
 
 
 def test_single_item_fallback_does_not_expand_tail() -> None:
-    reducer = CodingToolResultReducer(
-        ReducerLimits(max_result_bytes=512, max_items=1)
-    )
+    reducer = CodingToolResultReducer(ReducerLimits(max_result_bytes=512, max_items=1))
 
     text = _text(
         reducer(

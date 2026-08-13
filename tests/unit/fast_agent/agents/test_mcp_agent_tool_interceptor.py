@@ -32,14 +32,35 @@ class RecordingShellRuntime:
         self.tool = Tool(
             name="execute",
             description="Run a shell command",
-            inputSchema={"type": "object", "properties": {"command": {"type": "string"}}},
+            input_schema={"type": "object", "properties": {"command": {"type": "string"}}},
         )
+        self.tools = [self.tool]
         self.calls: list[str] = []
         self.active_calls = 0
         self.max_active_calls = 0
 
-    def metadata(self, command: str | None) -> dict[str, object]:
-        return {"variant": "shell", "command": command}
+    def owns_tool(self, name: str) -> bool:
+        return name == self.tool.name
+
+    def metadata(self, arguments: dict[str, object]) -> dict[str, object]:
+        return {"variant": "shell", "command": arguments.get("command")}
+
+    async def call_tool(
+        self,
+        name: str,
+        arguments: dict[str, object] | None = None,
+        tool_use_id: str | None = None,
+        *,
+        show_tool_call_id: bool = False,
+        defer_display_to_tool_result: bool = False,
+    ) -> CallToolResult:
+        assert self.owns_tool(name)
+        return await self.execute(
+            arguments,
+            tool_use_id,
+            show_tool_call_id=show_tool_call_id,
+            defer_display_to_tool_result=defer_display_to_tool_result,
+        )
 
     async def execute(
         self,
@@ -59,7 +80,7 @@ class RecordingShellRuntime:
         self.calls.append(f"end:{tool_use_id}:{command}")
         return CallToolResult(
             content=[TextContent(type="text", text=f"ran {command}")],
-            isError=False,
+            is_error=False,
         )
 
 

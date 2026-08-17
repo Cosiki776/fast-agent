@@ -6,6 +6,8 @@ from typing import TYPE_CHECKING, Any, Final, cast
 from uuid import uuid4
 
 from mcp_types import ContentBlock, TextContent
+from openai import APIError, AsyncOpenAI
+from pydantic import ValidationError
 
 from fast_agent.core.exceptions import ModelConfigError, ProviderKeyError
 from fast_agent.llm.provider.openai.responses import ResponsesLLM
@@ -25,6 +27,7 @@ from fast_agent.llm.provider.openai.web_tools import (
     ResolvedOpenAIWebSearch,
     build_xai_web_search_tool,
 )
+from fast_agent.llm.provider.openai.xai_image_uploads import XAIImageUploadManager
 from fast_agent.llm.provider_types import Provider
 from fast_agent.llm.usage_tracking import TurnUsage, usage_from_responses_compatible
 
@@ -39,7 +42,7 @@ if TYPE_CHECKING:
     from fast_agent.types import RequestParams
 
 DEFAULT_XAI_MODEL = "grok-4.6"
-GROK_45_HIGH_STREAMING_TIMEOUT: Final = 300.0
+GROK_EXTENDED_STREAMING_TIMEOUT: Final = 300.0
 XAI_BASE_URL = "https://api.x.ai/v1"
 XAI_EXPERIMENTAL_STREAMING_MODELS: Final = frozenset({"grok-4.5", "grok-4.6"})
 XAI_X_SEARCH_INTERNAL_TOOL_NAMES = frozenset(
@@ -80,6 +83,13 @@ class XAIResponsesLLM(ResponsesLLM):
             bool(x_search_override) if isinstance(x_search_override, bool) else None
         )
         self._prompt_cache_key = uuid4().hex
+        settings = self._xai_settings()
+        self._image_upload_manager = (
+            XAIImageUploadManager(settings.image_upload_ttl_seconds)
+            if settings is not None and settings.image_upload_mode == "public_url"
+            else None
+        )
+        self._image_upload_warning_emitted = False
 
     def _apply_reasoning_streaming_timeout_default(self) -> None:
         params = self.default_request_params
@@ -88,8 +98,11 @@ class XAIResponsesLLM(ResponsesLLM):
             and "streaming_timeout" in self._init_request_params.model_fields_set
         ):
             return
-        if params.model == "grok-4.5" and self._resolve_reasoning_effort() == "high":
-            params.streaming_timeout = GROK_45_HIGH_STREAMING_TIMEOUT
+        effort = self._resolve_reasoning_effort()
+        if (params.model == "grok-4.5" and effort == "high") or (
+            params.model == "grok-4.6" and effort in {"high", "xhigh"}
+        ):
+            params.streaming_timeout = GROK_EXTENDED_STREAMING_TIMEOUT
 
     def _initialize_default_params(self, kwargs: dict[str, Any]) -> RequestParams:
         params = self._initialize_default_params_with_model_fallback(
@@ -207,6 +220,37 @@ class XAIResponsesLLM(ResponsesLLM):
         settings = self._xai_settings()
         return settings.default_headers if settings is not None else None
 
+    async def _normalize_input_image_part(
+        self,
+        client: AsyncOpenAI,
+        part: dict[str, Any],
+    ) -> tuple[dict[str, Any], bool]:
+        manager = self._image_upload_manager
+        image_url = part.get("image_url")
+        if manager is None or not isinstance(image_url, str):
+            return await super()._normalize_input_image_part(client, part)
+
+        try:
+            public_url = await manager.public_url(client, image_url)
+        except (APIError, ValidationError):
+            if not self._image_upload_warning_emitted:
+                self.logger.warning(
+                    "xAI image upload failed; falling back to inline image data for this session."
+                )
+                self._image_upload_warning_emitted = True
+            return part, False
+
+        if public_url is None:
+            return await super()._normalize_input_image_part(client, part)
+
+        normalized: dict[str, Any] = {
+            "type": "input_image",
+            "image_url": public_url,
+        }
+        if detail := part.get("detail"):
+            normalized["detail"] = detail
+        return normalized, True
+
     def _build_websocket_headers(self) -> dict[str, str]:
         headers = dict(self._default_headers() or {})
         headers.setdefault("Authorization", f"Bearer {self._api_key()}")
@@ -239,6 +283,18 @@ class XAIResponsesLLM(ResponsesLLM):
         for item in items:
             item.pop("id", None)
         return items
+
+    def _input_item_dedupe_key(self, item: dict[str, Any]) -> tuple[str, ...] | None:
+        key = super()._input_item_dedupe_key(item)
+        encrypted_content = item.get("encrypted_content")
+        if (
+            key is not None
+            and item.get("type") == "reasoning"
+            and isinstance(encrypted_content, str)
+            and encrypted_content
+        ):
+            return (*key, encrypted_content)
+        return key
 
     def _websocket_keepalive_options(self) -> ResponsesWebSocketKeepaliveOptions:
         # xAI currently doesn't reliably answer client-generated Ping frames.

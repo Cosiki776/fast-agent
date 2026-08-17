@@ -760,8 +760,16 @@ def test_xai_streaming_timeout_query_overrides_high_reasoning_default(
     assert llm.default_request_params.streaming_timeout == expected_timeout
 
 
-def test_xai_grok_45_high_reasoning_defaults_to_extended_streaming_timeout() -> None:
-    factory = ModelFactory.create_factory("xai/grok-4.5?reasoning=high")
+@pytest.mark.parametrize(
+    "model",
+    [
+        "xai/grok-4.5?reasoning=high",
+        "xai/grok-4.6?reasoning=high",
+        "xai/grok-4.6?reasoning=xhigh",
+    ],
+)
+def test_xai_high_reasoning_defaults_to_extended_streaming_timeout(model: str) -> None:
+    factory = ModelFactory.create_factory(model)
     llm = factory(
         LlmAgent(AgentConfig(name="Test Agent")),
         request_params=RequestParams(use_history=False),
@@ -892,6 +900,16 @@ def test_huggingface_alias_without_provider():
     config = ModelFactory.parse_model_string("kimi", presets=TEST_ALIASES)
     assert config.provider == Provider.HUGGINGFACE
     assert config.model_name == "moonshotai/Kimi-K2-Instruct-0905"
+
+
+def test_glimmer_alias_uses_together_with_recommended_sampling() -> None:
+    config = ModelFactory.parse_model_string("glimmer")
+
+    assert config.provider == Provider.HUGGINGFACE
+    assert config.model_name == "meta-models/Muse-Glimmer-30B:together"
+    assert config.temperature == 1.0
+    assert config.top_p == 0.95
+    assert config.top_k == 64
 
 
 def test_builtin_glm_alias_uses_glm_52_default() -> None:

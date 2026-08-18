@@ -62,6 +62,25 @@ resolved from the process current working directory.
 `llm_retries` defaults to `2` and is the preferred way to control retry attempts. If unset in
 config, the `FAST_AGENT_RETRIES` environment variable is used as a fallback.
 
+## Transactional Coding Runtime
+
+The compatibility default is `baseline`. `reducer` enables durable evidence and bounded tool
+results; `full` additionally creates an isolated Git worktree with checkpoints and bounded
+recovery. Policy approval and final workspace promotion are separate stages.
+
+```yaml
+transactional:
+  profile: baseline  # baseline | reducer | full
+  mode: coding
+  keep_worktree: true
+  max_tool_calls: 80
+  max_llm_calls: 20
+  max_wall_time_seconds: 1800
+  max_artifact_output_bytes: 33554432
+  max_tokens: null
+  max_recovery_attempts: 3
+```
+
 ## Namespaced Model References
 
 Use `model_references` to create exact-token model references such as `$system.fast` and reuse them in

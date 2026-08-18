@@ -46,6 +46,7 @@ from fast_agent.mcp.server_declaration import (
 from fast_agent.plugins.models import PluginContributions, PluginPostUserTurnSpec
 from fast_agent.tools.environment_config import EnvironmentSpec
 from fast_agent.tools.shell_profiles import ShellToolProfile
+from fast_agent.transactional.settings import TransactionalSettings
 from fast_agent.types.streaming import StreamingMode
 from fast_agent.utils.action_normalization import (
     FALSE_ACTION_ALIASES,
@@ -2275,6 +2276,9 @@ class Settings(BaseSettings):
 
     harness_app: HarnessAppSettings = Field(default_factory=HarnessAppSettings)
     """Harness application boundary configuration."""
+
+    transactional: TransactionalSettings = Field(default_factory=TransactionalSettings)
+    """Transactional coding runtime profile and run budgets."""
 
     execution_engine: Literal["asyncio"] = "asyncio"
     """Execution engine for the fast-agent application"""

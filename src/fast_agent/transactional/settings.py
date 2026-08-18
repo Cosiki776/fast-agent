@@ -32,6 +32,7 @@ class TransactionalSettings(BaseModel):
     max_artifact_output_bytes: NonNegativeInt | None = 32 * 1024 * 1024
     max_tokens: NonNegativeInt | None = None
     max_recovery_attempts: NonNegativeInt | None = 3
+    shell_terminal_timeout_seconds: NonNegativeFloat = 300
 
     def budget_limits(self) -> RunBudgetLimits:
         return RunBudgetLimits(

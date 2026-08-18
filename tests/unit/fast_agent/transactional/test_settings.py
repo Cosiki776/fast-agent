@@ -27,6 +27,9 @@ def test_negative_transactional_budget_is_rejected() -> None:
     with pytest.raises(ValidationError):
         TransactionalSettings.model_validate({"max_tool_calls": -1})
 
+    with pytest.raises(ValidationError):
+        TransactionalSettings.model_validate({"shell_terminal_timeout_seconds": -1})
+
 
 def test_transactional_profile_loads_from_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("TRANSACTIONAL__PROFILE", "reducer")

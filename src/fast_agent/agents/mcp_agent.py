@@ -130,6 +130,7 @@ from fast_agent.tools.shell_runtime import ShellRuntime
 from fast_agent.tools.skill_reader import READ_SKILL_TOOL_NAME, SkillReader
 from fast_agent.transactional.execution import (
     ToolExecutionRequest,
+    ToolExecutionUncertainError,
     execute_with_interceptor,
 )
 from fast_agent.transactional.models import ToolCallId
@@ -303,14 +304,6 @@ class McpAgent(ABC, ToolAgent):
         # Register the interactive elicitation handler so local tools can call it
         # without importing MCP types. This avoids circular imports and ensures the callback is ready.
         self._register_mcp_elicitation_adapter()
-
-    def _clone_constructor_kwargs(self) -> dict[str, Any]:
-        """Preserve the execution boundary when cloning an active transactional agent."""
-        kwargs = super()._clone_constructor_kwargs()
-        if self._tool_execution_interceptor is not None:
-            kwargs["transactional_run_id"] = self._transactional_run_id
-            kwargs["tool_execution_interceptor"] = self._tool_execution_interceptor
-        return kwargs
 
     def _managed_mcp_setup(
         self,
@@ -535,14 +528,40 @@ class McpAgent(ABC, ToolAgent):
             access_modes=("[red]direct[/red]",),
         )
 
-    def bind_transactional_workspace(self, workspace: Path) -> None:
+    def bind_transactional_workspace(
+        self,
+        workspace: Path,
+        *,
+        shell_terminal_timeout_seconds: float,
+        remaining_run_seconds: Callable[[], float | None],
+    ) -> None:
         """Bind this agent's supported local shell and filesystem to one Run worktree."""
         root = workspace.resolve()
         self.enable_shell(root)
-        local_runtime = self._local_filesystem_runtime()
-        if local_runtime is None:
-            raise RuntimeError("Transactional coding requires a local filesystem runtime")
+        if self._shell_runtime is None:
+            raise RuntimeError("Transactional coding requires a shell runtime")
+        from fast_agent.tools.shell_runtime import ShellTerminalExecutionPolicy
+
+        self._shell_runtime.set_terminal_execution_policy(
+            ShellTerminalExecutionPolicy(
+                max_seconds=shell_terminal_timeout_seconds,
+                remaining_run_seconds=remaining_run_seconds,
+            )
+        )
+        edit_flags = self._shell_edit_tool_flags()
+        local_runtime = LocalFilesystemRuntime(
+            self.logger,
+            working_directory=root,
+            enable_read=self._shell_read_text_file_enabled(),
+            enable_write=edit_flags.write_text_file,
+            enable_apply_patch=edit_flags.apply_patch,
+            enable_edit_file=edit_flags.edit_file,
+            enable_attach_media=self._shell_attach_media_mode(),
+            model_info=self.llm.model_info if self.llm else None,
+            tool_handler_resolver=self._get_tool_handler,
+        )
         local_runtime.restrict_to_directory(root)
+        self._filesystem_runtime = local_runtime
 
     async def get_server_status(self) -> dict[str, ServerStatus]:
         """Expose server status details for UI and diagnostics consumers."""
@@ -666,8 +685,12 @@ class McpAgent(ABC, ToolAgent):
         return config
 
     def _clone_constructor_kwargs(self) -> dict[str, Any]:
+        """Preserve shell and transactional execution boundaries in detached clones."""
         kwargs = super()._clone_constructor_kwargs()
         kwargs["shell_environment"] = self._shell_environment
+        if self._tool_execution_interceptor is not None:
+            kwargs["transactional_run_id"] = self._transactional_run_id
+            kwargs["tool_execution_interceptor"] = self._tool_execution_interceptor
         return kwargs
 
     def _temporary_artifact_environment(self) -> EnvironmentTemporaryArtifacts | None:
@@ -1971,9 +1994,10 @@ class McpAgent(ABC, ToolAgent):
         if should_parallel and planned_calls:
             self.display.show_parallel_tool_calls(
                 [
-                    request
+                    display_request
                     for call in planned_calls
-                    if (request := self._planned_mcp_tool_call_display_request(call)) is not None
+                    if (display_request := self._planned_mcp_tool_call_display_request(call))
+                    is not None
                 ]
             )
             await self._run_parallel_planned_tool_calls(
@@ -2090,6 +2114,8 @@ class McpAgent(ABC, ToolAgent):
         display_requests: list[ToolResultDisplayRequest] = []
         presentation_errors: list[Exception] = []
         for call, item in zip(planned_calls, results, strict=True):
+            if isinstance(item, ToolExecutionUncertainError):
+                raise item
             if isinstance(item, BaseException):
                 self.logger.error(f"MCP tool {call.display_tool_name} failed: {item}")
                 result = CallToolResult(
@@ -2153,6 +2179,8 @@ class McpAgent(ABC, ToolAgent):
                 if display_request is not None:
                     self._show_tool_result_display_request(display_request)
                 self.logger.debug(f"MCP tool {call.display_tool_name} executed successfully")
+            except ToolExecutionUncertainError:
+                raise
             except Exception as e:
                 self.logger.error(f"MCP tool {call.display_tool_name} failed: {e}")
                 error_result = CallToolResult(

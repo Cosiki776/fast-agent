@@ -76,6 +76,19 @@ def test_wall_time_uses_injected_monotonic_clock() -> None:
     assert tracker.snapshot.elapsed_seconds == 5.0
 
 
+def test_remaining_wall_time_is_bounded_at_zero() -> None:
+    now = 10.0
+
+    def clock() -> float:
+        return now
+
+    tracker = RunBudgetTracker(RunBudgetLimits(max_wall_time_seconds=5), clock=clock)
+    now = 12.0
+    assert tracker.remaining_wall_time_seconds() == 3.0
+    now = 20.0
+    assert tracker.remaining_wall_time_seconds() == 0.0
+
+
 def test_recovery_budget_has_a_separate_controlled_action() -> None:
     tracker = RunBudgetTracker(RunBudgetLimits(max_recovery_attempts=1))
 
@@ -85,6 +98,22 @@ def test_recovery_budget_has_a_separate_controlled_action() -> None:
     assert decision.allowed is False
     assert decision.exhausted == (BudgetDimension.RECOVERY_ATTEMPTS,)
     assert tracker.snapshot.recovery_attempts == 1
+
+
+def test_recovery_remains_available_after_wall_time_is_exhausted() -> None:
+    now = 0.0
+
+    def clock() -> float:
+        return now
+
+    tracker = RunBudgetTracker(
+        RunBudgetLimits(max_wall_time_seconds=1, max_recovery_attempts=1),
+        clock=clock,
+    )
+    now = 1.0
+
+    assert tracker.start_recovery().allowed is True
+    assert tracker.start_llm_call().exhausted == (BudgetDimension.WALL_TIME,)
 
 
 def test_budget_limits_reject_negative_values() -> None:

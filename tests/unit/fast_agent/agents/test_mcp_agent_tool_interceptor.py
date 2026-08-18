@@ -16,7 +16,10 @@ from fast_agent.agents.agent_types import AgentConfig
 from fast_agent.agents.mcp_agent import McpAgent
 from fast_agent.agents.mcp_tool_planning import McpToolRoute, PlannedMcpToolCall
 from fast_agent.context import Context
-from fast_agent.transactional.execution import ToolExecutionOutcome
+from fast_agent.transactional.execution import (
+    ToolExecutionOutcome,
+    ToolExecutionUncertainError,
+)
 from fast_agent.transactional.models import RunId
 from fast_agent.types import PromptMessageExtended
 
@@ -85,6 +88,19 @@ class RecordingShellRuntime:
         )
 
 
+class UncertainShellRuntime(RecordingShellRuntime):
+    async def execute(
+        self,
+        arguments: dict[str, object] | None = None,
+        tool_use_id: str | None = None,
+        *,
+        show_tool_call_id: bool = False,
+        defer_display_to_tool_result: bool = False,
+    ) -> CallToolResult:
+        del arguments, tool_use_id, show_tool_call_id, defer_display_to_tool_result
+        raise ToolExecutionUncertainError("termination could not be confirmed")
+
+
 def _tool_request() -> PromptMessageExtended:
     return PromptMessageExtended(
         role="assistant",
@@ -128,6 +144,24 @@ def _agent(
     agent._shell_runtime = cast("Any", shell_runtime)
     agent._shell_runtime_enabled = True
     return agent, shell_runtime
+
+
+@pytest.mark.asyncio
+async def test_clone_preserves_transactional_execution_boundary() -> None:
+    async def interceptor(
+        request: ToolExecutionRequest,
+        call_next: ToolCallNext,
+    ) -> ToolExecutionOutcome:
+        del request
+        return await call_next()
+
+    agent, _ = _agent(interceptor=interceptor)
+
+    kwargs = agent._clone_constructor_kwargs()
+
+    assert kwargs["transactional_run_id"] == RunId("run-1")
+    assert kwargs["tool_execution_interceptor"] is interceptor
+    assert kwargs["shell_environment"] is agent._shell_environment
 
 
 @pytest.mark.asyncio
@@ -188,6 +222,17 @@ async def test_interceptor_receives_each_id_and_forces_sequential_execution() ->
     ]
     assert result.tool_results is not None
     assert list(result.tool_results) == ["call-1", "call-2"]
+    await agent._aggregator.close()
+
+
+@pytest.mark.asyncio
+async def test_parallel_summary_rethrows_uncertain_tool_outcome() -> None:
+    agent, _ = _agent()
+    agent._shell_runtime = cast("Any", UncertainShellRuntime())
+
+    with pytest.raises(ToolExecutionUncertainError, match="termination could not be confirmed"):
+        await agent.run_tools(_tool_request())
+
     await agent._aggregator.close()
 
 

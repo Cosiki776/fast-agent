@@ -62,7 +62,7 @@ def test_reducer_profile_omits_worktree_and_recovery(tmp_path: Path) -> None:
         runtime.close()
 
 
-def test_full_profile_requires_matching_run_worktree(tmp_path: Path) -> None:
+def test_full_profile_requires_run_worktree(tmp_path: Path) -> None:
     assembler = TransactionalRuntimeAssembler(
         TransactionalSettings(profile=TransactionalProfile.FULL),
         tmp_path / "runtime",

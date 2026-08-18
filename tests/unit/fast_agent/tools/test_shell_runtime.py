@@ -39,8 +39,9 @@ from fast_agent.tools.execution_environment import (
 from fast_agent.tools.local_shell_executor import LocalShellExecutor
 from fast_agent.tools.process_resources import ProcessResourceSnapshot
 from fast_agent.tools.shell_output import ShellOutputBuffer
-from fast_agent.tools.shell_runtime import ShellRuntime
+from fast_agent.tools.shell_runtime import ShellRuntime, ShellTerminalExecutionPolicy
 from fast_agent.tools.shell_tool_definitions import parse_poll_process_arguments
+from fast_agent.transactional.execution import ToolExecutionUncertainError
 from fast_agent.ui import console
 from fast_agent.ui.display_suppression import (
     InteractiveDisplayMode,
@@ -3625,3 +3626,111 @@ async def test_execute_emits_terminal_failed_progress_when_subprocess_start_fail
     assert progress_payloads[1]["details"] == "failed: spawn failed"
     assert progress_payloads[1]["tool_state"] == "failed"
     assert progress_payloads[1]["tool_terminal"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        {"command": "server", "background": True},
+        {"command": "server &"},
+        {"command": "nohup server"},
+    ],
+)
+async def test_transactional_terminal_policy_rejects_detachment_before_start(
+    arguments: dict[str, Any],
+) -> None:
+    environment = _RecordingShellEnvironment()
+    runtime = ShellRuntime(
+        activation_reason="test",
+        logger=logging.getLogger("shell-runtime-test"),
+        shell_environment=environment,
+        terminal_execution_policy=ShellTerminalExecutionPolicy(
+            max_seconds=1,
+            remaining_run_seconds=lambda: 1,
+        ),
+    )
+
+    result = await runtime.execute(arguments)
+
+    assert result.is_error is True
+    assert environment.requests == []
+
+
+@pytest.mark.asyncio
+async def test_transactional_terminal_policy_times_out_and_terminates_managed_process() -> None:
+    environment = _ManagedShellEnvironment()
+    runtime = ShellRuntime(
+        activation_reason="test",
+        logger=logging.getLogger("shell-runtime-test"),
+        shell_environment=environment,
+        terminal_execution_policy=ShellTerminalExecutionPolicy(
+            max_seconds=1,
+            remaining_run_seconds=lambda: 0.01,
+        ),
+    )
+
+    result = await runtime.execute({"command": "hang"})
+
+    assert result.is_error is True
+    assert environment.cancelled is True
+    assert len(environment.requests) == 1
+    assert isinstance(result.content[0], TextContent)
+    assert "outcome: timed_out" in result.content[0].text
+
+
+@pytest.mark.asyncio
+async def test_transactional_terminal_policy_fails_closed_when_termination_is_unconfirmed() -> None:
+    environment = _FailedCancellationShellEnvironment()
+    runtime = ShellRuntime(
+        activation_reason="test",
+        logger=logging.getLogger("shell-runtime-test"),
+        shell_environment=environment,
+        terminal_execution_policy=ShellTerminalExecutionPolicy(
+            max_seconds=0.01,
+            remaining_run_seconds=lambda: 1,
+        ),
+    )
+
+    with pytest.raises(ToolExecutionUncertainError, match="termination could not be confirmed"):
+        await runtime.execute({"command": "hang"})
+
+
+@pytest.mark.asyncio
+async def test_transactional_cancellation_fails_closed_when_termination_is_unconfirmed() -> None:
+    environment = _FailedCancellationShellEnvironment()
+    runtime = ShellRuntime(
+        activation_reason="test",
+        logger=logging.getLogger("shell-runtime-test"),
+        shell_environment=environment,
+        terminal_execution_policy=ShellTerminalExecutionPolicy(
+            max_seconds=10,
+            remaining_run_seconds=lambda: 10,
+        ),
+    )
+    execution = asyncio.create_task(runtime.execute({"command": "hang"}))
+    await environment.started.wait()
+
+    execution.cancel()
+
+    with pytest.raises(ToolExecutionUncertainError, match="termination could not be confirmed"):
+        await execution
+
+
+@pytest.mark.asyncio
+async def test_transactional_terminal_policy_returns_only_completed_success() -> None:
+    environment = _RecordingShellEnvironment()
+    runtime = ShellRuntime(
+        activation_reason="test",
+        logger=logging.getLogger("shell-runtime-test"),
+        shell_environment=environment,
+        terminal_execution_policy=ShellTerminalExecutionPolicy(
+            max_seconds=1,
+            remaining_run_seconds=lambda: 1,
+        ),
+    )
+
+    result = await runtime.execute({"command": "true"})
+
+    assert result.is_error is False
+    assert len(environment.requests) == 1

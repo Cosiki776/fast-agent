@@ -72,6 +72,7 @@ recovery. Policy approval and final workspace promotion are separate stages.
 transactional:
   profile: baseline  # baseline | reducer | full
   mode: coding
+  shell_terminal_timeout_seconds: 300
   keep_worktree: true
   max_tool_calls: 80
   max_llm_calls: 20

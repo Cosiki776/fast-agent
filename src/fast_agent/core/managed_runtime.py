@@ -196,6 +196,11 @@ class ManagedRuntimeMixin:
                 run_budget=(
                     transactional_runtime.budget if transactional_runtime is not None else None
                 ),
+                shell_terminal_timeout_seconds=(
+                    transactional_runtime.shell_terminal_timeout_seconds
+                    if transactional_runtime is not None
+                    else None
+                ),
             )
 
             tool_only_agents = {

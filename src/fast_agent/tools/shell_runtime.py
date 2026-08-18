@@ -9,7 +9,7 @@ import tempfile
 import time
 from collections import deque
 from contextlib import nullcontext, suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, TypedDict, cast
 
@@ -17,7 +17,7 @@ from mcp_types import CallToolResult, TextContent, Tool
 from rich.text import Text
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
+    from collections.abc import Callable, Mapping
 
     from fast_agent.config import Settings
     from fast_agent.tools.execution_environment import ShellEnvironment, ShellExecutionResult
@@ -94,6 +94,7 @@ from fast_agent.tools.shell_tool_definitions import (
     set_poll_process_tool_default_wait_seconds,
 )
 from fast_agent.tools.tool_sources import SHELL_TOOL_SOURCE, set_tool_source
+from fast_agent.transactional.execution import ToolExecutionUncertainError
 from fast_agent.ui import console
 from fast_agent.ui.console_display import ConsoleDisplay
 from fast_agent.ui.display_suppression import display_tools_enabled
@@ -141,6 +142,23 @@ def _text_result(message: str, *, is_error: bool) -> CallToolResult:
         is_error=is_error,
         content=[TextContent(type="text", text=message)],
     )
+
+
+@dataclass(frozen=True, slots=True)
+class ShellTerminalExecutionPolicy:
+    """Require a shell call to reach a terminal state within one deadline."""
+
+    max_seconds: float
+    remaining_run_seconds: Callable[[], float | None]
+
+    def deadline_seconds(self, requested_seconds: float | None) -> float:
+        candidates = [self.max_seconds]
+        remaining = self.remaining_run_seconds()
+        if remaining is not None:
+            candidates.append(remaining)
+        if requested_seconds is not None:
+            candidates.append(requested_seconds)
+        return min(candidates)
 
 
 @dataclass(slots=True)
@@ -201,6 +219,7 @@ class ShellRuntime:
         tool_profile: ShellToolProfile | None = None,
         model_tool_profile: ResolvedShellToolProfile | None = None,
         foreground_auto_await_max_seconds: float | None = None,
+        terminal_execution_policy: ShellTerminalExecutionPolicy | None = None,
     ) -> None:
         self._working_directory = str(working_directory) if working_directory is not None else None
         self._environment = shell_environment or LocalShellExecutor(
@@ -227,6 +246,7 @@ class ShellRuntime:
         self._foreground_auto_await_max_seconds = float(
             _default_foreground_auto_await_max_seconds()
         )
+        self._terminal_execution_policy = terminal_execution_policy
         self._minimal_shell_tool_name = minimal_shell_tool_name
         self._minimal_shell_tool_requires_description = minimal_shell_tool_requires_description
         self._extended_guidance = extended_guidance
@@ -540,6 +560,12 @@ class ShellRuntime:
     def set_working_directory(self, working_directory: Path | None) -> None:
         """Set the working directory used for shell execution."""
         self._working_directory = str(working_directory) if working_directory is not None else None
+
+    def set_terminal_execution_policy(
+        self,
+        policy: ShellTerminalExecutionPolicy | None,
+    ) -> None:
+        self._terminal_execution_policy = policy
 
     def runtime_info(self) -> ShellRuntimeInfo:
         """Best-effort detection of the shell runtime used for execution.
@@ -1411,14 +1437,31 @@ class ShellRuntime:
         return metadata
 
     @staticmethod
-    async def _terminate_managed_process_task(process: ManagedShellProcess) -> None:
+    async def _terminate_managed_process_task(
+        process: ManagedShellProcess,
+        *,
+        confirm: bool = False,
+    ) -> None:
         """Request process-group termination and wait for the environment contract."""
         if process.task.done():
+            if confirm and not process.task.cancelled() and process.task.exception() is not None:
+                raise ToolExecutionUncertainError(
+                    "shell process termination could not be confirmed"
+                ) from process.task.exception()
             return
         process.terminated = True
         process.request.terminate_on_cancel = True
         process.task.cancel()
-        await asyncio.gather(process.task, return_exceptions=True)
+        results = await asyncio.gather(process.task, return_exceptions=True)
+        failure = results[0]
+        if (
+            confirm
+            and isinstance(failure, BaseException)
+            and not isinstance(failure, asyncio.CancelledError)
+        ):
+            raise ToolExecutionUncertainError(
+                "shell process termination could not be confirmed"
+            ) from failure
 
     def _record_buffered_process_result(self, process: ManagedShellProcess) -> None:
         if process.buffered_result_recorded or not process.task.done():
@@ -2071,6 +2114,23 @@ class ShellRuntime:
         show_tool_call_id: bool,
         defer_display_to_tool_result: bool,
     ) -> CallToolResult:
+        terminal_policy = self._terminal_execution_policy
+        if terminal_policy is not None:
+            detachment = classify_shell_detachment(
+                parsed.command,
+                run_in_background=parsed.background,
+            )
+            if parsed.background or parsed.lifecycle == "persistent" or detachment != "none":
+                return self._invalid_execute_result(
+                    "transactional full profile requires a foreground, session-scoped command"
+                )
+            deadline = terminal_policy.deadline_seconds(parsed.hard_timeout_seconds)
+            if deadline <= 0:
+                return self._invalid_execute_result(
+                    "transactional shell deadline is already exhausted"
+                )
+            parsed = replace(parsed, hard_timeout_seconds=deadline)
+
         idle_yield_seconds = (
             self._idle_yield_seconds
             if parsed.yield_after_idle_sec is None
@@ -2122,7 +2182,10 @@ class ShellRuntime:
                         return_when=asyncio.ALL_COMPLETED,
                     )
                     if process.task not in completed:
-                        await self._terminate_managed_process_task(process)
+                        await self._terminate_managed_process_task(
+                            process,
+                            confirm=terminal_policy is not None,
+                        )
                         result = self._managed_process_result(process)
                         for block in result.content:
                             if isinstance(block, TextContent):
@@ -2134,6 +2197,12 @@ class ShellRuntime:
                         metadata = process_result_metadata(result)
                         if metadata is not None:
                             metadata["process_status"] = "timed_out"
+                        result.structured_content = {
+                            "status": "timeout",
+                            "message": (
+                                f"shell command timed out after {parsed.hard_timeout_seconds:g}s"
+                            ),
+                        }
                         result.is_error = True
                         self._progress.emit(
                             action=ProgressAction.TOOL_PROGRESS,
@@ -2252,11 +2321,23 @@ class ShellRuntime:
 
             except asyncio.CancelledError:
                 if process is not None and process.lifecycle == "session":
-                    await self._terminate_managed_process_task(process)
+                    await self._terminate_managed_process_task(
+                        process,
+                        confirm=terminal_policy is not None,
+                    )
                 self._progress.emit(
                     action=ProgressAction.TOOL_PROGRESS,
                     tool_use_id=tool_use_id,
                     details="cancelled",
+                    tool_state="failed",
+                    tool_terminal=True,
+                )
+                raise
+            except ToolExecutionUncertainError:
+                self._progress.emit(
+                    action=ProgressAction.TOOL_PROGRESS,
+                    tool_use_id=tool_use_id,
+                    details="failed: shell process termination could not be confirmed",
                     tool_state="failed",
                     tool_terminal=True,
                 )

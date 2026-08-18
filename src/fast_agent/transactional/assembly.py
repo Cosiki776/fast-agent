@@ -34,6 +34,7 @@ class TransactionalRuntime:
     artifact_store: FileArtifactStore
     budget: RunBudgetTracker
     coordinator: TransactionCoordinator
+    shell_terminal_timeout_seconds: float
     run_event_store: SQLiteRunEventStore | None = None
     controller: TransactionalCodingRun | None = None
     worktree: WorktreeMetadata | None = None
@@ -93,6 +94,7 @@ class TransactionalRuntimeAssembler:
                 artifact_store=artifact_store,
                 budget=budget,
                 coordinator=coordinator,
+                shell_terminal_timeout_seconds=self._settings.shell_terminal_timeout_seconds,
             )
 
         if worktree is None:
@@ -155,6 +157,7 @@ class TransactionalRuntimeAssembler:
             artifact_store=artifact_store,
             budget=budget,
             coordinator=coordinator,
+            shell_terminal_timeout_seconds=self._settings.shell_terminal_timeout_seconds,
             run_event_store=run_events,
             controller=controller,
             worktree=worktree,

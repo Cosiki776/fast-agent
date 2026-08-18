@@ -28,6 +28,7 @@ from fast_agent.transactional.execution import (
     ToolCallNext,
     ToolExecutionOutcome,
     ToolExecutionRequest,
+    ToolExecutionUncertainError,
 )
 from fast_agent.transactional.models import (
     RunId,
@@ -203,6 +204,26 @@ class TransactionCoordinator:
         )
         try:
             outcome = await call_next()
+        except ToolExecutionUncertainError as exc:
+            self._event_store.append(
+                ToolExecutionFailed(
+                    run_id=request.run_id,
+                    transaction_id=transaction_id,
+                    tool_call_id=request.tool_call_id,
+                    error_type=type(exc).__name__,
+                    message=str(exc),
+                )
+            )
+            self._event_store.append(
+                ToolFailed(
+                    run_id=request.run_id,
+                    transaction_id=transaction_id,
+                    tool_call_id=request.tool_call_id,
+                    reason="tool outcome is uncertain",
+                )
+            )
+            self._fail_run(request.run_id, f"tool outcome uncertain: {exc}")
+            raise
         except Exception as exc:
             error_type = type(exc).__name__
             message = str(exc)
@@ -263,6 +284,7 @@ class TransactionCoordinator:
                 effect=effect,
                 checkpoint_id=checkpoint_id,
                 result=reduced_result,
+                failure_result=result,
             )
             self._event_store.append(
                 ToolFailed(
@@ -308,11 +330,12 @@ class TransactionCoordinator:
         effect: ToolEffect,
         checkpoint_id: str | None,
         result: CallToolResult,
+        failure_result: CallToolResult,
     ) -> CallToolResult:
         controller = self._recovery_controller
         if controller is None:
             return result
-        decision = controller.decide(request, effect, result, checkpoint_id)
+        decision = controller.decide(request, effect, failure_result, checkpoint_id)
         if decision.action is RecoveryAction.CONTINUE:
             return result
         if decision.action is RecoveryAction.RETRY_READ:

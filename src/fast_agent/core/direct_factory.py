@@ -82,6 +82,7 @@ class AgentBuildContext:
     tool_execution_interceptor: "ToolExecutionInterceptor | None" = None
     transactional_workspace: Path | None = None
     run_budget: "RunBudgetTracker | None" = None
+    shell_terminal_timeout_seconds: float | None = None
 
 
 @dataclass(frozen=True)
@@ -692,7 +693,13 @@ async def _create_basic_agent(
         build_ctx.session_history_enabled,
     )
     if isinstance(agent, McpAgent) and build_ctx.transactional_workspace is not None:
-        agent.bind_transactional_workspace(build_ctx.transactional_workspace)
+        if build_ctx.run_budget is None or build_ctx.shell_terminal_timeout_seconds is None:
+            raise RuntimeError("Full transactional profile requires shell and Run budget settings")
+        agent.bind_transactional_workspace(
+            build_ctx.transactional_workspace,
+            shell_terminal_timeout_seconds=build_ctx.shell_terminal_timeout_seconds,
+            remaining_run_seconds=build_ctx.run_budget.remaining_wall_time_seconds,
+        )
     if build_ctx.run_budget is not None:
         _apply_transactional_budget_hooks(agent, build_ctx.run_budget)
 
@@ -1054,6 +1061,7 @@ async def create_agents_by_type(
     tool_execution_interceptor: "ToolExecutionInterceptor | None" = None,
     transactional_workspace: Path | None = None,
     run_budget: "RunBudgetTracker | None" = None,
+    shell_terminal_timeout_seconds: float | None = None,
 ) -> AgentDict:
     """
     Generic method to create agents of a specific type without using proxies.
@@ -1090,6 +1098,7 @@ async def create_agents_by_type(
         tool_execution_interceptor=tool_execution_interceptor,
         transactional_workspace=transactional_workspace,
         run_budget=run_budget,
+        shell_terminal_timeout_seconds=shell_terminal_timeout_seconds,
     )
 
     for name, agent_data in _iter_agents_of_type(agents_dict, agent_type):
@@ -1110,6 +1119,7 @@ async def active_agents_in_dependency_group(
     tool_execution_interceptor: "ToolExecutionInterceptor | None" = None,
     transactional_workspace: Path | None = None,
     run_budget: "RunBudgetTracker | None" = None,
+    shell_terminal_timeout_seconds: float | None = None,
 ):
     """
     For each of the possible agent types, create agents and update the active agents dictionary.
@@ -1135,6 +1145,7 @@ async def active_agents_in_dependency_group(
             tool_execution_interceptor=tool_execution_interceptor,
             transactional_workspace=transactional_workspace,
             run_budget=run_budget,
+            shell_terminal_timeout_seconds=shell_terminal_timeout_seconds,
         )
         active_agents.update(agents)
 
@@ -1150,6 +1161,7 @@ async def create_agents_in_dependency_order(
     tool_execution_interceptor: "ToolExecutionInterceptor | None" = None,
     transactional_workspace: Path | None = None,
     run_budget: "RunBudgetTracker | None" = None,
+    shell_terminal_timeout_seconds: float | None = None,
 ) -> AgentDict:
     """
     Create agent instances in dependency order without proxies.
@@ -1180,6 +1192,7 @@ async def create_agents_in_dependency_order(
         tool_execution_interceptor=tool_execution_interceptor,
         transactional_workspace=transactional_workspace,
         run_budget=run_budget,
+        shell_terminal_timeout_seconds=shell_terminal_timeout_seconds,
     )
 
     # Create agent proxies for each group in dependency order

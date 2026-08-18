@@ -52,6 +52,7 @@ if TYPE_CHECKING:
     from fast_agent.interfaces import AgentProtocol, ModelFactoryFunctionProtocol
     from fast_agent.mcp.mcp_aggregator import MCPAttachOptions, MCPAttachResult, MCPDetachResult
     from fast_agent.mcp.types import McpAgentProtocol
+    from fast_agent.transactional.assembly import TransactionalRuntime
     from fast_agent.types import PromptMessageExtended
 
 logger = get_logger(__name__)
@@ -172,6 +173,7 @@ class ManagedRuntimeMixin:
         self,
         runtime: "RunRuntime",
         app_override: AgentApp | None = None,
+        transactional_runtime: "TransactionalRuntime | None" = None,
     ) -> "AgentInstance":
         from fast_agent.core.fastagent import AgentInstance
 
@@ -182,6 +184,18 @@ class ManagedRuntimeMixin:
                 runtime.model_factory_func,
                 global_function_tools=self._registered_tools,
                 shell_environment=runtime.shell_environment,
+                transactional_run_id=(
+                    transactional_runtime.run_id if transactional_runtime is not None else None
+                ),
+                tool_execution_interceptor=(
+                    transactional_runtime.coordinator if transactional_runtime is not None else None
+                ),
+                transactional_workspace=(
+                    transactional_runtime.workspace if transactional_runtime is not None else None
+                ),
+                run_budget=(
+                    transactional_runtime.budget if transactional_runtime is not None else None
+                ),
             )
 
             tool_only_agents = {

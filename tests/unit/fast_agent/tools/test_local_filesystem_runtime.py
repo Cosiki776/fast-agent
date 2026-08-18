@@ -870,3 +870,29 @@ def test_attach_media_tool_description_conditional() -> None:
     gemini_named_tool = _tool_by_name(gemini_named_runtime, "attach_media")
     assert gemini_named_tool is not None
     assert "Gemini YouTube links" in gemini_named_tool.description
+
+
+@pytest.mark.asyncio
+async def test_transactional_root_rejects_relative_absolute_and_symlink_escape(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "worktree"
+    outside = tmp_path / "outside"
+    root.mkdir()
+    outside.mkdir()
+    (root / "link").symlink_to(outside, target_is_directory=True)
+    runtime = LocalFilesystemRuntime(
+        logging.getLogger("local-filesystem-runtime-test"),
+        working_directory=root,
+    )
+    runtime.restrict_to_directory(root)
+
+    for path in ("../escape.txt", str(outside / "absolute.txt"), "link/symlink.txt"):
+        result = await runtime.write_text_file({"path": path, "content": "no"})
+        assert result.is_error is True
+        assert isinstance(result.content[0], TextContent)
+        assert "escapes transactional workspace" in result.content[0].text
+
+    result = await runtime.write_text_file({"path": "inside.txt", "content": "yes"})
+    assert result.is_error is False
+    assert (root / "inside.txt").read_text(encoding="utf-8") == "yes"

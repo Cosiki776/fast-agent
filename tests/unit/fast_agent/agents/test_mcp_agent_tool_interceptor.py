@@ -14,7 +14,9 @@ from mcp.types import (
 
 from fast_agent.agents.agent_types import AgentConfig
 from fast_agent.agents.mcp_agent import McpAgent
+from fast_agent.agents.mcp_tool_planning import McpToolRoute, PlannedMcpToolCall
 from fast_agent.context import Context
+from fast_agent.transactional.execution import ToolExecutionOutcome
 from fast_agent.transactional.models import RunId
 from fast_agent.types import PromptMessageExtended
 
@@ -22,7 +24,6 @@ if TYPE_CHECKING:
     from fast_agent.transactional.execution import (
         ToolCallNext,
         ToolExecutionInterceptor,
-        ToolExecutionOutcome,
         ToolExecutionRequest,
     )
 
@@ -187,4 +188,53 @@ async def test_interceptor_receives_each_id_and_forces_sequential_execution() ->
     ]
     assert result.tool_results is not None
     assert list(result.tool_results) == ["call-1", "call-2"]
+    await agent._aggregator.close()
+
+
+@pytest.mark.asyncio
+async def test_interceptor_can_deny_remote_mcp_tool_before_execution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: list[str] = []
+
+    async def interceptor(request, call_next):
+        del call_next
+        observed.append(request.tool_name)
+        return ToolExecutionOutcome(
+            result=CallToolResult(
+                content=[TextContent(type="text", text="denied")],
+                is_error=True,
+            )
+        )
+
+    agent, _ = _agent(interceptor=interceptor)
+    executed = False
+
+    async def call_tool(*args, **kwargs):
+        nonlocal executed
+        del args, kwargs
+        executed = True
+        return CallToolResult(content=[], is_error=False)
+
+    monkeypatch.setattr(agent, "call_tool", call_tool)
+    call = PlannedMcpToolCall(
+        correlation_id="remote-1",
+        route=McpToolRoute(
+            requested_name="remote_tool",
+            namespaced_tool=None,
+            candidate_namespaced_tool=None,
+            route_to_namespaced_candidate=False,
+        ),
+        tool_args={},
+        bottom_items=None,
+        highlight_indexes=[],
+        source_label="remote",
+        server_name="server",
+    )
+
+    _, result, _ = await agent._execute_mcp_planned_tool_call(call, request_params=None)
+
+    assert observed == ["remote_tool"]
+    assert executed is False
+    assert result.is_error is True
     await agent._aggregator.close()

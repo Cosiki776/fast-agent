@@ -18,6 +18,7 @@ from fast_agent.mcp.mime_utils import is_image_mime_type
 from fast_agent.mcp.tool_result_metadata import set_tool_result_media_preview
 from fast_agent.patch.engine import apply_patch as run_apply_patch
 from fast_agent.patch.errors import ApplyPatchError
+from fast_agent.patch.parser import parse_patch
 from fast_agent.tools.apply_patch_tool import extract_apply_patch_input
 from fast_agent.tools.attach_media import (
     DEFAULT_ATTACH_MEDIA_MAX_BYTES,
@@ -68,6 +69,7 @@ class LocalFilesystemRuntime(FilesystemRuntimeBase):
     ) -> None:
         self._logger = logger
         self._working_directory = working_directory
+        self._root_directory: Path | None = None
         super().__init__(
             tracking_source="local",
             enable_read=enable_read,
@@ -84,6 +86,12 @@ class LocalFilesystemRuntime(FilesystemRuntimeBase):
         """Update the base directory used for relative file paths."""
         self._working_directory = working_directory
 
+    def restrict_to_directory(self, root_directory: Path) -> None:
+        """Restrict all local filesystem paths to one resolved directory."""
+        root = root_directory.resolve()
+        self._working_directory = root
+        self._root_directory = root
+
     def _base_directory(self) -> Path:
         if self._working_directory is None:
             return Path.cwd()
@@ -93,9 +101,14 @@ class LocalFilesystemRuntime(FilesystemRuntimeBase):
 
     def _resolve_path(self, raw_path: str) -> Path:
         candidate = Path(raw_path).expanduser()
-        if candidate.is_absolute():
-            return candidate.resolve()
-        return (self._base_directory() / candidate).resolve()
+        resolved = (
+            candidate.resolve()
+            if candidate.is_absolute()
+            else (self._base_directory() / candidate).resolve()
+        )
+        if self._root_directory is not None and not resolved.is_relative_to(self._root_directory):
+            raise ValueError(f"Path escapes transactional workspace: {raw_path}")
+        return resolved
 
     async def read_text_file(
         self, arguments: dict[str, Any] | None = None, tool_use_id: str | None = None
@@ -108,10 +121,11 @@ class LocalFilesystemRuntime(FilesystemRuntimeBase):
         except ValueError as exc:
             return text_result(str(exc), is_error=True)
 
-        resolved_path = self._resolve_path(parsed.path)
-
         try:
+            resolved_path = self._resolve_path(parsed.path)
             content = resolved_path.read_text(encoding="utf-8", errors="replace")
+        except ValueError as exc:
+            return text_result(str(exc), is_error=True)
         except OSError as exc:
             self._logger.exception("Error reading file")
             if is_permission_error(exc):
@@ -138,10 +152,12 @@ class LocalFilesystemRuntime(FilesystemRuntimeBase):
         except ValueError as exc:
             return text_result(str(exc), is_error=True)
 
-        resolved_path = self._resolve_path(parsed.path)
         try:
+            resolved_path = self._resolve_path(parsed.path)
             resolved_path.parent.mkdir(parents=True, exist_ok=True)
             resolved_path.write_text(parsed.content, encoding="utf-8", errors="replace")
+        except ValueError as exc:
+            return text_result(str(exc), is_error=True)
         except OSError as exc:
             self._logger.exception("Error writing file")
             if is_permission_error(exc):
@@ -220,8 +236,14 @@ class LocalFilesystemRuntime(FilesystemRuntimeBase):
         stderr = io.StringIO()
         base_directory = self._base_directory()
         try:
+            if self._root_directory is not None:
+                parsed_patch = parse_patch(patch_text)
+                for hunk in parsed_patch.hunks:
+                    self._resolve_path(str(hunk.path))
+                    if hunk.kind == "update" and hunk.move_path is not None:
+                        self._resolve_path(str(hunk.move_path))
             run_apply_patch(patch_text, stdout, stderr, base_directory=base_directory)
-        except ApplyPatchError as exc:
+        except (ApplyPatchError, ValueError) as exc:
             self._logger.error(f"Error applying patch: {exc}")
             error_text = stderr.getvalue().strip() or str(exc)
             return CallToolResult(
@@ -260,7 +282,10 @@ class LocalFilesystemRuntime(FilesystemRuntimeBase):
                 is_error=True,
             )
 
-        resolved_path = self._resolve_path(edit_input.path)
+        try:
+            resolved_path = self._resolve_path(edit_input.path)
+        except ValueError as exc:
+            return text_result(str(exc), is_error=True)
         result_payload = run_edit_file(
             resolved_path,
             display_path=edit_input.path,
@@ -283,4 +308,7 @@ class LocalFilesystemRuntime(FilesystemRuntimeBase):
             "type": "local_filesystem",
             "tools": [tool.name for tool in self.tools],
             "working_directory": str(self._base_directory()),
+            "root_directory": (
+                str(self._root_directory) if self._root_directory is not None else None
+            ),
         }

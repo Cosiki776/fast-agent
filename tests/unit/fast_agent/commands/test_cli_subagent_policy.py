@@ -10,7 +10,10 @@ from fast_agent import FastAgent
 from fast_agent.agents.subagent_tool import SUBAGENT_TOOL_NAME, install_subagent_tool
 from fast_agent.agents.tool_agent import ToolAgent
 from fast_agent.cli.commands.go import app as go_app
-from fast_agent.cli.runtime.agent_setup import _apply_cli_subagent_overrides
+from fast_agent.cli.runtime.agent_setup import (
+    _apply_cli_subagent_overrides,
+    _apply_transactional_request_constraints,
+)
 from fast_agent.cli.runtime.request_builders import build_command_run_request
 
 if TYPE_CHECKING:
@@ -119,3 +122,42 @@ def test_cli_rejects_no_subagents_with_subagent_model() -> None:
     output = strip_ansi(result.output)
     assert "Cannot combine --subagent-model with" in output
     assert "--no-subagents." in output
+
+
+@pytest.mark.unit
+def test_transactional_profile_disables_subagents_and_runtime_reenable(tmp_path: Path) -> None:
+    config_path = tmp_path / "fast-agent.yaml"
+    config_path.write_text("transactional:\n  profile: reducer\n", encoding="utf-8")
+    request = _request(tmp_path, subagents=True)
+    request.config_path = str(config_path)
+    fast = FastAgent("test", parse_cli_args=False)
+
+    @fast.agent(name="agent", model="passthrough", default=True)
+    async def generated_agent() -> None:
+        pass
+
+    _apply_transactional_request_constraints(request)
+    _apply_cli_subagent_overrides(fast, request)
+    config = fast.agents["agent"]["config"]
+
+    assert request.subagents is False
+    assert config.subagents is False
+    assert config.subagent_activation_source == "configuration"
+    assert install_subagent_tool(ToolAgent(config)) is False
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(("field", "value"), [("no_home", True), ("resume", "latest")])
+def test_transactional_profile_rejects_unsupported_startup_before_build(
+    tmp_path: Path,
+    field: str,
+    value: object,
+) -> None:
+    config_path = tmp_path / "fast-agent.yaml"
+    config_path.write_text("transactional:\n  profile: full\n", encoding="utf-8")
+    request = _request(tmp_path)
+    request.config_path = str(config_path)
+    setattr(request, field, value)
+
+    with pytest.raises(ValueError, match="transactional"):
+        _apply_transactional_request_constraints(request)

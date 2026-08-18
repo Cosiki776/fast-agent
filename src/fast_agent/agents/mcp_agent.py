@@ -535,6 +535,15 @@ class McpAgent(ABC, ToolAgent):
             access_modes=("[red]direct[/red]",),
         )
 
+    def bind_transactional_workspace(self, workspace: Path) -> None:
+        """Bind this agent's supported local shell and filesystem to one Run worktree."""
+        root = workspace.resolve()
+        self.enable_shell(root)
+        local_runtime = self._local_filesystem_runtime()
+        if local_runtime is None:
+            raise RuntimeError("Transactional coding requires a local filesystem runtime")
+        local_runtime.restrict_to_directory(root)
+
     async def get_server_status(self) -> dict[str, ServerStatus]:
         """Expose server status details for UI and diagnostics consumers."""
         if not self._aggregator:
@@ -1123,7 +1132,11 @@ class McpAgent(ABC, ToolAgent):
             )
             return
 
-        if self._shell_environment is not None:
+        from fast_agent.tools.local_shell_executor import LocalEnvironment
+
+        if self._shell_environment is not None and not isinstance(
+            self._shell_environment, LocalEnvironment
+        ):
             self._drop_local_filesystem_runtime()
             return
 
@@ -2172,7 +2185,7 @@ class McpAgent(ABC, ToolAgent):
                 request_params=request_params,
             )
 
-        if self._should_intercept_local_tool(call):
+        if self._should_intercept_tool(call):
             request = self._transactional_execution_request(call)
             outcome = await execute_with_interceptor(
                 request,
@@ -2185,22 +2198,9 @@ class McpAgent(ABC, ToolAgent):
         end_time = time.perf_counter()
         return call.correlation_id, result, round((end_time - start_time) * 1000, 2)
 
-    def _should_intercept_local_tool(self, call: PlannedMcpToolCall) -> bool:
-        if self._tool_execution_interceptor is None:
-            return False
-        if call.execution_tool_name != call.tool_name:
-            return False
-        if call.tool_name in {
-            READ_TEXT_FILE_TOOL_NAME,
-            WRITE_TEXT_FILE_TOOL_NAME,
-            APPLY_PATCH_TOOL_NAME,
-        }:
-            return self._is_filesystem_runtime_tool(call.tool_name)
-        return bool(
-            self._shell_runtime
-            and self._shell_runtime.tool
-            and call.tool_name == self._shell_runtime.tool.name
-        )
+    def _should_intercept_tool(self, call: PlannedMcpToolCall) -> bool:
+        del call
+        return self._tool_execution_interceptor is not None
 
     def _transactional_execution_request(
         self,

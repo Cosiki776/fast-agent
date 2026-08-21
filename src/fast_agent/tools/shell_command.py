@@ -1058,9 +1058,9 @@ def classify_shell_detachment(
         for chunk in _command_chunks(words)
         if (invoked := _invoked_command_basename(chunk)) is not None
     }
-    if has_background_job and (
-        run_in_background or "nohup" in command_words or "disown" in command_words
-    ):
+    if "nohup" in command_words or "disown" in command_words:
+        return "service_detach"
+    if has_background_job and run_in_background:
         return "service_detach"
     if has_background_job:
         return "ambiguous"

@@ -984,10 +984,14 @@ def _apply_cli_subagent_overrides(fast: Any, request: AgentRunRequest) -> None:
         SubagentRuntimePolicy,
         apply_subagent_runtime_policy,
     )
+    from fast_agent.transactional.settings import TransactionalProfile
 
+    transactional_enabled = (
+        _load_request_settings(request).transactional.profile is not TransactionalProfile.BASELINE
+    )
     policy = SubagentRuntimePolicy(
-        enabled=request.subagents,
-        model=request.subagent_model,
+        enabled=False if transactional_enabled else request.subagents,
+        model=None if transactional_enabled else request.subagent_model,
     )
     for agent_data in fast.agents.values():
         config = agent_data.get("config")
@@ -998,6 +1002,22 @@ def _apply_cli_subagent_overrides(fast: Any, request: AgentRunRequest) -> None:
             policy,
             tool_only=bool(agent_data.get("tool_only", False)),
         )
+        if transactional_enabled:
+            config.subagent_activation_source = "configuration"
+
+
+def _apply_transactional_request_constraints(request: AgentRunRequest) -> None:
+    from fast_agent.transactional.settings import TransactionalProfile
+
+    profile = _load_request_settings(request).transactional.profile
+    if profile is TransactionalProfile.BASELINE:
+        return
+    if request.no_home:
+        raise ValueError(f"transactional profile '{profile.value}' does not support --no-home")
+    if request.resume is not None:
+        raise ValueError("transactional resume is not supported yet")
+    request.subagents = False
+    request.subagent_model = None
 
 
 def _build_fast_agent(request: AgentRunRequest):
@@ -1530,6 +1550,7 @@ def _classify_cli_mcp_failure(
 
 async def run_agent_request(request: AgentRunRequest) -> None:
     """Run the normalized CLI request."""
+    _apply_transactional_request_constraints(request)
     startup_model_source_override = await _select_startup_model_if_needed(request)
     serve_permissions_enabled = _serve_permissions_enabled(request)
     instruction = _request_instruction(request)

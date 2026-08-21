@@ -46,6 +46,10 @@ class ToolCallAlreadyExecutedError(RuntimeError):
     """Raised when an interceptor tries to execute the same tool call twice."""
 
 
+class ToolExecutionUncertainError(RuntimeError):
+    """Fail-stop signal for a started tool that may still produce side effects."""
+
+
 @dataclass(slots=True)
 class _SingleUseToolCall:
     execute: ToolExecutor

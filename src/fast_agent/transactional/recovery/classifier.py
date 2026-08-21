@@ -21,6 +21,7 @@ _WORKSPACE_WRITE_TOOLS = frozenset(
         WRITE_TEXT_FILE_TOOL_NAME,
         APPLY_PATCH_TOOL_NAME,
         "execute",
+        "exec",
         "bash",
         "process",
         "shell",

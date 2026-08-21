@@ -7,6 +7,7 @@ import sys
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, TypeAlias, TypeVar
 
 from mcp_types import PromptMessage
@@ -35,7 +36,6 @@ from fast_agent.types import (
 )
 
 if TYPE_CHECKING:
-    from pathlib import Path
     from types import TracebackType
 
     from fast_agent.a2a.task_api import A2ATaskHandle
@@ -49,8 +49,11 @@ if TYPE_CHECKING:
     from fast_agent.tools.environment_registry import EnvironmentSelection
     from fast_agent.tools.execution_environment import ShellEnvironment, ShellExecutionResult
     from fast_agent.tools.local_shell_executor import LocalEnvironment
+    from fast_agent.transactional.assembly import TransactionalRuntime
+    from fast_agent.transactional.checkpoint.worktree import WorktreeManager
 
 ModelT = TypeVar("ModelT", bound=BaseModel)
+ResultT = TypeVar("ResultT")
 HARNESS_SESSION_ID_MAX_LENGTH = 128
 HARNESS_SESSION_ID_PATTERN = re.compile(
     rf"^[A-Za-z0-9](?:[A-Za-z0-9_-]{{0,{HARNESS_SESSION_ID_MAX_LENGTH - 2}}}[A-Za-z0-9])?$"
@@ -68,6 +71,7 @@ class _HarnessSessionRecord:
     session_id: str
     default_agent_name: str | None
     instance: AgentInstance
+    transactional_runtime: TransactionalRuntime | None = None
     session: HarnessSession | None = None
     persistence_handle: object | None = None
     active_operation: str | None = None
@@ -116,9 +120,13 @@ class HarnessSession:
         """Send a message and return assistant text."""
         agent = await self._begin_operation("send", agent_name)
         try:
-            result = await agent.send(message, request_params)
-            await self._save_persisted_history(agent)
-            return result
+
+            async def execute() -> str:
+                result = await agent.send(message, request_params)
+                await self._save_persisted_history(agent)
+                return result
+
+            return await self._call_agent_once(execute)
         finally:
             await self._end_operation("send")
 
@@ -132,9 +140,13 @@ class HarnessSession:
         """Generate a message and return the full assistant message."""
         agent = await self._begin_operation("generate", agent_name)
         try:
-            result = await agent.generate(messages, request_params)
-            await self._save_persisted_history(agent)
-            return result
+
+            async def execute() -> PromptMessageExtended:
+                result = await agent.generate(messages, request_params)
+                await self._save_persisted_history(agent)
+                return result
+
+            return await self._call_agent_once(execute)
         finally:
             await self._end_operation("generate")
 
@@ -159,9 +171,13 @@ class HarnessSession:
         """Generate structured output parsed as a Pydantic model."""
         agent = await self._begin_operation("structured", agent_name)
         try:
-            result = await agent.structured(messages, model, request_params)
-            await self._save_persisted_history(agent)
-            return result
+
+            async def execute() -> tuple[ModelT | None, PromptMessageExtended]:
+                result = await agent.structured(messages, model, request_params)
+                await self._save_persisted_history(agent)
+                return result
+
+            return await self._call_agent_once(execute)
         finally:
             await self._end_operation("structured")
 
@@ -176,9 +192,13 @@ class HarnessSession:
         """Generate structured JSON validated against a raw schema."""
         agent = await self._begin_operation("structured_schema", agent_name)
         try:
-            result = await agent.structured_schema(messages, schema, request_params)
-            await self._save_persisted_history(agent)
-            return result
+
+            async def execute() -> tuple[Any | None, PromptMessageExtended]:
+                result = await agent.structured_schema(messages, schema, request_params)
+                await self._save_persisted_history(agent)
+                return result
+
+            return await self._call_agent_once(execute)
         finally:
             await self._end_operation("structured_schema")
 
@@ -255,6 +275,12 @@ class HarnessSession:
     async def delete(self) -> None:
         """Delete this session and dispose its owned instance."""
         await self._manager.delete(self.id)
+
+    async def _call_agent_once(self, call: Callable[[], Awaitable[ResultT]]) -> ResultT:
+        runtime = self._record.transactional_runtime
+        if runtime is None or runtime.controller is None:
+            return await call()
+        return await runtime.controller.call_agent_once(call)
 
     async def _begin_operation(
         self,
@@ -344,6 +370,10 @@ class HarnessSessions:
         delete_persisted_session: Callable[[str], Awaitable[None]] | None = None,
         shell_environment: ShellEnvironment | None = None,
         validate_instance: Callable[[AgentInstance], None] | None = None,
+        create_session_instance: Callable[[str, str | None], Awaitable[AgentInstance]]
+        | None = None,
+        transactional_runtime_for_instance: Callable[[AgentInstance], TransactionalRuntime | None]
+        | None = None,
     ) -> None:
         instance_factory = _resolve_instance_factory(
             instance_factory=instance_factory,
@@ -357,9 +387,11 @@ class HarnessSessions:
         )
         self._shell_environment = shell_environment
         self._validate_instance = validate_instance
+        self._transactional_runtime_for_instance = transactional_runtime_for_instance
         self._registry: InMemoryLiveSessionRegistry[_HarnessSessionRecord, str | None] = (
             InMemoryLiveSessionRegistry(
                 instance_factory=instance_factory,
+                create_instance=create_session_instance,
                 create_record=self._create_record,
                 record_instance=lambda record: record.instance,
                 close_record=self._close_record,
@@ -450,6 +482,11 @@ class HarnessSessions:
             session_id=session_id,
             default_agent_name=default_agent_name,
             instance=instance,
+            transactional_runtime=(
+                self._transactional_runtime_for_instance(instance)
+                if self._transactional_runtime_for_instance is not None
+                else None
+            ),
         )
         session = HarnessSession(self, record)
         record.session = session
@@ -510,6 +547,9 @@ class AgentHarness:
         self._lifecycle_state: FastAgentRunLifecycleState | None = None
         self._shell_environment: ShellEnvironment | None = None
         self._local_environment: LocalEnvironment | None = None
+        self._transactional_resources: dict[
+            int, tuple[TransactionalRuntime, WorktreeManager | None]
+        ] = {}
 
     @property
     def sessions(self) -> HarnessSessions:
@@ -577,6 +617,8 @@ class AgentHarness:
                     if self._runtime.is_acp_server_mode
                     else self._validate_instance_provider_state
                 ),
+                create_session_instance=self._create_session_instance,
+                transactional_runtime_for_instance=self._transactional_runtime_for_instance,
             )
             return self
         except Exception:
@@ -779,7 +821,10 @@ class AgentHarness:
             return None
         return FileHarnessSessionPersistence(settings.home)
 
-    async def _create_instance(self) -> AgentInstance:
+    async def _create_instance(
+        self,
+        transactional_runtime: TransactionalRuntime | None = None,
+    ) -> AgentInstance:
         if self._runtime is None:
             raise RuntimeError("Harness is not running.")
         if self._settings is None:
@@ -792,7 +837,13 @@ class AgentHarness:
         if config_settings is not None:
             config_settings.session_history = False
         try:
-            instance = await self._fast_agent._instantiate_agent_instance(self._runtime)
+            if transactional_runtime is None:
+                instance = await self._fast_agent._instantiate_agent_instance(self._runtime)
+            else:
+                instance = await self._fast_agent._instantiate_agent_instance(
+                    self._runtime,
+                    transactional_runtime=transactional_runtime,
+                )
         finally:
             if config_settings is not None and original_session_history is not None:
                 config_settings.session_history = original_session_history
@@ -820,6 +871,71 @@ class AgentHarness:
         self._fast_agent._configure_streaming_for_run(instance.agents)
         return instance
 
+    async def _create_session_instance(
+        self,
+        session_id: str,
+        agent_name: str | None,
+    ) -> AgentInstance:
+        del session_id, agent_name
+        settings = self._fast_agent.context.config
+        if settings is None:
+            return await self._create_instance()
+
+        from fast_agent.paths import resolve_home_paths
+        from fast_agent.transactional.assembly import TransactionalRuntimeAssembler
+        from fast_agent.transactional.checkpoint.snapshot import WorkspaceSnapshotManager
+        from fast_agent.transactional.checkpoint.worktree import WorktreeManager
+        from fast_agent.transactional.models import new_run_id
+        from fast_agent.transactional.settings import TransactionalProfile
+
+        transactional = settings.transactional
+        if transactional.profile is TransactionalProfile.BASELINE:
+            return await self._create_instance()
+
+        runtime_root = (
+            Path(transactional.runtime_root).expanduser().resolve()
+            if transactional.runtime_root is not None
+            else resolve_home_paths(settings).root / "transactional"
+        )
+        run_id = new_run_id()
+        worktree_manager: WorktreeManager | None = None
+        worktree = None
+        if transactional.profile is TransactionalProfile.FULL:
+            snapshot_manager = WorkspaceSnapshotManager(
+                self._fast_agent.workspace_root,
+                runtime_root / "snapshots",
+            )
+            snapshot = snapshot_manager.capture()
+            worktree_manager = WorktreeManager(
+                self._fast_agent.workspace_root,
+                runtime_root / "worktrees",
+            )
+            worktree = worktree_manager.create(run_id, baseline=snapshot.base_commit)
+            snapshot_manager.materialize(snapshot, worktree)
+
+        runtime = TransactionalRuntimeAssembler(transactional, runtime_root / "runs").assemble(
+            run_id=run_id,
+            worktree=worktree,
+        )
+        if runtime is None:
+            raise RuntimeError("Transactional runtime assembly unexpectedly returned baseline")
+        try:
+            instance = await self._create_instance(runtime)
+        except Exception:
+            runtime.close()
+            if worktree_manager is not None and worktree is not None:
+                worktree_manager.cleanup(worktree)
+            raise
+        self._transactional_resources[id(instance)] = (runtime, worktree_manager)
+        return instance
+
+    def _transactional_runtime_for_instance(
+        self,
+        instance: AgentInstance,
+    ) -> TransactionalRuntime | None:
+        resources = self._transactional_resources.get(id(instance))
+        return resources[0] if resources is not None else None
+
     @staticmethod
     def _validate_instance_provider_state(instance: AgentInstance) -> None:
         from fast_agent.core.runtime_finalization import validate_final_provider_state
@@ -827,10 +943,23 @@ class AgentHarness:
         validate_final_provider_state(instance.agents)
 
     async def _dispose_instance(self, instance: AgentInstance) -> None:
-        if self._runtime is None:
-            await instance.shutdown()
-            return
-        await self._fast_agent._dispose_agent_instance(self._runtime, instance)
+        try:
+            if self._runtime is None:
+                await instance.shutdown()
+                return
+            await self._fast_agent._dispose_agent_instance(self._runtime, instance)
+        finally:
+            resources = self._transactional_resources.pop(id(instance), None)
+            if resources is not None:
+                transactional_runtime, worktree_manager = resources
+                transactional_runtime.close()
+                if (
+                    worktree_manager is not None
+                    and transactional_runtime.worktree is not None
+                    and self._fast_agent.context.config is not None
+                    and not self._fast_agent.context.config.transactional.keep_worktree
+                ):
+                    worktree_manager.cleanup(transactional_runtime.worktree)
 
 
 def _resolve_instance_factory(

@@ -32,11 +32,13 @@ class InMemoryLiveSessionRegistry(Generic[RecordT, ContextT]):
         self,
         *,
         instance_factory: AgentInstanceFactory,
+        create_instance: Callable[[str, ContextT], Awaitable[AgentInstance]] | None = None,
         create_record: Callable[[str, AgentInstance, ContextT], Awaitable[RecordT]],
         record_instance: Callable[[RecordT], AgentInstance],
         close_record: Callable[[RecordT], None],
     ) -> None:
         self._instance_factory = instance_factory
+        self._create_instance = create_instance
         self._create_record = create_record
         self._record_instance = record_instance
         self._close_record = close_record
@@ -59,7 +61,11 @@ class InMemoryLiveSessionRegistry(Generic[RecordT, ContextT]):
             if session_id in self._records:
                 raise ValueError(f"Session '{session_id}' already exists")
 
-            instance = await self._instance_factory.create_instance()
+            instance = (
+                await self._create_instance(session_id, context)
+                if self._create_instance is not None
+                else await self._instance_factory.create_instance()
+            )
             try:
                 record = await self._create_record(session_id, instance, context)
             except Exception:

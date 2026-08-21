@@ -79,6 +79,40 @@ async def test_live_session_registry_create_get_delete() -> None:
 
 
 @pytest.mark.asyncio
+async def test_live_session_registry_can_create_instance_from_session_context() -> None:
+    factory = FakeFactory()
+    contexts: list[tuple[str, str]] = []
+
+    async def create_instance(session_id: str, context: str) -> AgentInstance:
+        contexts.append((session_id, context))
+        return await factory.create()
+
+    async def create_record(
+        session_id: str,
+        instance: AgentInstance,
+        context: str,
+    ) -> FakeRecord:
+        del context
+        return FakeRecord(session_id=session_id, instance=instance)
+
+    registry: InMemoryLiveSessionRegistry[FakeRecord, str] = InMemoryLiveSessionRegistry(
+        instance_factory=CallableAgentInstanceFactory(
+            create=factory.create,
+            dispose=factory.dispose,
+        ),
+        create_instance=create_instance,
+        create_record=create_record,
+        record_instance=lambda record: record.instance,
+        close_record=lambda record: setattr(record, "closed", True),
+    )
+
+    await registry.create("run-1", "agent")
+
+    assert contexts == [("run-1", "agent")]
+    assert len(factory.instances) == 1
+
+
+@pytest.mark.asyncio
 async def test_live_session_registry_disposes_instance_when_record_creation_fails() -> None:
     factory = FakeFactory()
 

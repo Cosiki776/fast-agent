@@ -608,6 +608,32 @@ async def test_harness_sessions_accepts_instance_factory() -> None:
     assert factory.disposed == [session._record.instance]
 
 
+@pytest.mark.asyncio
+async def test_transactional_session_wraps_agent_turn_with_run_controller() -> None:
+    factory = InstanceFactory()
+    calls: list[str] = []
+
+    class Controller:
+        async def call_agent_once(self, call):
+            calls.append("before")
+            result = await call()
+            calls.append("after")
+            return result
+
+    runtime = cast("Any", SimpleNamespace(controller=Controller()))
+    sessions = HarnessSessions(
+        create_instance=factory.create,
+        dispose_instance=factory.dispose,
+        transactional_runtime_for_instance=lambda instance: runtime,
+    )
+
+    session = await sessions.create("run")
+    response = await session.send("hello")
+
+    assert response == "main-0:hello"
+    assert calls == ["before", "after"]
+
+
 def test_harness_sessions_rejects_ambiguous_factory_configuration() -> None:
     factory = InstanceFactory()
 

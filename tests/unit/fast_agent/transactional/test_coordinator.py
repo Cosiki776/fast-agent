@@ -27,6 +27,7 @@ from fast_agent.transactional.events import (
 from fast_agent.transactional.execution import (
     ToolExecutionOutcome,
     ToolExecutionRequest,
+    ToolExecutionUncertainError,
 )
 from fast_agent.transactional.models import (
     RunId,
@@ -224,6 +225,43 @@ async def test_exception_becomes_explicit_failed_tool_result(tmp_path: Path) -> 
         ToolEventKind.EXECUTION_FAILED,
         ToolEventKind.FAILED,
     ]
+    event_store.close()
+
+
+@pytest.mark.asyncio
+async def test_uncertain_tool_outcome_fails_run_without_restore(tmp_path: Path) -> None:
+    restored: list[str] = []
+    run_events = SQLiteRunEventStore(tmp_path / "events.sqlite3")
+    run_events.append(RunStarted(run_id=RUN_ID, profile="full"))
+    coordinator, event_store, _ = _coordinator(
+        tmp_path,
+        checkpoint_creator=lambda request: f"checkpoint-{request.tool_call_id}",
+        checkpoint_restorer=lambda checkpoint_id: restored.append(checkpoint_id) or "version-1",
+        recovery_controller=RecoveryController(repeated_failure_threshold=2),
+        run_event_store=run_events,
+    )
+
+    async def call_next() -> ToolExecutionOutcome:
+        raise ToolExecutionUncertainError("shell process termination could not be confirmed")
+
+    with pytest.raises(ToolExecutionUncertainError):
+        await coordinator.coordinate(_request("bash"), call_next)
+
+    assert restored == []
+    assert [event.kind for event in _events(event_store)] == [
+        ToolEventKind.PROPOSED,
+        ToolEventKind.VALIDATED,
+        ToolEventKind.AUTHORIZED,
+        ToolEventKind.CHECKPOINTED,
+        ToolEventKind.EXECUTION_STARTED,
+        ToolEventKind.EXECUTION_FAILED,
+        ToolEventKind.FAILED,
+    ]
+    assert [item.event.kind for item in run_events.events_for_run(RUN_ID)] == [
+        RunEventKind.STARTED,
+        RunEventKind.FAILED,
+    ]
+    run_events.close()
     event_store.close()
 
 

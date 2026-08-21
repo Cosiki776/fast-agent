@@ -134,10 +134,7 @@ class RunBudgetTracker:
         return self._warnings((BudgetDimension.TOKENS,))
 
     def start_recovery(self) -> BudgetDecision:
-        dimensions = (
-            BudgetDimension.RECOVERY_ATTEMPTS,
-            BudgetDimension.WALL_TIME,
-        )
+        dimensions = (BudgetDimension.RECOVERY_ATTEMPTS,)
         decision = self._before_action(dimensions)
         if not decision.allowed:
             return decision
@@ -146,6 +143,12 @@ class RunBudgetTracker:
 
     def check_wall_time(self) -> BudgetDecision:
         return self._before_action((BudgetDimension.WALL_TIME,))
+
+    def remaining_wall_time_seconds(self) -> float | None:
+        limit = self._limits.max_wall_time_seconds
+        if limit is None:
+            return None
+        return max(0.0, limit - self.snapshot.elapsed_seconds)
 
     def _before_action(self, dimensions: Iterable[BudgetDimension]) -> BudgetDecision:
         checked = tuple(dimensions)

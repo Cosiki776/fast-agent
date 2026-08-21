@@ -57,6 +57,9 @@ if TYPE_CHECKING:
     from fast_agent.agents.workflow.agents_as_tools_agent import AgentsAsToolsOptions
     from fast_agent.hooks.hook_context import HookAgentProtocol
     from fast_agent.tools.execution_environment import ShellEnvironment
+    from fast_agent.transactional.budget import RunBudgetTracker
+    from fast_agent.transactional.execution import ToolExecutionInterceptor
+    from fast_agent.transactional.models import RunId
 
 # Type aliases for improved readability and IDE support
 AgentDict = dict[str, AgentProtocol]
@@ -75,6 +78,11 @@ class AgentBuildContext:
     session_history_enabled: bool
     global_function_tools: Sequence[FunctionTool]
     shell_environment: "ShellEnvironment | None" = None
+    transactional_run_id: "RunId | None" = None
+    tool_execution_interceptor: "ToolExecutionInterceptor | None" = None
+    transactional_workspace: Path | None = None
+    run_budget: "RunBudgetTracker | None" = None
+    shell_terminal_timeout_seconds: float | None = None
 
 
 @dataclass(frozen=True)
@@ -671,6 +679,8 @@ async def _create_basic_agent(
             context=build_ctx.app_instance.context,
             tools=function_tools,
             shell_environment=build_ctx.shell_environment,
+            transactional_run_id=build_ctx.transactional_run_id,
+            tool_execution_interceptor=build_ctx.tool_execution_interceptor,
         )
 
     await _finalize_agent(
@@ -681,6 +691,56 @@ async def _create_basic_agent(
         build_ctx.model_factory_func,
         result_agents,
         build_ctx.session_history_enabled,
+    )
+    if isinstance(agent, McpAgent) and build_ctx.transactional_workspace is not None:
+        if build_ctx.run_budget is None or build_ctx.shell_terminal_timeout_seconds is None:
+            raise RuntimeError("Full transactional profile requires shell and Run budget settings")
+        agent.bind_transactional_workspace(
+            build_ctx.transactional_workspace,
+            shell_terminal_timeout_seconds=build_ctx.shell_terminal_timeout_seconds,
+            remaining_run_seconds=build_ctx.run_budget.remaining_wall_time_seconds,
+        )
+    if build_ctx.run_budget is not None:
+        _apply_transactional_budget_hooks(agent, build_ctx.run_budget)
+
+
+def _apply_transactional_budget_hooks(agent: LlmAgent, budget: "RunBudgetTracker") -> None:
+    from fast_agent.agents.tool_runner import ToolRunnerHooks
+    from fast_agent.transactional.run_controller import TransactionalRunTerminatedError
+
+    existing = agent.tool_runner_hooks or ToolRunnerHooks()
+    last_total = (
+        agent.usage_accumulator.summary.total if agent.usage_accumulator is not None else None
+    )
+
+    async def before_llm_call(runner: Any, messages: Any) -> None:
+        decision = budget.start_llm_call()
+        if not decision.allowed:
+            exhausted = ", ".join(item.value for item in decision.exhausted)
+            raise TransactionalRunTerminatedError(f"LLM budget exhausted: {exhausted}")
+        if existing.before_llm_call is not None:
+            await existing.before_llm_call(runner, messages)
+
+    async def after_llm_call(runner: Any, message: Any) -> None:
+        nonlocal last_total
+        try:
+            if existing.after_llm_call is not None:
+                await existing.after_llm_call(runner, message)
+        finally:
+            accumulator = agent.usage_accumulator
+            current_total = accumulator.summary.total if accumulator is not None else None
+            if current_total is None or last_total is None:
+                budget.record_token_usage(None)
+            else:
+                budget.record_token_usage(max(0, current_total - last_total))
+            last_total = current_total
+
+    agent.tool_runner_hooks = ToolRunnerHooks(
+        before_llm_call=before_llm_call,
+        after_llm_call=after_llm_call,
+        before_tool_call=existing.before_tool_call,
+        after_tool_call=existing.after_tool_call,
+        after_turn_complete=existing.after_turn_complete,
     )
 
 
@@ -997,6 +1057,11 @@ async def create_agents_by_type(
     active_agents: AgentDict | None = None,
     global_function_tools: Sequence[FunctionTool] = (),
     shell_environment: "ShellEnvironment | None" = None,
+    transactional_run_id: "RunId | None" = None,
+    tool_execution_interceptor: "ToolExecutionInterceptor | None" = None,
+    transactional_workspace: Path | None = None,
+    run_budget: "RunBudgetTracker | None" = None,
+    shell_terminal_timeout_seconds: float | None = None,
 ) -> AgentDict:
     """
     Generic method to create agents of a specific type without using proxies.
@@ -1029,6 +1094,11 @@ async def create_agents_by_type(
         session_history_enabled=session_history_enabled,
         global_function_tools=global_function_tools,
         shell_environment=shell_environment,
+        transactional_run_id=transactional_run_id,
+        tool_execution_interceptor=tool_execution_interceptor,
+        transactional_workspace=transactional_workspace,
+        run_budget=run_budget,
+        shell_terminal_timeout_seconds=shell_terminal_timeout_seconds,
     )
 
     for name, agent_data in _iter_agents_of_type(agents_dict, agent_type):
@@ -1045,6 +1115,11 @@ async def active_agents_in_dependency_group(
     group: list[str],
     active_agents: AgentDict,
     shell_environment: "ShellEnvironment | None" = None,
+    transactional_run_id: "RunId | None" = None,
+    tool_execution_interceptor: "ToolExecutionInterceptor | None" = None,
+    transactional_workspace: Path | None = None,
+    run_budget: "RunBudgetTracker | None" = None,
+    shell_terminal_timeout_seconds: float | None = None,
 ):
     """
     For each of the possible agent types, create agents and update the active agents dictionary.
@@ -1066,6 +1141,11 @@ async def active_agents_in_dependency_group(
             active_agents,
             global_function_tools,
             shell_environment=shell_environment,
+            transactional_run_id=transactional_run_id,
+            tool_execution_interceptor=tool_execution_interceptor,
+            transactional_workspace=transactional_workspace,
+            run_budget=run_budget,
+            shell_terminal_timeout_seconds=shell_terminal_timeout_seconds,
         )
         active_agents.update(agents)
 
@@ -1077,6 +1157,11 @@ async def create_agents_in_dependency_order(
     global_function_tools: Sequence[FunctionTool] = (),
     allow_cycles: bool = False,
     shell_environment: "ShellEnvironment | None" = None,
+    transactional_run_id: "RunId | None" = None,
+    tool_execution_interceptor: "ToolExecutionInterceptor | None" = None,
+    transactional_workspace: Path | None = None,
+    run_budget: "RunBudgetTracker | None" = None,
+    shell_terminal_timeout_seconds: float | None = None,
 ) -> AgentDict:
     """
     Create agent instances in dependency order without proxies.
@@ -1103,6 +1188,11 @@ async def create_agents_in_dependency_order(
         model_factory_func,
         global_function_tools,
         shell_environment=shell_environment,
+        transactional_run_id=transactional_run_id,
+        tool_execution_interceptor=tool_execution_interceptor,
+        transactional_workspace=transactional_workspace,
+        run_budget=run_budget,
+        shell_terminal_timeout_seconds=shell_terminal_timeout_seconds,
     )
 
     # Create agent proxies for each group in dependency order

@@ -37,6 +37,7 @@ def test_local_effect_classifier_only_trusts_explicit_rules() -> None:
     assert classifier(_request("read_text_file")) is ToolEffect.READ
     assert classifier(_request("write_text_file")) is ToolEffect.WORKSPACE_WRITE
     assert classifier(_request("bash")) is ToolEffect.WORKSPACE_WRITE
+    assert classifier(_request("exec")) is ToolEffect.WORKSPACE_WRITE
     assert classifier(_request("remote_tool")) is ToolEffect.EXTERNAL_UNKNOWN
 
 

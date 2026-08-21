@@ -24,6 +24,7 @@ from fast_agent.core.logging.logger import get_logger
 from fast_agent.interfaces import MessageHistoryAgentProtocol, TurnCancellationStateCapable
 from fast_agent.llm.request_params import tool_result_mode_is_passthrough
 from fast_agent.mcp.helpers.content_helpers import text_content
+from fast_agent.transactional.execution import ToolExecutionUncertainError
 from fast_agent.types import PromptMessageExtended, RequestParams
 from fast_agent.types.llm_stop_reason import LlmStopReason
 
@@ -610,6 +611,8 @@ class ToolRunner:
                 self._pending_tool_request, request_params=self._request_params
             )
         except asyncio.CancelledError:
+            raise
+        except ToolExecutionUncertainError:
             raise
         except Exception as exc:
             tool_calls = self._pending_tool_request.tool_calls or {}

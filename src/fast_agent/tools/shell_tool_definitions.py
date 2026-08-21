@@ -63,7 +63,7 @@ class ShellExecuteArguments:
     lifecycle: Literal["session", "persistent"]
     yield_after_idle_sec: int | None
     output_byte_limit: int | None
-    hard_timeout_seconds: int | None = None
+    hard_timeout_seconds: float | None = None
 
 
 @dataclass(frozen=True, slots=True)

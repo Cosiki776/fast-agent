@@ -4,10 +4,12 @@ from typing import TYPE_CHECKING
 
 import pytest
 
+from fast_agent.mcp.tool_permission_handler import ToolPermissionResult
 from fast_agent.transactional.execution import ToolExecutionRequest
 from fast_agent.transactional.governance import (
     CodingToolGovernanceGate,
     CodingToolPolicy,
+    GovernanceDecision,
     GovernanceDisposition,
 )
 from fast_agent.transactional.models import RunId, ToolCallId, ToolEffect
@@ -165,3 +167,57 @@ async def test_gate_fails_closed_when_approval_is_unavailable(tmp_path: Path) ->
     )
 
     assert decision.disposition is GovernanceDisposition.DENY
+
+
+class _PermissionHandler:
+    def __init__(self, result: ToolPermissionResult) -> None:
+        self.result = result
+        self.calls = 0
+
+    async def check_permission(
+        self,
+        tool_name: str,
+        server_name: str,
+        arguments: dict | None = None,
+        tool_use_id: str | None = None,
+    ) -> ToolPermissionResult:
+        del tool_name, server_name, arguments, tool_use_id
+        self.calls += 1
+        return self.result
+
+
+@pytest.mark.asyncio
+async def test_gate_allows_one_approved_unknown_tool(tmp_path: Path) -> None:
+    policy, _ = _policy(tmp_path)
+    handler = _PermissionHandler(ToolPermissionResult.allow())
+    gate = CodingToolGovernanceGate(
+        policy,
+        current_workspace_version=lambda: "version-1",
+        permission_handler=handler,
+    )
+
+    decision = await gate.evaluate(
+        _request("remote_tool", {"target": "external"}),
+        ToolEffect.EXTERNAL_UNKNOWN,
+    )
+
+    assert decision.disposition is GovernanceDisposition.ALLOW
+    assert handler.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_gate_denies_when_workspace_changes_during_approval(tmp_path: Path) -> None:
+    policy, _ = _policy(tmp_path)
+    versions = iter(("version-1", "version-2"))
+    gate = CodingToolGovernanceGate(
+        policy,
+        current_workspace_version=lambda: next(versions),
+        permission_handler=_PermissionHandler(ToolPermissionResult.allow()),
+    )
+
+    decision = await gate.evaluate(
+        _request("remote_tool", {"target": "external"}),
+        ToolEffect.EXTERNAL_UNKNOWN,
+    )
+
+    assert decision == GovernanceDecision.deny("approval context changed before tool execution")

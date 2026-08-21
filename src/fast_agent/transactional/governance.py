@@ -3,6 +3,8 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import shlex
+from copy import deepcopy
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
@@ -16,6 +18,9 @@ from fast_agent.transactional.models import ToolEffect
 from fast_agent.utils.tool_names import is_shell_command_tool_name, matches_tool_name
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
+    from fast_agent.mcp.tool_permission_handler import ToolPermissionHandler
     from fast_agent.transactional.execution import ToolExecutionRequest
 
 
@@ -24,7 +29,6 @@ POLICY_VERSION = "coding-v1"
 _PATH_ARGUMENTS = ("path", "cwd", "working_directory")
 _PATCH_PATH = re.compile(r"^\*\*\* (?:Add|Delete|Update) File: (.+)$", re.MULTILINE)
 _PATCH_MOVE_PATH = re.compile(r"^\*\*\* Move to: (.+)$", re.MULTILINE)
-_SHELL_ABSOLUTE_PATH = re.compile(r"(?<![\w.-])(/[^\s;&|<>]+)")
 _SHELL_PRIVILEGE_ESCALATION = re.compile(
     r"(?:^|[;&|]\s*)(?:\S*/)?(?:sudo|doas|pkexec|su)(?:\s|$)",
     re.IGNORECASE,
@@ -216,24 +220,56 @@ class CodingToolPolicy:
             return True
         if str(self._transactional_root) in command:
             return True
-        for match in _SHELL_ABSOLUTE_PATH.finditer(command):
-            raw_path = match.group(1).rstrip(",:)\"'")
-            prefix = command[max(0, match.start(1) - 8) : match.start(1)]
-            if raw_path.startswith("//") or prefix.endswith(":"):
-                continue
-            if self._validate_path(raw_path) is not None:
-                return True
-        return any(
+        if any(
             marker in normalized.casefold()
             for marker in ("/.env", "/.ssh/", "/.aws/", "/.gnupg/", "credentials.json")
-        )
+        ):
+            return True
+
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
+        lexer.whitespace_split = True
+        lexer.commenters = ""
+        try:
+            tokens = list(lexer)
+        except ValueError:
+            return True
+
+        command_start = True
+        skip_payload = False
+        for token in tokens:
+            if token in {";", "&&", "||", "|", "&"}:
+                command_start = True
+                skip_payload = False
+                continue
+            if command_start:
+                command_start = False
+                continue
+            if skip_payload:
+                skip_payload = False
+                continue
+            if token in {"-c", "-Command"}:
+                skip_payload = True
+                continue
+            if token.startswith("-") or "://" in token:
+                continue
+            if Path(token).is_absolute() and self._validate_path(token) is not None:
+                return True
+        return False
 
 
 class CodingToolGovernanceGate:
-    """Apply coding policy and fail closed while approval is unavailable."""
+    """Apply coding policy and request one context-bound approval when required."""
 
-    def __init__(self, policy: CodingToolPolicy) -> None:
+    def __init__(
+        self,
+        policy: CodingToolPolicy,
+        *,
+        current_workspace_version: Callable[[], str] | None = None,
+        permission_handler: ToolPermissionHandler | None = None,
+    ) -> None:
         self._policy = policy
+        self._current_workspace_version = current_workspace_version
+        self._permission_handler = permission_handler
 
     async def evaluate(
         self,
@@ -242,9 +278,52 @@ class CodingToolGovernanceGate:
         /,
     ) -> GovernanceDecision:
         decision = self._policy.evaluate(request, effect)
-        if decision.disposition is GovernanceDisposition.REQUIRE_APPROVAL:
+        if decision.disposition is not GovernanceDisposition.REQUIRE_APPROVAL:
+            return decision
+        if self._permission_handler is None or self._current_workspace_version is None:
             return GovernanceDecision.deny(decision.reason)
-        return decision
+
+        try:
+            binding = self._approval_binding(request)
+            permission = await self._permission_handler.check_permission(
+                tool_name=request.tool_name,
+                server_name=request.server_name or "local",
+                arguments=deepcopy(request.arguments),
+                tool_use_id=str(request.tool_call_id),
+            )
+        except Exception as exc:
+            return GovernanceDecision.deny(f"approval request failed: {exc}")
+
+        if not permission.allowed:
+            return GovernanceDecision.deny(
+                permission.error_message or f"approval denied for tool: {request.tool_name}"
+            )
+
+        revalidated = self._policy.evaluate(request, effect)
+        if revalidated.disposition is not GovernanceDisposition.REQUIRE_APPROVAL:
+            return GovernanceDecision.deny("approval context changed during policy revalidation")
+        if self._approval_binding(request) != binding:
+            return GovernanceDecision.deny("approval context changed before tool execution")
+        return GovernanceDecision.allow()
+
+    def _approval_binding(self, request: ToolExecutionRequest) -> ApprovalBinding:
+        current_version = self._current_workspace_version
+        if current_version is None:
+            raise RuntimeError("approval requires a workspace version provider")
+        return ApprovalBinding(
+            tool_name=request.tool_name,
+            arguments_sha256=normalized_arguments_sha256(request),
+            workspace_version=current_version(),
+            policy_version=self._policy.version,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ApprovalBinding:
+    tool_name: str
+    arguments_sha256: str
+    workspace_version: str
+    policy_version: str
 
 
 def normalized_arguments_sha256(request: ToolExecutionRequest) -> str:

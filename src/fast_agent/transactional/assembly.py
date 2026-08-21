@@ -20,6 +20,7 @@ from fast_agent.transactional.storage.run_event_store import SQLiteRunEventStore
 if TYPE_CHECKING:
     from pathlib import Path
 
+    from fast_agent.mcp.tool_permission_handler import ToolPermissionHandler
     from fast_agent.transactional.checkpoint.checkpoint import CheckpointMetadata
     from fast_agent.transactional.checkpoint.worktree import WorktreeMetadata
     from fast_agent.transactional.execution import ToolExecutionRequest
@@ -70,6 +71,7 @@ class TransactionalRuntimeAssembler:
         *,
         run_id: RunId | None = None,
         worktree: WorktreeMetadata | None = None,
+        permission_handler: ToolPermissionHandler | None = None,
     ) -> TransactionalRuntime | None:
         if self._settings.profile is TransactionalProfile.BASELINE:
             return None
@@ -109,6 +111,7 @@ class TransactionalRuntimeAssembler:
             budget,
             reducer,
             worktree,
+            permission_handler,
         )
 
     def _assemble_full(
@@ -120,6 +123,7 @@ class TransactionalRuntimeAssembler:
         budget: RunBudgetTracker,
         reducer: CodingToolResultReducer,
         worktree: WorktreeMetadata,
+        permission_handler: ToolPermissionHandler | None,
     ) -> TransactionalRuntime:
         if worktree.run_id != run_id:
             event_store.close()
@@ -130,7 +134,9 @@ class TransactionalRuntimeAssembler:
                 worktree.worktree_path,
                 run_root,
                 max_shell_timeout_seconds=self._settings.shell_terminal_timeout_seconds,
-            )
+            ),
+            current_workspace_version=lambda: str(checkpoint_manager.current_version()),
+            permission_handler=permission_handler,
         )
         checkpoints: dict[str, CheckpointMetadata] = {}
 

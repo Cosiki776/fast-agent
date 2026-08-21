@@ -150,8 +150,10 @@ class TransactionCoordinator:
             denial_reason = (
                 decision.reason if decision.disposition is not GovernanceDisposition.ALLOW else None
             )
+            if denial_reason is None and self._classify_effect(request) is not effect:
+                denial_reason = "tool effect changed during governance"
             governed = denial_reason is None
-        elif effect is ToolEffect.EXTERNAL_UNKNOWN:
+        elif denial_reason is None and effect is ToolEffect.EXTERNAL_UNKNOWN:
             denial_reason = f"tool effect is unknown: {request.tool_name}"
         if denial_reason is not None:
             self._event_store.append(

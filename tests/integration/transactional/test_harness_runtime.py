@@ -69,6 +69,41 @@ class _TwoTimeoutsThenDoneLlm(PassthroughLLM):
         return Prompt.assistant("done", stop_reason=LlmStopReason.END_TURN)
 
 
+class _OneCommandThenDoneLlm(PassthroughLLM):
+    def __init__(self, command: str) -> None:
+        super().__init__()
+        self._command = command
+        self._turn = 0
+        self.final_request: list[PromptMessageExtended] | None = None
+
+    async def _apply_prompt_provider_specific(
+        self,
+        multipart_messages: list[PromptMessageExtended],
+        request_params: RequestParams | None = None,
+        tools: list[Tool] | None = None,
+        is_template: bool = False,
+    ) -> PromptMessageExtended:
+        del request_params, tools, is_template
+        self._turn += 1
+        if self._turn == 1:
+            return Prompt.assistant(
+                "Run the external command",
+                stop_reason=LlmStopReason.TOOL_USE,
+                tool_calls={
+                    "external-1": CallToolRequest(
+                        method="tools/call",
+                        params=CallToolRequestParams(
+                            name="execute",
+                            arguments={"command": self._command},
+                        ),
+                    )
+                },
+            )
+
+        self.final_request = [message.model_copy(deep=True) for message in multipart_messages]
+        return Prompt.assistant("done", stop_reason=LlmStopReason.END_TURN)
+
+
 def _git_repository(root: Path) -> Path:
     root.mkdir()
     subprocess.run(["git", "init", "-q"], cwd=root, check=True)
@@ -230,6 +265,72 @@ async def test_cli_modes_create_transactional_harness_runtime(
             await run_cli_flow(fast, request, flow=flow)
 
         assert observed == [(TransactionalProfile.REDUCER, True)]
+    finally:
+        update_global_settings(old_settings)
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_full_cli_denies_unknown_side_effect_before_shell_execution(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository = _git_repository(tmp_path / "repository")
+    old_settings = get_settings()
+
+    async def deny(*args, **kwargs) -> str:
+        del args, kwargs
+        return "deny"
+
+    monkeypatch.setattr("fast_agent.cli.runtime.tool_approval.get_selection_input", deny)
+    try:
+        fast, config_path, home = _fast_agent(
+            tmp_path,
+            profile=TransactionalProfile.FULL,
+            workspace=repository,
+        )
+        llm = _OneCommandThenDoneLlm("curl https://example.test && touch should-not-exist.txt")
+        request = _request(
+            config_path=config_path,
+            home=home,
+            workspace=repository,
+            message="request an external side effect",
+        )
+        observed = False
+
+        async def flow(
+            agent_app: AgentApp,
+            request: AgentRunRequest,
+            *,
+            session_manager: SessionManager | None = None,
+            harness_session: HarnessSession | None = None,
+        ) -> None:
+            nonlocal observed
+            del request, session_manager
+            assert harness_session is not None
+            runtime = harness_session._record.transactional_runtime
+            assert runtime is not None
+            assert runtime.worktree is not None
+            cast("McpAgent", agent_app["main"])._llm = llm
+
+            assert await harness_session.send("request an external side effect") == "done"
+            assert llm.final_request is not None
+            denied = next(
+                result
+                for message in llm.final_request
+                for result in (message.tool_results or {}).values()
+            )
+            assert denied.structured_content == {
+                "status": "denied",
+                "reason": "Tool approval denied",
+            }
+            assert not (runtime.worktree.worktree_path / "should-not-exist.txt").exists()
+            observed = True
+
+        with suppress_interactive_display():
+            await run_cli_flow(fast, request, flow=flow)
+
+        assert observed is True
     finally:
         update_global_settings(old_settings)
 

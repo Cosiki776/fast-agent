@@ -45,6 +45,7 @@ if TYPE_CHECKING:
     from fast_agent.core.harness_app import HarnessApp
     from fast_agent.history.compaction import CompactionResult
     from fast_agent.interfaces import AgentProtocol
+    from fast_agent.mcp.tool_permission_handler import ToolPermissionHandler
     from fast_agent.session.session_manager import Session, SessionManager
     from fast_agent.tools.environment_registry import EnvironmentSelection
     from fast_agent.tools.execution_environment import ShellEnvironment, ShellExecutionResult
@@ -550,6 +551,7 @@ class AgentHarness:
         self._transactional_resources: dict[
             int, tuple[TransactionalRuntime, WorktreeManager | None]
         ] = {}
+        self._transactional_permission_handler: ToolPermissionHandler | None = None
 
     @property
     def sessions(self) -> HarnessSessions:
@@ -710,6 +712,15 @@ class AgentHarness:
             settings=self._fast_agent.context.config,
             entrypoint=entrypoint,
         )
+
+    def set_transactional_permission_handler(
+        self,
+        handler: ToolPermissionHandler,
+    ) -> None:
+        """Set the permission handler used by subsequently created transactional sessions."""
+        if self._transactional_resources:
+            raise RuntimeError("Transactional sessions already exist for this harness")
+        self._transactional_permission_handler = handler
 
     @contextmanager
     def request_context(
@@ -916,6 +927,7 @@ class AgentHarness:
         runtime = TransactionalRuntimeAssembler(transactional, runtime_root / "runs").assemble(
             run_id=run_id,
             worktree=worktree,
+            permission_handler=self._transactional_permission_handler,
         )
         if runtime is None:
             raise RuntimeError("Transactional runtime assembly unexpectedly returned baseline")

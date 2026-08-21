@@ -57,6 +57,8 @@ class LocalCodingEffectClassifier:
     """Explicit first-stage rules for supported local coding tools."""
 
     def __call__(self, request: ToolExecutionRequest, /) -> ToolEffect:
+        if request.server_name is not None:
+            return ToolEffect.EXTERNAL_UNKNOWN
         if request.tool_name == READ_TEXT_FILE_TOOL_NAME:
             return ToolEffect.READ
         if request.tool_name in _WORKSPACE_WRITE_TOOLS:

@@ -128,3 +128,43 @@ async def test_full_profile_composes_real_checkpoint_recovery(tmp_path: Path) ->
     finally:
         runtime.close()
         worktree_manager.cleanup(worktree)
+
+
+@pytest.mark.asyncio
+async def test_full_profile_policy_denies_path_escape_before_execution(tmp_path: Path) -> None:
+    repository = _repository(tmp_path)
+    run_id = RunId("full-policy")
+    worktree_manager = WorktreeManager(repository, tmp_path / "worktrees")
+    worktree = worktree_manager.create(run_id)
+    runtime = TransactionalRuntimeAssembler(
+        TransactionalSettings(profile=TransactionalProfile.FULL),
+        tmp_path / "runtime",
+    ).assemble(run_id=run_id, worktree=worktree)
+
+    assert runtime is not None
+    executions = 0
+
+    async def execute() -> ToolExecutionOutcome:
+        nonlocal executions
+        executions += 1
+        raise AssertionError("policy denial must not execute the tool")
+
+    try:
+        outcome = await runtime.coordinator.coordinate(
+            ToolExecutionRequest(
+                run_id=run_id,
+                tool_call_id=ToolCallId("escape"),
+                tool_name="write_text_file",
+                arguments={"path": "../outside.txt", "content": "unsafe"},
+            ),
+            execute,
+        )
+
+        assert executions == 0
+        assert outcome.result.structured_content == {
+            "status": "denied",
+            "reason": "path escapes the Run worktree: ../outside.txt",
+        }
+    finally:
+        runtime.close()
+        worktree_manager.cleanup(worktree)

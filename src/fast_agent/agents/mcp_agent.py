@@ -2246,6 +2246,7 @@ class McpAgent(ABC, ToolAgent):
             tool_call_id=ToolCallId(call.correlation_id),
             tool_name=call.tool_name,
             arguments=arguments,
+            server_name=call.server_name,
         )
 
     async def _record_planned_tool_result(

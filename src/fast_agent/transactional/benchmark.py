@@ -9,19 +9,14 @@ from typing import TYPE_CHECKING, Annotated
 import yaml
 from pydantic import BaseModel, ConfigDict, Field
 
+from fast_agent.transactional.verification import VerificationSpec  # noqa: TC001
+
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
     from pathlib import Path
 
 
 type NonNegativeInt = Annotated[int, Field(ge=0)]
-
-
-class VerificationSpec(BaseModel):
-    command: str = Field(min_length=1)
-    timeout_seconds: int = Field(gt=0)
-
-    model_config = ConfigDict(frozen=True, extra="forbid")
 
 
 class BenchmarkBudgetSpec(BaseModel):

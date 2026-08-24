@@ -13,12 +13,18 @@ class RunEventKind(StrEnum):
     STARTED = "run.started"
     RECOVERY_STARTED = "run.recovery_started"
     RECOVERED = "run.recovered"
+    VERIFICATION_STARTED = "run.verification_started"
+    VERIFICATION_FAILED = "run.verification_failed"
+    VERIFIED = "run.verified"
     FAILED = "run.failed"
 
 
 class RunState(StrEnum):
     ACTIVE = "active"
     RECOVERING = "recovering"
+    VERIFYING = "verifying"
+    VERIFICATION_FAILED = "verification_failed"
+    VERIFIED = "verified"
     FAILED = "failed"
 
 
@@ -52,12 +58,43 @@ class RunRecovered(RunEventBase):
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
+class RunVerificationStarted(RunEventBase):
+    kind: ClassVar[RunEventKind] = RunEventKind.VERIFICATION_STARTED
+    command: str
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class RunVerificationFailed(RunEventBase):
+    kind: ClassVar[RunEventKind] = RunEventKind.VERIFICATION_FAILED
+    exit_code: int
+    timed_out: bool
+    stdout_artifact_id: str
+    stderr_artifact_id: str
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class RunVerified(RunEventBase):
+    kind: ClassVar[RunEventKind] = RunEventKind.VERIFIED
+    workspace_version: str
+    stdout_artifact_id: str
+    stderr_artifact_id: str
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
 class RunFailed(RunEventBase):
     kind: ClassVar[RunEventKind] = RunEventKind.FAILED
     reason: str
 
 
-type RunEvent = RunStarted | RunRecoveryStarted | RunRecovered | RunFailed
+type RunEvent = (
+    RunStarted
+    | RunRecoveryStarted
+    | RunRecovered
+    | RunVerificationStarted
+    | RunVerificationFailed
+    | RunVerified
+    | RunFailed
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -75,8 +112,8 @@ def replay_run(events: list[RunEvent]) -> RunProjection:
     for event in events[1:]:
         if event.run_id != run_id:
             raise ValueError("Run event stream contains mixed run IDs")
-        if state is RunState.FAILED:
-            raise ValueError("A failed run cannot accept more events")
+        if state in {RunState.FAILED, RunState.VERIFIED}:
+            raise ValueError(f"A {state.value} run cannot accept more events")
         if isinstance(event, RunRecoveryStarted):
             if state is not RunState.ACTIVE:
                 raise ValueError("Recovery can only start from an active run")
@@ -85,6 +122,18 @@ def replay_run(events: list[RunEvent]) -> RunProjection:
             if state is not RunState.RECOVERING:
                 raise ValueError("run.recovered requires an active recovery")
             state = RunState.ACTIVE
+        elif isinstance(event, RunVerificationStarted):
+            if state not in {RunState.ACTIVE, RunState.VERIFICATION_FAILED}:
+                raise ValueError("Verification can only start from an active run")
+            state = RunState.VERIFYING
+        elif isinstance(event, RunVerificationFailed):
+            if state is not RunState.VERIFYING:
+                raise ValueError("run.verification_failed requires active verification")
+            state = RunState.VERIFICATION_FAILED
+        elif isinstance(event, RunVerified):
+            if state is not RunState.VERIFYING:
+                raise ValueError("run.verified requires active verification")
+            state = RunState.VERIFIED
         elif isinstance(event, RunFailed):
             state = RunState.FAILED
         else:

@@ -16,6 +16,7 @@ from fast_agent.transactional.settings import TransactionalProfile, Transactiona
 from fast_agent.transactional.storage.artifact_store import FileArtifactStore
 from fast_agent.transactional.storage.event_store import SQLiteEventStore
 from fast_agent.transactional.storage.run_event_store import SQLiteRunEventStore
+from fast_agent.transactional.verification import CompletionVerifier
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -164,7 +165,27 @@ class TransactionalRuntimeAssembler:
             recovery_controller=recovery,
             run_event_store=run_events,
         )
-        controller = TransactionalCodingRun(run_id, run_events, budget)
+        verifier = None
+        if self._settings.verification is not None:
+            from fast_agent.core.logging.logger import get_logger
+            from fast_agent.tools.local_shell_executor import LocalShellExecutor
+
+            verifier = CompletionVerifier(
+                LocalShellExecutor(
+                    logger=get_logger(__name__),
+                    working_directory=worktree.worktree_path,
+                ),
+                artifact_store,
+            )
+        controller = TransactionalCodingRun(
+            run_id,
+            run_events,
+            budget,
+            verifier=verifier,
+            verification_spec=self._settings.verification,
+            workspace=worktree.worktree_path,
+            workspace_version=lambda: str(checkpoint_manager.current_version()),
+        )
         return TransactionalRuntime(
             run_id=run_id,
             profile=self._settings.profile,

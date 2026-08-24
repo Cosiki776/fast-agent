@@ -6,6 +6,7 @@ from typing import Annotated, Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 from fast_agent.transactional.budget import RunBudgetLimits
+from fast_agent.transactional.verification import VerificationSpec  # noqa: TC001
 
 NonNegativeInt = Annotated[int, Field(ge=0)]
 NonNegativeFloat = Annotated[float, Field(ge=0)]
@@ -33,6 +34,7 @@ class TransactionalSettings(BaseModel):
     max_tokens: NonNegativeInt | None = None
     max_recovery_attempts: NonNegativeInt | None = 3
     shell_terminal_timeout_seconds: NonNegativeFloat = 300
+    verification: VerificationSpec | None = None
 
     def budget_limits(self) -> RunBudgetLimits:
         return RunBudgetLimits(

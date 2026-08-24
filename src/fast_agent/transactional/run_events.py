@@ -16,6 +16,8 @@ class RunEventKind(StrEnum):
     VERIFICATION_STARTED = "run.verification_started"
     VERIFICATION_FAILED = "run.verification_failed"
     VERIFIED = "run.verified"
+    PROMOTION_APPLIED = "promotion.applied"
+    PROMOTION_REJECTED = "promotion.rejected"
     FAILED = "run.failed"
 
 
@@ -25,6 +27,8 @@ class RunState(StrEnum):
     VERIFYING = "verifying"
     VERIFICATION_FAILED = "verification_failed"
     VERIFIED = "verified"
+    PROMOTED = "promoted"
+    PROMOTION_REJECTED = "promotion_rejected"
     FAILED = "failed"
 
 
@@ -81,6 +85,20 @@ class RunVerified(RunEventBase):
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
+class PromotionApplied(RunEventBase):
+    kind: ClassVar[RunEventKind] = RunEventKind.PROMOTION_APPLIED
+    workspace_version: str
+    patch_artifact_id: str
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class PromotionRejected(RunEventBase):
+    kind: ClassVar[RunEventKind] = RunEventKind.PROMOTION_REJECTED
+    reason: str
+    patch_artifact_id: str
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
 class RunFailed(RunEventBase):
     kind: ClassVar[RunEventKind] = RunEventKind.FAILED
     reason: str
@@ -93,6 +111,8 @@ type RunEvent = (
     | RunVerificationStarted
     | RunVerificationFailed
     | RunVerified
+    | PromotionApplied
+    | PromotionRejected
     | RunFailed
 )
 
@@ -112,7 +132,7 @@ def replay_run(events: list[RunEvent]) -> RunProjection:
     for event in events[1:]:
         if event.run_id != run_id:
             raise ValueError("Run event stream contains mixed run IDs")
-        if state in {RunState.FAILED, RunState.VERIFIED}:
+        if state in {RunState.FAILED, RunState.PROMOTED, RunState.PROMOTION_REJECTED}:
             raise ValueError(f"A {state.value} run cannot accept more events")
         if isinstance(event, RunRecoveryStarted):
             if state is not RunState.ACTIVE:
@@ -134,6 +154,14 @@ def replay_run(events: list[RunEvent]) -> RunProjection:
             if state is not RunState.VERIFYING:
                 raise ValueError("run.verified requires active verification")
             state = RunState.VERIFIED
+        elif isinstance(event, PromotionApplied):
+            if state is not RunState.VERIFIED:
+                raise ValueError("promotion.applied requires a verified run")
+            state = RunState.PROMOTED
+        elif isinstance(event, PromotionRejected):
+            if state is not RunState.VERIFIED:
+                raise ValueError("promotion.rejected requires a verified run")
+            state = RunState.PROMOTION_REJECTED
         elif isinstance(event, RunFailed):
             state = RunState.FAILED
         else:

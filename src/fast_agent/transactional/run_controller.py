@@ -2,7 +2,10 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, TypeVar
 
+from fast_agent.transactional.checkpoint.promotion import PromotionRejectedError
 from fast_agent.transactional.run_events import (
+    PromotionApplied,
+    PromotionRejected,
     RunFailed,
     RunState,
     RunVerificationFailed,
@@ -16,6 +19,7 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     from fast_agent.transactional.budget import RunBudgetTracker
+    from fast_agent.transactional.checkpoint.promotion import PromotionResult
     from fast_agent.transactional.models import RunId
     from fast_agent.transactional.storage.run_event_store import SQLiteRunEventStore
     from fast_agent.transactional.verification import CompletionVerifier, VerificationSpec
@@ -40,6 +44,7 @@ class TransactionalCodingRun:
         verification_spec: VerificationSpec | None = None,
         workspace: Path | None = None,
         workspace_version: Callable[[], str] | None = None,
+        promote: Callable[[str], PromotionResult] | None = None,
     ) -> None:
         self.run_id = run_id
         self._run_events = run_events
@@ -48,14 +53,22 @@ class TransactionalCodingRun:
         self._verification_spec = verification_spec
         self._workspace = workspace
         self._workspace_version = workspace_version
+        self._promote = promote
 
     @property
     def state(self) -> RunState:
         return self._run_events.replay(self.run_id).state
 
     async def call_agent_once(self, call: Callable[[], Awaitable[ResultT]]) -> ResultT:
-        if self.state is RunState.FAILED:
-            raise TransactionalRunTerminatedError(f"Transactional run '{self.run_id}' has failed")
+        if self.state in {
+            RunState.FAILED,
+            RunState.VERIFIED,
+            RunState.PROMOTED,
+            RunState.PROMOTION_REJECTED,
+        }:
+            raise TransactionalRunTerminatedError(
+                f"Transactional run '{self.run_id}' is terminal ({self.state.value})"
+            )
         wall_time = self._budget.check_wall_time()
         if not wall_time.allowed:
             self.fail("budget exhausted: wall_time")
@@ -64,7 +77,7 @@ class TransactionalCodingRun:
             result = await call()
             await self._verify_completion()
             return result
-        except CompletionVerificationError:
+        except (CompletionVerificationError, PromotionRejectedError):
             raise
         except Exception as exc:
             self.fail(f"agent turn failed: {type(exc).__name__}: {exc}")
@@ -93,14 +106,34 @@ class TransactionalCodingRun:
                 )
             )
             raise CompletionVerificationError(result)
+        verified_version = self._workspace_version()
         self._run_events.append(
             RunVerified(
                 run_id=self.run_id,
-                workspace_version=self._workspace_version(),
+                workspace_version=verified_version,
                 stdout_artifact_id=result.stdout_artifact_id,
                 stderr_artifact_id=result.stderr_artifact_id,
             )
         )
+        if self._promote is not None:
+            try:
+                promotion = self._promote(verified_version)
+            except PromotionRejectedError as exc:
+                self._run_events.append(
+                    PromotionRejected(
+                        run_id=self.run_id,
+                        reason=str(exc),
+                        patch_artifact_id=exc.patch_artifact_id,
+                    )
+                )
+                raise
+            self._run_events.append(
+                PromotionApplied(
+                    run_id=self.run_id,
+                    workspace_version=promotion.workspace_version,
+                    patch_artifact_id=promotion.patch_artifact_id,
+                )
+            )
 
     def fail(self, reason: str) -> None:
         if self.state is not RunState.FAILED:

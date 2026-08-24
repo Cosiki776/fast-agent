@@ -935,6 +935,8 @@ class AgentHarness:
         run_id = new_run_id()
         worktree_manager: WorktreeManager | None = None
         worktree = None
+        snapshot_manager = None
+        snapshot = None
         if transactional.profile is TransactionalProfile.FULL:
             snapshot_manager = WorkspaceSnapshotManager(
                 self._fast_agent.workspace_root,
@@ -952,6 +954,8 @@ class AgentHarness:
             run_id=run_id,
             worktree=worktree,
             permission_handler=self._transactional_permission_handler,
+            snapshot_manager=snapshot_manager,
+            snapshot=snapshot,
         )
         if runtime is None:
             raise RuntimeError("Transactional runtime assembly unexpectedly returned baseline")

@@ -24,6 +24,7 @@ class ArtifactKind(StrEnum):
     RAW_RESULT = "raw_result"
     STDOUT = "stdout"
     STDERR = "stderr"
+    WORKSPACE_PATCH = "workspace_patch"
 
 
 @dataclass(frozen=True, slots=True)

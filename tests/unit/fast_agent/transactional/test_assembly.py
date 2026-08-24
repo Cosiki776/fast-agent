@@ -8,11 +8,16 @@ from mcp.types import CallToolResult, TextContent
 
 from fast_agent.mcp.tool_permission_handler import ToolPermissionResult
 from fast_agent.transactional.assembly import TransactionalRuntimeAssembler
+from fast_agent.transactional.checkpoint.snapshot import (
+    WorkspaceChangedError,
+    WorkspaceSnapshotManager,
+)
 from fast_agent.transactional.checkpoint.worktree import WorktreeManager
 from fast_agent.transactional.execution import ToolExecutionOutcome, ToolExecutionRequest
 from fast_agent.transactional.models import RunId, ToolCallId
-from fast_agent.transactional.run_events import RunEventKind
+from fast_agent.transactional.run_events import RunEventKind, RunState
 from fast_agent.transactional.settings import TransactionalProfile, TransactionalSettings
+from fast_agent.transactional.verification import VerificationSpec
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -87,6 +92,88 @@ def test_full_profile_requires_run_worktree(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="requires a Run worktree"):
         assembler.assemble(run_id=RunId("full"))
+
+
+@pytest.mark.asyncio
+async def test_full_profile_verifies_and_promotes_agent_workspace(tmp_path: Path) -> None:
+    repository = _repository(tmp_path)
+    run_id = RunId("full-promotion")
+    snapshots = WorkspaceSnapshotManager(repository, tmp_path / "snapshots")
+    snapshot = snapshots.capture()
+    worktree_manager = WorktreeManager(repository, tmp_path / "worktrees")
+    worktree = worktree_manager.create(run_id, baseline=snapshot.base_commit)
+    snapshots.materialize(snapshot, worktree)
+    runtime = TransactionalRuntimeAssembler(
+        TransactionalSettings(
+            profile=TransactionalProfile.FULL,
+            verification=VerificationSpec(command="test -f result.txt", timeout_seconds=5),
+        ),
+        tmp_path / "runtime",
+    ).assemble(
+        run_id=run_id,
+        worktree=worktree,
+        snapshot_manager=snapshots,
+        snapshot=snapshot,
+    )
+
+    assert runtime is not None
+    assert runtime.controller is not None
+    try:
+
+        async def finish() -> str:
+            worktree.worktree_path.joinpath("result.txt").write_text("done\n", encoding="utf-8")
+            return "done"
+
+        assert await runtime.controller.call_agent_once(finish) == "done"
+        assert repository.joinpath("result.txt").read_text(encoding="utf-8") == "done\n"
+        assert runtime.controller.state is RunState.PROMOTED
+    finally:
+        runtime.close()
+        worktree_manager.cleanup(worktree)
+
+
+@pytest.mark.asyncio
+async def test_full_profile_rejects_promotion_after_source_change(tmp_path: Path) -> None:
+    repository = _repository(tmp_path)
+    run_id = RunId("full-rejected-promotion")
+    snapshots = WorkspaceSnapshotManager(repository, tmp_path / "snapshots")
+    snapshot = snapshots.capture()
+    worktree_manager = WorktreeManager(repository, tmp_path / "worktrees")
+    worktree = worktree_manager.create(run_id, baseline=snapshot.base_commit)
+    snapshots.materialize(snapshot, worktree)
+    runtime = TransactionalRuntimeAssembler(
+        TransactionalSettings(
+            profile=TransactionalProfile.FULL,
+            verification=VerificationSpec(command="test -f result.txt", timeout_seconds=5),
+        ),
+        tmp_path / "runtime",
+    ).assemble(
+        run_id=run_id,
+        worktree=worktree,
+        snapshot_manager=snapshots,
+        snapshot=snapshot,
+    )
+
+    assert runtime is not None
+    assert runtime.controller is not None
+    try:
+
+        async def finish() -> str:
+            worktree.worktree_path.joinpath("result.txt").write_text("agent\n", encoding="utf-8")
+            repository.joinpath("tracked.txt").write_text("user\n", encoding="utf-8")
+            return "done"
+
+        with pytest.raises(WorkspaceChangedError, match="changed after snapshot"):
+            await runtime.controller.call_agent_once(finish)
+        assert repository.joinpath("tracked.txt").read_text(encoding="utf-8") == "user\n"
+        assert not repository.joinpath("result.txt").exists()
+        assert (
+            worktree.worktree_path.joinpath("result.txt").read_text(encoding="utf-8") == "agent\n"
+        )
+        assert runtime.controller.state is RunState.PROMOTION_REJECTED
+    finally:
+        runtime.close()
+        worktree_manager.cleanup(worktree)
 
 
 @pytest.mark.asyncio

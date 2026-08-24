@@ -8,6 +8,8 @@ from typing import TYPE_CHECKING, Self
 
 from fast_agent.transactional.models import RunId
 from fast_agent.transactional.run_events import (
+    PromotionApplied,
+    PromotionRejected,
     RunEvent,
     RunEventKind,
     RunFailed,
@@ -116,6 +118,16 @@ def _payload(event: RunEvent) -> dict[str, object]:
             "stdout_artifact_id": event.stdout_artifact_id,
             "stderr_artifact_id": event.stderr_artifact_id,
         }
+    if isinstance(event, PromotionApplied):
+        return {
+            "workspace_version": event.workspace_version,
+            "patch_artifact_id": event.patch_artifact_id,
+        }
+    if isinstance(event, PromotionRejected):
+        return {
+            "reason": event.reason,
+            "patch_artifact_id": event.patch_artifact_id,
+        }
     return {"reason": event.reason}
 
 
@@ -158,6 +170,18 @@ def _stored_event(row: sqlite3.Row) -> StoredRunEvent:
             workspace_version=_required_string(payload, "workspace_version"),
             stdout_artifact_id=_required_string(payload, "stdout_artifact_id"),
             stderr_artifact_id=_required_string(payload, "stderr_artifact_id"),
+        )
+    elif kind is RunEventKind.PROMOTION_APPLIED:
+        event = PromotionApplied(
+            **fields,
+            workspace_version=_required_string(payload, "workspace_version"),
+            patch_artifact_id=_required_string(payload, "patch_artifact_id"),
+        )
+    elif kind is RunEventKind.PROMOTION_REJECTED:
+        event = PromotionRejected(
+            **fields,
+            reason=_required_string(payload, "reason"),
+            patch_artifact_id=_required_string(payload, "patch_artifact_id"),
         )
     else:
         event = RunFailed(**fields, reason=_required_string(payload, "reason"))

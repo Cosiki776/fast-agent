@@ -23,6 +23,10 @@ if TYPE_CHECKING:
 
     from fast_agent.mcp.tool_permission_handler import ToolPermissionHandler
     from fast_agent.transactional.checkpoint.checkpoint import CheckpointMetadata
+    from fast_agent.transactional.checkpoint.snapshot import (
+        WorkspaceSnapshot,
+        WorkspaceSnapshotManager,
+    )
     from fast_agent.transactional.checkpoint.worktree import WorktreeMetadata
     from fast_agent.transactional.execution import ToolExecutionRequest
 
@@ -73,6 +77,8 @@ class TransactionalRuntimeAssembler:
         run_id: RunId | None = None,
         worktree: WorktreeMetadata | None = None,
         permission_handler: ToolPermissionHandler | None = None,
+        snapshot_manager: WorkspaceSnapshotManager | None = None,
+        snapshot: WorkspaceSnapshot | None = None,
     ) -> TransactionalRuntime | None:
         if self._settings.profile is TransactionalProfile.BASELINE:
             return None
@@ -113,6 +119,8 @@ class TransactionalRuntimeAssembler:
             reducer,
             worktree,
             permission_handler,
+            snapshot_manager,
+            snapshot,
         )
 
     def _assemble_full(
@@ -125,6 +133,8 @@ class TransactionalRuntimeAssembler:
         reducer: CodingToolResultReducer,
         worktree: WorktreeMetadata,
         permission_handler: ToolPermissionHandler | None,
+        snapshot_manager: WorkspaceSnapshotManager | None,
+        snapshot: WorkspaceSnapshot | None,
     ) -> TransactionalRuntime:
         if worktree.run_id != run_id:
             event_store.close()
@@ -166,6 +176,7 @@ class TransactionalRuntimeAssembler:
             run_event_store=run_events,
         )
         verifier = None
+        promote = None
         if self._settings.verification is not None:
             from fast_agent.core.logging.logger import get_logger
             from fast_agent.tools.local_shell_executor import LocalShellExecutor
@@ -177,6 +188,19 @@ class TransactionalRuntimeAssembler:
                 ),
                 artifact_store,
             )
+            if snapshot_manager is None or snapshot is None:
+                event_store.close()
+                run_events.close()
+                raise ValueError("workspace promotion requires the initial WorkspaceSnapshot")
+            from fast_agent.transactional.checkpoint.promotion import WorkspacePromoter
+
+            promoter = WorkspacePromoter(
+                snapshot_manager,
+                snapshot,
+                worktree,
+                artifact_store,
+            )
+            promote = promoter.promote
         controller = TransactionalCodingRun(
             run_id,
             run_events,
@@ -184,7 +208,12 @@ class TransactionalRuntimeAssembler:
             verifier=verifier,
             verification_spec=self._settings.verification,
             workspace=worktree.worktree_path,
-            workspace_version=lambda: str(checkpoint_manager.current_version()),
+            workspace_version=(
+                (lambda: str(snapshot_manager.worktree_version(snapshot, worktree)))
+                if snapshot_manager is not None and snapshot is not None
+                else lambda: str(checkpoint_manager.current_version())
+            ),
+            promote=promote,
         )
         return TransactionalRuntime(
             run_id=run_id,

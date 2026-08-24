@@ -52,6 +52,7 @@ from fast_agent.transactional.storage.artifact_store import ArtifactKind
 
 if TYPE_CHECKING:
     from fast_agent.transactional.budget import BudgetDimension, RunBudgetTracker
+    from fast_agent.transactional.governance import ToolGovernanceGate
     from fast_agent.transactional.storage.artifact_store import FileArtifactStore
     from fast_agent.transactional.storage.event_store import SQLiteEventStore
     from fast_agent.transactional.storage.run_event_store import SQLiteRunEventStore
@@ -76,6 +77,7 @@ class TransactionCoordinator:
         result_reducer: ToolResultReducer | None = None,
         run_budget: RunBudgetTracker | None = None,
         effect_classifier: ToolEffectClassifier | None = None,
+        governance_gate: ToolGovernanceGate | None = None,
         recovery_controller: RecoveryController | None = None,
         run_event_store: SQLiteRunEventStore | None = None,
         transaction_id_factory: TransactionIdFactory = new_transaction_id,
@@ -88,6 +90,7 @@ class TransactionCoordinator:
         self._result_reducer = result_reducer
         self._run_budget = run_budget
         self._effect_classifier = effect_classifier or LocalCodingEffectClassifier()
+        self._governance_gate = governance_gate
         self._recovery_controller = recovery_controller
         self._run_event_store = run_event_store
         self._transaction_id_factory = transaction_id_factory
@@ -139,7 +142,18 @@ class TransactionCoordinator:
                 )
 
         denial_reason = self._denial_reason(request) if self._denial_reason is not None else None
-        if effect is ToolEffect.EXTERNAL_UNKNOWN:
+        governed = False
+        if denial_reason is None and self._governance_gate is not None:
+            from fast_agent.transactional.governance import GovernanceDisposition
+
+            decision = await self._governance_gate.evaluate(request, effect)
+            denial_reason = (
+                decision.reason if decision.disposition is not GovernanceDisposition.ALLOW else None
+            )
+            if denial_reason is None and self._classify_effect(request) is not effect:
+                denial_reason = "tool effect changed during governance"
+            governed = denial_reason is None
+        elif denial_reason is None and effect is ToolEffect.EXTERNAL_UNKNOWN:
             denial_reason = f"tool effect is unknown: {request.tool_name}"
         if denial_reason is not None:
             self._event_store.append(
@@ -160,7 +174,7 @@ class TransactionCoordinator:
             )
             return ToolExecutionOutcome(result=_denied_result(denial_reason))
 
-        if effect is ToolEffect.WORKSPACE_WRITE and self._checkpoint_creator is not None:
+        if governed:
             self._event_store.append(
                 ToolValidated(
                     run_id=request.run_id,
@@ -175,6 +189,23 @@ class TransactionCoordinator:
                     tool_call_id=request.tool_call_id,
                 )
             )
+
+        if effect is ToolEffect.WORKSPACE_WRITE and self._checkpoint_creator is not None:
+            if not governed:
+                self._event_store.append(
+                    ToolValidated(
+                        run_id=request.run_id,
+                        transaction_id=transaction_id,
+                        tool_call_id=request.tool_call_id,
+                    )
+                )
+                self._event_store.append(
+                    ToolAuthorized(
+                        run_id=request.run_id,
+                        transaction_id=transaction_id,
+                        tool_call_id=request.tool_call_id,
+                    )
+                )
             try:
                 checkpoint_id = self._checkpoint_creator(request)
                 if not checkpoint_id:

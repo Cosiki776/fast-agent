@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING
 import pytest
 from mcp.types import CallToolResult, TextContent
 
+from fast_agent.mcp.tool_permission_handler import ToolPermissionResult
 from fast_agent.transactional.assembly import TransactionalRuntimeAssembler
 from fast_agent.transactional.checkpoint.worktree import WorktreeManager
 from fast_agent.transactional.execution import ToolExecutionOutcome, ToolExecutionRequest
@@ -36,6 +37,22 @@ def _repository(tmp_path: Path) -> Path:
     _git(root, "add", "tracked.txt")
     _git(root, "commit", "-m", "baseline")
     return root
+
+
+class _AllowOnceHandler:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def check_permission(
+        self,
+        tool_name: str,
+        server_name: str,
+        arguments: dict | None = None,
+        tool_use_id: str | None = None,
+    ) -> ToolPermissionResult:
+        del tool_name, server_name, arguments, tool_use_id
+        self.calls += 1
+        return ToolPermissionResult.allow()
 
 
 def test_baseline_assembles_no_transactional_components(tmp_path: Path) -> None:
@@ -125,6 +142,95 @@ async def test_full_profile_composes_real_checkpoint_recovery(tmp_path: Path) ->
             RunEventKind.RECOVERY_STARTED,
             RunEventKind.RECOVERED,
         ]
+    finally:
+        runtime.close()
+        worktree_manager.cleanup(worktree)
+
+
+@pytest.mark.asyncio
+async def test_full_profile_policy_denies_path_escape_before_execution(tmp_path: Path) -> None:
+    repository = _repository(tmp_path)
+    run_id = RunId("full-policy")
+    worktree_manager = WorktreeManager(repository, tmp_path / "worktrees")
+    worktree = worktree_manager.create(run_id)
+    runtime = TransactionalRuntimeAssembler(
+        TransactionalSettings(profile=TransactionalProfile.FULL),
+        tmp_path / "runtime",
+    ).assemble(run_id=run_id, worktree=worktree)
+
+    assert runtime is not None
+    executions = 0
+
+    async def execute() -> ToolExecutionOutcome:
+        nonlocal executions
+        executions += 1
+        raise AssertionError("policy denial must not execute the tool")
+
+    try:
+        outcome = await runtime.coordinator.coordinate(
+            ToolExecutionRequest(
+                run_id=run_id,
+                tool_call_id=ToolCallId("escape"),
+                tool_name="write_text_file",
+                arguments={"path": "../outside.txt", "content": "unsafe"},
+            ),
+            execute,
+        )
+
+        assert executions == 0
+        assert outcome.result.structured_content == {
+            "status": "denied",
+            "reason": "path escapes the Run worktree: ../outside.txt",
+        }
+    finally:
+        runtime.close()
+        worktree_manager.cleanup(worktree)
+
+
+@pytest.mark.asyncio
+async def test_full_profile_executes_approved_unknown_tool_once(tmp_path: Path) -> None:
+    repository = _repository(tmp_path)
+    run_id = RunId("full-approval")
+    worktree_manager = WorktreeManager(repository, tmp_path / "worktrees")
+    worktree = worktree_manager.create(run_id)
+    permission_handler = _AllowOnceHandler()
+    runtime = TransactionalRuntimeAssembler(
+        TransactionalSettings(profile=TransactionalProfile.FULL),
+        tmp_path / "runtime",
+    ).assemble(
+        run_id=run_id,
+        worktree=worktree,
+        permission_handler=permission_handler,
+    )
+
+    assert runtime is not None
+    executions = 0
+
+    async def execute() -> ToolExecutionOutcome:
+        nonlocal executions
+        executions += 1
+        return ToolExecutionOutcome(
+            result=CallToolResult(
+                content=[TextContent(type="text", text="approved")],
+                structured_content={"status": "approved"},
+            )
+        )
+
+    try:
+        outcome = await runtime.coordinator.coordinate(
+            ToolExecutionRequest(
+                run_id=run_id,
+                tool_call_id=ToolCallId("approved"),
+                tool_name="read_text_file",
+                arguments={"target": "external"},
+                server_name="example",
+            ),
+            execute,
+        )
+
+        assert executions == 1
+        assert permission_handler.calls == 1
+        assert outcome.result.is_error is False
     finally:
         runtime.close()
         worktree_manager.cleanup(worktree)

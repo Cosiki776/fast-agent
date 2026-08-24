@@ -7,6 +7,7 @@ from fast_agent.transactional.budget import RunBudgetTracker
 from fast_agent.transactional.checkpoint.checkpoint import CheckpointManager
 from fast_agent.transactional.context.reducers import CodingToolResultReducer
 from fast_agent.transactional.coordinator import TransactionCoordinator
+from fast_agent.transactional.governance import CodingToolGovernanceGate, CodingToolPolicy
 from fast_agent.transactional.models import RunId, new_run_id
 from fast_agent.transactional.recovery.controller import RecoveryController
 from fast_agent.transactional.run_controller import TransactionalCodingRun
@@ -19,6 +20,7 @@ from fast_agent.transactional.storage.run_event_store import SQLiteRunEventStore
 if TYPE_CHECKING:
     from pathlib import Path
 
+    from fast_agent.mcp.tool_permission_handler import ToolPermissionHandler
     from fast_agent.transactional.checkpoint.checkpoint import CheckpointMetadata
     from fast_agent.transactional.checkpoint.worktree import WorktreeMetadata
     from fast_agent.transactional.execution import ToolExecutionRequest
@@ -69,6 +71,7 @@ class TransactionalRuntimeAssembler:
         *,
         run_id: RunId | None = None,
         worktree: WorktreeMetadata | None = None,
+        permission_handler: ToolPermissionHandler | None = None,
     ) -> TransactionalRuntime | None:
         if self._settings.profile is TransactionalProfile.BASELINE:
             return None
@@ -108,6 +111,7 @@ class TransactionalRuntimeAssembler:
             budget,
             reducer,
             worktree,
+            permission_handler,
         )
 
     def _assemble_full(
@@ -119,11 +123,21 @@ class TransactionalRuntimeAssembler:
         budget: RunBudgetTracker,
         reducer: CodingToolResultReducer,
         worktree: WorktreeMetadata,
+        permission_handler: ToolPermissionHandler | None,
     ) -> TransactionalRuntime:
         if worktree.run_id != run_id:
             event_store.close()
             raise ValueError("Run worktree belongs to a different transactional run")
         checkpoint_manager = CheckpointManager(worktree, run_root / "checkpoints")
+        governance_gate = CodingToolGovernanceGate(
+            CodingToolPolicy(
+                worktree.worktree_path,
+                run_root,
+                max_shell_timeout_seconds=self._settings.shell_terminal_timeout_seconds,
+            ),
+            current_workspace_version=lambda: str(checkpoint_manager.current_version()),
+            permission_handler=permission_handler,
+        )
         checkpoints: dict[str, CheckpointMetadata] = {}
 
         def create_checkpoint(request: ToolExecutionRequest) -> str:
@@ -146,6 +160,7 @@ class TransactionalRuntimeAssembler:
             checkpoint_restorer=restore_checkpoint,
             result_reducer=reducer,
             run_budget=budget,
+            governance_gate=governance_gate,
             recovery_controller=recovery,
             run_event_store=run_events,
         )

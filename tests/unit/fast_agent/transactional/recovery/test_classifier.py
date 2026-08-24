@@ -11,12 +11,13 @@ from fast_agent.transactional.recovery.classifier import (
 )
 
 
-def _request(tool_name: str) -> ToolExecutionRequest:
+def _request(tool_name: str, *, server_name: str | None = None) -> ToolExecutionRequest:
     return ToolExecutionRequest(
         run_id=RunId("run-1"),
         tool_call_id=ToolCallId("call-1"),
         tool_name=tool_name,
         arguments={},
+        server_name=server_name,
     )
 
 
@@ -39,6 +40,18 @@ def test_local_effect_classifier_only_trusts_explicit_rules() -> None:
     assert classifier(_request("bash")) is ToolEffect.WORKSPACE_WRITE
     assert classifier(_request("exec")) is ToolEffect.WORKSPACE_WRITE
     assert classifier(_request("remote_tool")) is ToolEffect.EXTERNAL_UNKNOWN
+
+
+def test_external_server_tool_cannot_inherit_a_local_tool_effect() -> None:
+    classifier = LocalCodingEffectClassifier()
+
+    assert (
+        classifier(_request("read_text_file", server_name="remote-files"))
+        is ToolEffect.EXTERNAL_UNKNOWN
+    )
+    assert (
+        classifier(_request("execute", server_name="remote-shell")) is ToolEffect.EXTERNAL_UNKNOWN
+    )
 
 
 def test_failure_classifier_covers_runtime_failure_categories() -> None:

@@ -18,6 +18,7 @@ class ToolExecutionRequest:
     tool_call_id: ToolCallId
     tool_name: str
     arguments: dict[str, JsonValue]
+    server_name: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

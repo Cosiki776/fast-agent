@@ -221,6 +221,7 @@ async def run_harness_cli_flow(
     disabled_resume, original_resume = _disable_core_resume_for_harness_startup(fast)
     try:
         async with fast.harness(environment=request.environment) as harness:
+            _configure_transactional_cli_approval(harness)
             if prepare is not None:
                 prepare()
             app = harness.app()
@@ -286,6 +287,7 @@ async def run_harness_parallel_cli_flow(
     disabled_resume, original_resume = _disable_core_resume_for_harness_startup(fast)
     try:
         async with fast.harness(environment=request.environment) as harness:
+            _configure_transactional_cli_approval(harness)
             app = harness.app()
             async with app.open(
                 AppOpenRequest(session_id=session_id, agent=request.target_agent_name)
@@ -320,6 +322,14 @@ async def run_harness_parallel_cli_flow(
         raise SystemExit(1) from exc
     finally:
         _restore_core_resume_flag(fast, disabled_resume, original_resume)
+
+
+def _configure_transactional_cli_approval(harness: AgentHarness) -> None:
+    from fast_agent.cli.runtime.tool_approval import CliToolApprovalHandler
+    from fast_agent.core.harness import AgentHarness
+
+    if isinstance(harness, AgentHarness):
+        harness.set_transactional_permission_handler(CliToolApprovalHandler())
 
 
 async def run_parallel_cli_flow(

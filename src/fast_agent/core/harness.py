@@ -103,6 +103,11 @@ class HarnessSession:
         return self._record.instance.app
 
     @property
+    def transactional_runtime(self) -> "TransactionalRuntime | None":
+        """Transactional resources owned by this session, when enabled."""
+        return self._record.transactional_runtime
+
+    @property
     def session_manager(self) -> "SessionManager | None":
         """Persisted session manager when this session has file-backed state."""
         from fast_agent.session.session_manager import Session
@@ -128,7 +133,12 @@ class HarnessSession:
                 await self._save_persisted_history(agent)
                 return result
 
-            return await self._call_agent_once(execute)
+            async def retry(evidence: str) -> str:
+                result = await agent.send(evidence, request_params)
+                await self._save_persisted_history(agent)
+                return result
+
+            return await self._call_agent_once(execute, retry)
         finally:
             await self._end_operation("send")
 
@@ -148,7 +158,12 @@ class HarnessSession:
                 await self._save_persisted_history(agent)
                 return result
 
-            return await self._call_agent_once(execute)
+            async def retry(evidence: str) -> PromptMessageExtended:
+                result = await agent.generate(evidence, request_params)
+                await self._save_persisted_history(agent)
+                return result
+
+            return await self._call_agent_once(execute, retry)
         finally:
             await self._end_operation("generate")
 
@@ -179,7 +194,12 @@ class HarnessSession:
                 await self._save_persisted_history(agent)
                 return result
 
-            return await self._call_agent_once(execute)
+            async def retry(evidence: str) -> tuple[ModelT | None, PromptMessageExtended]:
+                result = await agent.structured(evidence, model, request_params)
+                await self._save_persisted_history(agent)
+                return result
+
+            return await self._call_agent_once(execute, retry)
         finally:
             await self._end_operation("structured")
 
@@ -200,7 +220,12 @@ class HarnessSession:
                 await self._save_persisted_history(agent)
                 return result
 
-            return await self._call_agent_once(execute)
+            async def retry(evidence: str) -> tuple[Any | None, PromptMessageExtended]:
+                result = await agent.structured_schema(evidence, schema, request_params)
+                await self._save_persisted_history(agent)
+                return result
+
+            return await self._call_agent_once(execute, retry)
         finally:
             await self._end_operation("structured_schema")
 
@@ -278,11 +303,17 @@ class HarnessSession:
         """Delete this session and dispose its owned instance."""
         await self._manager.delete(self.id)
 
-    async def _call_agent_once(self, call: Callable[[], Awaitable[ResultT]]) -> ResultT:
+    async def _call_agent_once(
+        self,
+        call: Callable[[], Awaitable[ResultT]],
+        retry: Callable[[str], Awaitable[ResultT]] | None = None,
+    ) -> ResultT:
         runtime = self._record.transactional_runtime
         if runtime is None or runtime.controller is None:
             return await call()
-        return await runtime.controller.call_agent_once(call)
+        if retry is None:
+            return await runtime.controller.call_agent_once(call)
+        return await runtime.controller.call_agent_until_verified(call, retry)
 
     async def _begin_operation(
         self,

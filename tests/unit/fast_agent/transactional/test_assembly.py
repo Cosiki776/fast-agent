@@ -235,6 +235,109 @@ async def test_full_profile_composes_real_checkpoint_recovery(tmp_path: Path) ->
 
 
 @pytest.mark.asyncio
+async def test_full_profile_recovers_replans_verifies_and_promotes(tmp_path: Path) -> None:
+    repository = _repository(tmp_path)
+    run_id = RunId("full-recovery-closure")
+    snapshots = WorkspaceSnapshotManager(repository, tmp_path / "snapshots")
+    snapshot = snapshots.capture()
+    worktree_manager = WorktreeManager(repository, tmp_path / "worktrees")
+    worktree = worktree_manager.create(run_id, baseline=snapshot.base_commit)
+    snapshots.materialize(snapshot, worktree)
+    runtime = TransactionalRuntimeAssembler(
+        TransactionalSettings(
+            profile=TransactionalProfile.FULL,
+            verification=VerificationSpec(
+                command="grep -qx corrected tracked.txt",
+                timeout_seconds=5,
+            ),
+        ),
+        tmp_path / "runtime",
+    ).assemble(
+        run_id=run_id,
+        worktree=worktree,
+        snapshot_manager=snapshots,
+        snapshot=snapshot,
+    )
+
+    assert runtime is not None
+    assert runtime.controller is not None
+    assert runtime.workspace is not None
+    assert runtime.run_event_store is not None
+    workspace = runtime.workspace
+    try:
+
+        async def run_scripted_agent() -> str:
+            async def fail_with_repeated_hypothesis() -> ToolExecutionOutcome:
+                workspace.joinpath("tracked.txt").write_text("incorrect\n", encoding="utf-8")
+                return ToolExecutionOutcome(
+                    result=CallToolResult(
+                        content=[TextContent(type="text", text="same assertion failed")],
+                        structured_content={
+                            "status": "failed",
+                            "message": "same assertion failed",
+                        },
+                        is_error=True,
+                    )
+                )
+
+            handoff = None
+            for call_id in ("bad-call-1", "bad-call-2"):
+                handoff = await runtime.coordinator.coordinate(
+                    ToolExecutionRequest(
+                        run_id=run_id,
+                        tool_call_id=ToolCallId(call_id),
+                        tool_name="write_text_file",
+                        arguments={"path": "tracked.txt", "content": "incorrect"},
+                    ),
+                    fail_with_repeated_hypothesis,
+                )
+
+            assert handoff is not None
+            assert handoff.result.structured_content is not None
+            assert handoff.result.structured_content["status"] == "recovery_handoff"
+            assert workspace.joinpath("tracked.txt").read_text(encoding="utf-8") == "baseline\n"
+
+            async def apply_new_hypothesis() -> ToolExecutionOutcome:
+                workspace.joinpath("tracked.txt").write_text("corrected\n", encoding="utf-8")
+                return ToolExecutionOutcome(
+                    result=CallToolResult(
+                        content=[TextContent(type="text", text="new hypothesis applied")],
+                        is_error=False,
+                    )
+                )
+
+            corrected = await runtime.coordinator.coordinate(
+                ToolExecutionRequest(
+                    run_id=run_id,
+                    tool_call_id=ToolCallId("corrected-call"),
+                    tool_name="write_text_file",
+                    arguments={"path": "tracked.txt", "content": "corrected"},
+                ),
+                apply_new_hypothesis,
+            )
+            assert corrected.result.is_error is False
+            return "corrected completion"
+
+        assert (
+            await runtime.controller.call_agent_once(run_scripted_agent) == "corrected completion"
+        )
+        assert repository.joinpath("tracked.txt").read_text(encoding="utf-8") == "corrected\n"
+        assert runtime.budget.snapshot.recovery_attempts == 1
+        assert runtime.controller.state is RunState.PROMOTED
+        assert [item.event.kind for item in runtime.run_event_store.events_for_run(run_id)] == [
+            RunEventKind.STARTED,
+            RunEventKind.RECOVERY_STARTED,
+            RunEventKind.RECOVERED,
+            RunEventKind.VERIFICATION_STARTED,
+            RunEventKind.VERIFIED,
+            RunEventKind.PROMOTION_APPLIED,
+        ]
+    finally:
+        runtime.close()
+        worktree_manager.cleanup(worktree)
+
+
+@pytest.mark.asyncio
 async def test_full_profile_policy_denies_path_escape_before_execution(tmp_path: Path) -> None:
     repository = _repository(tmp_path)
     run_id = RunId("full-policy")

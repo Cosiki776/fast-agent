@@ -69,19 +69,63 @@ class TransactionalCodingRun:
             raise TransactionalRunTerminatedError(
                 f"Transactional run '{self.run_id}' is terminal ({self.state.value})"
             )
-        wall_time = self._budget.check_wall_time()
-        if not wall_time.allowed:
-            self.fail("budget exhausted: wall_time")
-            raise TransactionalRunTerminatedError("Transactional run wall-time budget is exhausted")
         try:
-            result = await call()
-            await self._verify_completion()
-            return result
+            return await self._call_until_verified(call, None)
         except (CompletionVerificationError, PromotionRejectedError):
             raise
         except Exception as exc:
             self.fail(f"agent turn failed: {type(exc).__name__}: {exc}")
             raise
+
+    async def call_agent_until_verified(
+        self,
+        call: Callable[[], Awaitable[ResultT]],
+        retry: Callable[[str], Awaitable[ResultT]],
+    ) -> ResultT:
+        if self.state in {
+            RunState.FAILED,
+            RunState.VERIFIED,
+            RunState.PROMOTED,
+            RunState.PROMOTION_REJECTED,
+        }:
+            raise TransactionalRunTerminatedError(
+                f"Transactional run '{self.run_id}' is terminal ({self.state.value})"
+            )
+        try:
+            return await self._call_until_verified(call, retry)
+        except PromotionRejectedError:
+            raise
+        except Exception as exc:
+            self.fail(f"agent turn failed: {type(exc).__name__}: {exc}")
+            raise
+
+    async def _call_until_verified(
+        self,
+        call: Callable[[], Awaitable[ResultT]],
+        retry: Callable[[str], Awaitable[ResultT]] | None,
+    ) -> ResultT:
+        next_call = call
+        while True:
+            wall_time = self._budget.check_wall_time()
+            if not wall_time.allowed:
+                self.fail("budget exhausted: wall_time")
+                raise TransactionalRunTerminatedError(
+                    "Transactional run wall-time budget is exhausted"
+                )
+            result = await next_call()
+            try:
+                await self._verify_completion()
+            except CompletionVerificationError as exc:
+                if retry is None:
+                    raise
+                evidence = exc.result.evidence
+
+                async def retry_call() -> ResultT:
+                    return await retry(evidence)
+
+                next_call = retry_call
+                continue
+            return result
 
     async def _verify_completion(self) -> None:
         if self._verifier is None or self._verification_spec is None:

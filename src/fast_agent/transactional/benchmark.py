@@ -31,6 +31,7 @@ class BenchmarkTaskManifest(BaseModel):
     repository: str = Field(min_length=1)
     base_commit: str = Field(min_length=1)
     issue: str = Field(min_length=1)
+    controlled_command: str | None = Field(default=None, min_length=1)
     verification: VerificationSpec
     budget: BenchmarkBudgetSpec
 
@@ -125,7 +126,7 @@ def load_task_manifests(directory: Path) -> list[BenchmarkTaskManifest]:
 
 def task_manifest_sha256(task: BenchmarkTaskManifest) -> str:
     payload = json.dumps(
-        task.model_dump(mode="json"),
+        task.model_dump(mode="json", exclude_none=True),
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),

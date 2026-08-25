@@ -63,6 +63,8 @@ class CodingToolResultReducer:
         /,
     ) -> CallToolResult:
         text = _result_text(result)
+        if len(text.encode("utf-8")) <= self.limits.max_result_bytes:
+            return result
         command = request.arguments.get("command")
         command_text = command if isinstance(command, str) else ""
         command_tokens = _command_tokens(command_text)

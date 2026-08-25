@@ -9,6 +9,7 @@ from typing import Protocol
 from mcp.types import CallToolResult, TextContent
 
 from fast_agent.tools.apply_patch_tool import APPLY_PATCH_TOOL_NAME
+from fast_agent.tools.edit_file_tool import EDIT_FILE_TOOL_NAME
 from fast_agent.tools.filesystem_tool_definitions import (
     READ_TEXT_FILE_TOOL_NAME,
     WRITE_TEXT_FILE_TOOL_NAME,
@@ -19,6 +20,7 @@ from fast_agent.transactional.models import RunId, ToolCallId, ToolEffect
 _WORKSPACE_WRITE_TOOLS = frozenset(
     {
         WRITE_TEXT_FILE_TOOL_NAME,
+        EDIT_FILE_TOOL_NAME,
         APPLY_PATCH_TOOL_NAME,
         "execute",
         "exec",

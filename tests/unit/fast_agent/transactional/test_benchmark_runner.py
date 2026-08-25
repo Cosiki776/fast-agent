@@ -23,12 +23,19 @@ def test_development_task_manifests_are_frozen_and_complete() -> None:
 
     assert [task.id for task in tasks] == [
         "boundary-check-001",
-        "default-value-001",
-        "missing-await-001",
+        "long-output-001",
+        "recovery-path-001",
     ]
-    assert {task.budget.max_llm_calls for task in tasks} == {20}
-    assert {task.budget.max_tool_calls for task in tasks} == {80}
-    assert all(task.verification.command == "uv run pytest -q" for task in tasks)
+    assert {task.budget.max_llm_calls for task in tasks} == {12, 16, 20}
+    assert {task.budget.max_tool_calls for task in tasks} == {50, 80}
+    assert all(
+        task.verification.command == "python3 -m unittest discover -s tests" for task in tasks
+    )
+    assert {task.id: task.controlled_command for task in tasks} == {
+        "boundary-check-001": None,
+        "long-output-001": "python3 -m unittest discover -s tests",
+        "recovery-path-001": None,
+    }
     with pytest.raises(ValidationError, match="frozen"):
         tasks[0].issue = "changed"  # ty: ignore[invalid-assignment]  # frozen mutation is under test
 

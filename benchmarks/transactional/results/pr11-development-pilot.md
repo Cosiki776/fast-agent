@@ -4,6 +4,10 @@ This development Pilot exercised three transactional profiles with
 `aliyun.qwen3.8-max` on three deterministic fixture tasks. It is a mechanism
 smoke test, not a formal or statistically significant benchmark.
 
+Tool-output handling was configured independently from the transactional
+profile: baseline used `tool_output.strategy=upstream`; reducer and full used
+`tool_output.strategy=semantic` with `semantic_reducer_version=v1`.
+
 ## Results
 
 | Task | Profile | Verified | LLM calls | Tool calls | Input tokens | Output tokens | Model-visible tool bytes | Wall time |

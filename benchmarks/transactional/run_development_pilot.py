@@ -19,7 +19,11 @@ from fast_agent import FastAgent
 from fast_agent.agents.mcp_agent import McpAgent
 from fast_agent.transactional.benchmark import load_task_manifest, task_manifest_sha256
 from fast_agent.transactional.events import ToolResultStored
-from fast_agent.transactional.settings import TransactionalProfile
+from fast_agent.transactional.settings import (
+    SemanticReducerVersion,
+    ToolOutputStrategy,
+    TransactionalProfile,
+)
 from fast_agent.transactional.storage.artifact_store import ArtifactId
 from fast_agent.types import RequestParams
 from fast_agent.utils.tool_names import is_shell_command_tool_name
@@ -50,6 +54,8 @@ class PilotResult(BaseModel):
     task_id: str
     manifest_sha256: str
     profile: TransactionalProfile
+    tool_output_strategy: ToolOutputStrategy
+    semantic_reducer_version: SemanticReducerVersion | None
     model: str
     base_commit: str
     run_id: str | None
@@ -79,6 +85,14 @@ async def run(args: argparse.Namespace) -> PilotResult:
     manifest_path = Path(args.manifest).resolve()
     task = load_task_manifest(manifest_path)
     profile = TransactionalProfile(args.profile)
+    tool_output_strategy = (
+        ToolOutputStrategy.UPSTREAM
+        if profile is TransactionalProfile.BASELINE
+        else ToolOutputStrategy.SEMANTIC
+    )
+    semantic_reducer_version = (
+        SemanticReducerVersion.V1 if tool_output_strategy is ToolOutputStrategy.SEMANTIC else None
+    )
     source = (REPOSITORY_ROOT / task.repository).resolve()
     _validate_fixture(source, task.base_commit)
 
@@ -104,6 +118,14 @@ async def run(args: argparse.Namespace) -> PilotResult:
                 },
                 "transactional": {
                     "profile": profile.value,
+                    "tool_output": {
+                        "strategy": tool_output_strategy.value,
+                        **(
+                            {"semantic_reducer_version": semantic_reducer_version.value}
+                            if semantic_reducer_version is not None
+                            else {}
+                        ),
+                    },
                     "runtime_root": str(output / "runtime"),
                     "keep_worktree": True,
                     "max_llm_calls": task.budget.max_llm_calls,
@@ -201,6 +223,8 @@ async def run(args: argparse.Namespace) -> PilotResult:
         task_id=task.id,
         manifest_sha256=task_manifest_sha256(task),
         profile=profile,
+        tool_output_strategy=tool_output_strategy,
+        semantic_reducer_version=semantic_reducer_version,
         model=args.model,
         base_commit=task.base_commit,
         run_id=run_id,

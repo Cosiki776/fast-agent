@@ -178,7 +178,7 @@ async def test_runner_collects_reducer_metrics_from_real_shell_result(tmp_path: 
     assert "exit_code: 1" in reducer_text
     assert "tests/test_order.py::test_cutoff" in reducer_text
     assert "AssertionError: cutoff rejected" in reducer_text
-    assert "full_output_artifact:" in reducer_text
+    assert "output_artifact:" in reducer_text
     assert raw_marker.encode() in artifact_payloads[BenchmarkProfile.REDUCER]
     assert result.reducer.model_visible_output_bytes < result.baseline.model_visible_output_bytes
     assert result.baseline.reducer_latency_seconds is None

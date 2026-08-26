@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "experiment": "pr11-development-pilot",
   "model": "aliyun.qwen3.8-max",
   "formal_benchmark": false,
@@ -7,6 +7,8 @@
     {
       "task_id": "boundary-check-001",
       "profile": "baseline",
+      "tool_output_strategy": "upstream",
+      "semantic_reducer_version": null,
       "manifest_sha256": "28d73e59ba306995c403f23a1753e0e5f73ca2e527a8ba35d382f8b7d4d5dceb",
       "verification_passed": true,
       "verification_exit_code": 0,
@@ -24,6 +26,8 @@
     {
       "task_id": "boundary-check-001",
       "profile": "reducer",
+      "tool_output_strategy": "semantic",
+      "semantic_reducer_version": "v1",
       "manifest_sha256": "28d73e59ba306995c403f23a1753e0e5f73ca2e527a8ba35d382f8b7d4d5dceb",
       "verification_passed": true,
       "verification_exit_code": 0,
@@ -41,6 +45,8 @@
     {
       "task_id": "boundary-check-001",
       "profile": "full",
+      "tool_output_strategy": "semantic",
+      "semantic_reducer_version": "v1",
       "manifest_sha256": "28d73e59ba306995c403f23a1753e0e5f73ca2e527a8ba35d382f8b7d4d5dceb",
       "verification_passed": true,
       "verification_exit_code": 0,
@@ -63,6 +69,8 @@
     {
       "task_id": "long-output-001",
       "profile": "baseline",
+      "tool_output_strategy": "upstream",
+      "semantic_reducer_version": null,
       "manifest_sha256": "8685adadc33cfaf1551b0b710591929dc7c6105f813d173d821fbdf379b9fef8",
       "verification_passed": true,
       "verification_exit_code": 0,
@@ -83,6 +91,8 @@
     {
       "task_id": "long-output-001",
       "profile": "reducer",
+      "tool_output_strategy": "semantic",
+      "semantic_reducer_version": "v1",
       "manifest_sha256": "8685adadc33cfaf1551b0b710591929dc7c6105f813d173d821fbdf379b9fef8",
       "verification_passed": true,
       "verification_exit_code": 0,
@@ -103,6 +113,8 @@
     {
       "task_id": "long-output-001",
       "profile": "full",
+      "tool_output_strategy": "semantic",
+      "semantic_reducer_version": "v1",
       "manifest_sha256": "8685adadc33cfaf1551b0b710591929dc7c6105f813d173d821fbdf379b9fef8",
       "verification_passed": true,
       "verification_exit_code": 0,
@@ -128,6 +140,8 @@
     {
       "task_id": "recovery-path-001",
       "profile": "baseline",
+      "tool_output_strategy": "upstream",
+      "semantic_reducer_version": null,
       "manifest_sha256": "8c58d68476e537d307fcfd1f8b2ac0982d686e506f05f220a8c0ea814c5eee96",
       "verification_passed": true,
       "verification_exit_code": 0,
@@ -145,6 +159,8 @@
     {
       "task_id": "recovery-path-001",
       "profile": "reducer",
+      "tool_output_strategy": "semantic",
+      "semantic_reducer_version": "v1",
       "manifest_sha256": "8c58d68476e537d307fcfd1f8b2ac0982d686e506f05f220a8c0ea814c5eee96",
       "verification_passed": true,
       "verification_exit_code": 0,
@@ -162,6 +178,8 @@
     {
       "task_id": "recovery-path-001",
       "profile": "full",
+      "tool_output_strategy": "semantic",
+      "semantic_reducer_version": "v1",
       "manifest_sha256": "8c58d68476e537d307fcfd1f8b2ac0982d686e506f05f220a8c0ea814c5eee96",
       "verification_passed": true,
       "verification_exit_code": 0,

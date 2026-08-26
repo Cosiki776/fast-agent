@@ -5,14 +5,19 @@ from typing import TYPE_CHECKING
 
 from fast_agent.transactional.budget import RunBudgetTracker
 from fast_agent.transactional.checkpoint.checkpoint import CheckpointManager
-from fast_agent.transactional.context.reducers import CodingToolResultReducer
+from fast_agent.transactional.context.reducers import CodingToolResultReducer, ToolResultReducer
 from fast_agent.transactional.coordinator import TransactionCoordinator
 from fast_agent.transactional.governance import CodingToolGovernanceGate, CodingToolPolicy
 from fast_agent.transactional.models import RunId, new_run_id
 from fast_agent.transactional.recovery.controller import RecoveryController
 from fast_agent.transactional.run_controller import TransactionalCodingRun
 from fast_agent.transactional.run_events import RunStarted
-from fast_agent.transactional.settings import TransactionalProfile, TransactionalSettings
+from fast_agent.transactional.settings import (
+    SemanticReducerVersion,
+    ToolOutputStrategy,
+    TransactionalProfile,
+    TransactionalSettings,
+)
 from fast_agent.transactional.storage.artifact_store import FileArtifactStore
 from fast_agent.transactional.storage.event_store import SQLiteEventStore
 from fast_agent.transactional.storage.run_event_store import SQLiteRunEventStore
@@ -88,7 +93,7 @@ class TransactionalRuntimeAssembler:
         event_store = SQLiteEventStore(run_root / "events.sqlite3")
         artifact_store = FileArtifactStore(run_root / "artifacts")
         budget = RunBudgetTracker(self._settings.budget_limits())
-        reducer = CodingToolResultReducer()
+        reducer = self._result_reducer()
 
         if self._settings.profile is TransactionalProfile.REDUCER:
             coordinator = TransactionCoordinator(
@@ -130,7 +135,7 @@ class TransactionalRuntimeAssembler:
         event_store: SQLiteEventStore,
         artifact_store: FileArtifactStore,
         budget: RunBudgetTracker,
-        reducer: CodingToolResultReducer,
+        reducer: ToolResultReducer | None,
         worktree: WorktreeMetadata,
         permission_handler: ToolPermissionHandler | None,
         snapshot_manager: WorkspaceSnapshotManager | None,
@@ -226,4 +231,14 @@ class TransactionalRuntimeAssembler:
             run_event_store=run_events,
             controller=controller,
             worktree=worktree,
+        )
+
+    def _result_reducer(self) -> ToolResultReducer | None:
+        tool_output = self._settings.tool_output
+        if tool_output.strategy is ToolOutputStrategy.UPSTREAM:
+            return None
+        if tool_output.semantic_reducer_version is SemanticReducerVersion.V1:
+            return CodingToolResultReducer()
+        raise ValueError(
+            f"Unsupported semantic reducer version: {tool_output.semantic_reducer_version}"
         )

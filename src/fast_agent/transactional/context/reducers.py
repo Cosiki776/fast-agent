@@ -175,7 +175,7 @@ def _reduced_result(
     artifact_id: ArtifactId,
     max_result_bytes: int,
 ) -> CallToolResult:
-    reference = f"full_output_artifact: {artifact_id}"
+    reference = f"output_artifact: {artifact_id}"
     text = _fit_with_reference(summary, reference, max_result_bytes)
     return result.model_copy(
         update={

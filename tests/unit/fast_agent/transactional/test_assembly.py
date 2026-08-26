@@ -16,7 +16,13 @@ from fast_agent.transactional.checkpoint.worktree import WorktreeManager
 from fast_agent.transactional.execution import ToolExecutionOutcome, ToolExecutionRequest
 from fast_agent.transactional.models import RunId, ToolCallId
 from fast_agent.transactional.run_events import RunEventKind, RunState
-from fast_agent.transactional.settings import TransactionalProfile, TransactionalSettings
+from fast_agent.transactional.settings import (
+    SemanticReducerVersion,
+    ToolOutputSettings,
+    ToolOutputStrategy,
+    TransactionalProfile,
+    TransactionalSettings,
+)
 from fast_agent.transactional.verification import VerificationSpec
 
 if TYPE_CHECKING:
@@ -84,6 +90,59 @@ def test_reducer_profile_omits_worktree_and_recovery(tmp_path: Path) -> None:
         runtime.close()
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("tool_output", "is_reduced"),
+    [
+        (ToolOutputSettings(strategy=ToolOutputStrategy.UPSTREAM), False),
+        (
+            ToolOutputSettings(
+                strategy=ToolOutputStrategy.SEMANTIC,
+                semantic_reducer_version=SemanticReducerVersion.V1,
+            ),
+            True,
+        ),
+    ],
+)
+async def test_tool_output_strategy_is_independent_from_profile(
+    tmp_path: Path,
+    tool_output: ToolOutputSettings,
+    is_reduced: bool,
+) -> None:
+    runtime = TransactionalRuntimeAssembler(
+        TransactionalSettings(
+            profile=TransactionalProfile.REDUCER,
+            tool_output=tool_output,
+        ),
+        tmp_path / tool_output.strategy.value,
+    ).assemble(run_id=RunId(tool_output.strategy.value))
+    assert runtime is not None
+    result = CallToolResult(
+        content=[TextContent(type="text", text="x" * 10_000)],
+        is_error=False,
+    )
+
+    async def execute() -> ToolExecutionOutcome:
+        return ToolExecutionOutcome(result=result)
+
+    try:
+        outcome = await runtime.coordinator.coordinate(
+            ToolExecutionRequest(
+                run_id=runtime.run_id,
+                tool_call_id=ToolCallId("call-1"),
+                tool_name="execute",
+                arguments={"command": "python noisy.py"},
+            ),
+            execute,
+        )
+        if is_reduced:
+            assert outcome.result is not result
+        else:
+            assert outcome.result is result
+    finally:
+        runtime.close()
+
+
 def test_full_profile_requires_run_worktree(tmp_path: Path) -> None:
     assembler = TransactionalRuntimeAssembler(
         TransactionalSettings(profile=TransactionalProfile.FULL),
@@ -106,6 +165,7 @@ async def test_full_profile_verifies_and_promotes_agent_workspace(tmp_path: Path
     runtime = TransactionalRuntimeAssembler(
         TransactionalSettings(
             profile=TransactionalProfile.FULL,
+            tool_output=ToolOutputSettings(strategy=ToolOutputStrategy.UPSTREAM),
             verification=VerificationSpec(command="test -f result.txt", timeout_seconds=5),
         ),
         tmp_path / "runtime",

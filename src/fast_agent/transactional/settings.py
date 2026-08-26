@@ -3,7 +3,7 @@ from __future__ import annotations
 from enum import StrEnum
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from fast_agent.transactional.budget import RunBudgetLimits
 from fast_agent.transactional.verification import VerificationSpec  # noqa: TC001
@@ -18,12 +18,40 @@ class TransactionalProfile(StrEnum):
     FULL = "full"
 
 
+class ToolOutputStrategy(StrEnum):
+    UPSTREAM = "upstream"
+    SEMANTIC = "semantic"
+
+
+class SemanticReducerVersion(StrEnum):
+    V1 = "v1"
+
+
+class ToolOutputSettings(BaseModel):
+    """Select model-facing tool-output handling independently of Run semantics."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    strategy: ToolOutputStrategy = ToolOutputStrategy.UPSTREAM
+    semantic_reducer_version: SemanticReducerVersion | None = None
+
+    @model_validator(mode="after")
+    def validate_semantic_version(self) -> "ToolOutputSettings":
+        if self.strategy is ToolOutputStrategy.SEMANTIC:
+            if self.semantic_reducer_version is None:
+                raise ValueError("semantic tool output requires semantic_reducer_version")
+        elif self.semantic_reducer_version is not None:
+            raise ValueError("semantic_reducer_version requires semantic tool output")
+        return self
+
+
 class TransactionalSettings(BaseModel):
     """Configuration for the constrained transactional coding profiles."""
 
     model_config = ConfigDict(extra="forbid")
 
     profile: TransactionalProfile = TransactionalProfile.BASELINE
+    tool_output: ToolOutputSettings = Field(default_factory=ToolOutputSettings)
     mode: Literal["coding"] = "coding"
     runtime_root: str | None = None
     keep_worktree: bool = True

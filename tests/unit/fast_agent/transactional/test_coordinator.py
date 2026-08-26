@@ -574,7 +574,7 @@ async def test_reducer_returns_bounded_result_after_raw_artifact_is_stored(tmp_p
     assert isinstance(content, TextContent)
     assert len(content.text.encode("utf-8")) <= 512
     assert raw_text not in content.text
-    assert f"full_output_artifact: {stored.artifact_id}" in content.text
+    assert f"output_artifact: {stored.artifact_id}" in content.text
     event_store.close()
 
 
@@ -616,7 +616,7 @@ async def test_reducer_failure_returns_bounded_fallback_with_artifact_reference(
     content = outcome.result.content[0]
     assert isinstance(content, TextContent)
     assert len(content.text.encode("utf-8")) <= 8 * 1024
-    assert f"full_output_artifact: {stored.artifact_id}" in content.text
+    assert f"output_artifact: {stored.artifact_id}" in content.text
     event_store.close()
 
 

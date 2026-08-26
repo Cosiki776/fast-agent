@@ -70,7 +70,7 @@ def test_pytest_reducer_extracts_failures_and_bounds_long_output() -> None:
     assert "tests/test_orders.py::test_cutoff" in text
     assert "tests/test_orders.py:42" in text
     assert "AssertionError: expected accepted order" in text
-    assert f"full_output_artifact: {ARTIFACT_ID}" in text
+    assert f"output_artifact: {ARTIFACT_ID}" in text
     assert "captured log line 19999" not in text
     assert reduced.is_error is True
 
@@ -98,7 +98,7 @@ def test_git_diff_reducer_reports_files_counts_and_bounded_hunks() -> None:
     assert "added_lines: 2" in text
     assert "deleted_lines: 1" in text
     assert "@@ -1,2 +1,3 @@" in text
-    assert f"full_output_artifact: {ARTIFACT_ID}" in text
+    assert f"output_artifact: {ARTIFACT_ID}" in text
 
 
 def test_shell_fallback_preserves_exit_code_and_head_tail() -> None:
@@ -113,7 +113,7 @@ def test_shell_fallback_preserves_exit_code_and_head_tail() -> None:
     assert "line-0" in text
     assert "line-99" in text
     assert "truncated_bytes:" in text
-    assert f"full_output_artifact: {ARTIFACT_ID}" in text
+    assert f"output_artifact: {ARTIFACT_ID}" in text
 
 
 def test_result_at_byte_limit_is_preserved_exactly() -> None:
@@ -151,7 +151,7 @@ def test_long_unicode_result_is_bounded_on_utf8_boundary() -> None:
     )
 
     assert len(text.encode("utf-8")) <= 256
-    assert f"full_output_artifact: {ARTIFACT_ID}" in text
+    assert f"output_artifact: {ARTIFACT_ID}" in text
 
 
 def test_single_item_fallback_does_not_expand_tail() -> None:

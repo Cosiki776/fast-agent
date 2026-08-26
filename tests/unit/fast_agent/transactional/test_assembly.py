@@ -178,6 +178,8 @@ async def test_full_profile_verifies_and_promotes_agent_workspace(tmp_path: Path
 
     assert runtime is not None
     assert runtime.controller is not None
+    assert runtime.worktree_only_completion_report() is None
+    assert runtime.requires_manual_review is False
     try:
 
         async def finish() -> str:
@@ -187,6 +189,104 @@ async def test_full_profile_verifies_and_promotes_agent_workspace(tmp_path: Path
         assert await runtime.controller.call_agent_once(finish) == "done"
         assert repository.joinpath("result.txt").read_text(encoding="utf-8") == "done\n"
         assert runtime.controller.state is RunState.PROMOTED
+    finally:
+        runtime.close()
+        worktree_manager.cleanup(worktree)
+
+
+@pytest.mark.asyncio
+async def test_full_profile_discards_verification_side_effects_before_promotion(
+    tmp_path: Path,
+) -> None:
+    repository = _repository(tmp_path)
+    run_id = RunId("full-verification-side-effect")
+    snapshots = WorkspaceSnapshotManager(repository, tmp_path / "snapshots")
+    snapshot = snapshots.capture()
+    worktree_manager = WorktreeManager(repository, tmp_path / "worktrees")
+    worktree = worktree_manager.create(run_id, baseline=snapshot.base_commit)
+    snapshots.materialize(snapshot, worktree)
+    runtime = TransactionalRuntimeAssembler(
+        TransactionalSettings(
+            profile=TransactionalProfile.FULL,
+            verification=VerificationSpec(
+                command="test -f result.txt && touch verification-report.txt",
+                timeout_seconds=5,
+            ),
+        ),
+        tmp_path / "runtime",
+    ).assemble(
+        run_id=run_id,
+        worktree=worktree,
+        snapshot_manager=snapshots,
+        snapshot=snapshot,
+    )
+
+    assert runtime is not None
+    assert runtime.controller is not None
+    try:
+
+        async def finish() -> str:
+            worktree.worktree_path.joinpath("result.txt").write_text("agent\n", encoding="utf-8")
+            return "done"
+
+        assert await runtime.controller.call_agent_once(finish) == "done"
+
+        assert worktree.worktree_path.joinpath("result.txt").read_text(encoding="utf-8") == (
+            "agent\n"
+        )
+        assert not worktree.worktree_path.joinpath("verification-report.txt").exists()
+        assert repository.joinpath("result.txt").read_text(encoding="utf-8") == "agent\n"
+        assert not repository.joinpath("verification-report.txt").exists()
+        assert runtime.controller.state is RunState.PROMOTED
+    finally:
+        runtime.close()
+        worktree_manager.cleanup(worktree)
+
+
+@pytest.mark.asyncio
+async def test_full_profile_without_verification_retains_worktree_for_review(
+    tmp_path: Path,
+) -> None:
+    repository = _repository(tmp_path)
+    run_id = RunId("full-manual-review")
+    snapshots = WorkspaceSnapshotManager(repository, tmp_path / "snapshots")
+    snapshot = snapshots.capture()
+    worktree_manager = WorktreeManager(repository, tmp_path / "worktrees")
+    worktree = worktree_manager.create(run_id, baseline=snapshot.base_commit)
+    snapshots.materialize(snapshot, worktree)
+    runtime = TransactionalRuntimeAssembler(
+        TransactionalSettings(profile=TransactionalProfile.FULL),
+        tmp_path / "runtime",
+    ).assemble(
+        run_id=run_id,
+        worktree=worktree,
+        snapshot_manager=snapshots,
+        snapshot=snapshot,
+    )
+
+    assert runtime is not None
+    assert runtime.controller is not None
+    assert runtime.requires_manual_review is True
+    try:
+
+        async def finish() -> str:
+            worktree.worktree_path.joinpath("result.txt").write_text(
+                "agent result\n",
+                encoding="utf-8",
+            )
+            return "done"
+
+        assert await runtime.controller.call_agent_once(finish) == "done"
+        report = runtime.worktree_only_completion_report()
+
+        assert report is not None
+        assert report.worktree_path == worktree.worktree_path
+        assert report.added == ("result.txt",)
+        assert not repository.joinpath("result.txt").exists()
+        assert worktree.worktree_path.joinpath("result.txt").read_text(encoding="utf-8") == (
+            "agent result\n"
+        )
+        assert runtime.controller.state is RunState.ACTIVE
     finally:
         runtime.close()
         worktree_manager.cleanup(worktree)

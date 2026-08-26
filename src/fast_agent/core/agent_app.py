@@ -758,6 +758,8 @@ class AgentApp:
                         request_params=request_params,
                     )
                     if show_usage:
+                        self._show_worktree_only_completion_report(harness_session)
+                    if show_usage:
                         self.complete_user_turn(agent_name, turn_start_indices)
                     if show_usage and display_usage_enabled():
                         self._show_turn_usage(agent_name, turn_start_indices)
@@ -807,6 +809,12 @@ class AgentApp:
             default=default_prompt,
             session_manager=session_manager,
         )
+
+    @staticmethod
+    def _show_worktree_only_completion_report(harness_session: "HarnessSession") -> None:
+        report = harness_session.worktree_only_completion_report()
+        if report is not None:
+            print(f"\n{report.render_text()}\n")
 
     async def _send_interactive_message(
         self,

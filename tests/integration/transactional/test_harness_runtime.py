@@ -131,6 +131,7 @@ def _fast_agent(
     *,
     profile: TransactionalProfile,
     workspace: Path,
+    keep_worktree: bool = True,
 ) -> tuple[FastAgent, Path, Path]:
     runtime_root = tmp_path / "transactional-runtime"
     home = tmp_path / "home"
@@ -149,7 +150,7 @@ def _fast_agent(
                 "transactional:",
                 f"  profile: {profile.value}",
                 f"  runtime_root: {runtime_root}",
-                "  keep_worktree: true",
+                f"  keep_worktree: {str(keep_worktree).lower()}",
                 "  shell_terminal_timeout_seconds: 0.15",
                 "  max_wall_time_seconds: 30",
             ]
@@ -364,6 +365,41 @@ async def test_full_harness_sessions_own_isolated_transactional_resources(
                     assert first_runtime.event_store.path != second_runtime.event_store.path
                     assert first_runtime.artifact_store.root != second_runtime.artifact_store.root
                     assert first_runtime.budget is not second_runtime.budget
+    finally:
+        update_global_settings(old_settings)
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_full_harness_retains_unverified_worktree_when_cleanup_is_requested(
+    tmp_path: Path,
+) -> None:
+    repository = _git_repository(tmp_path / "repository")
+    old_settings = get_settings()
+    worktree_path: Path | None = None
+    try:
+        fast, _, _ = _fast_agent(
+            tmp_path,
+            profile=TransactionalProfile.FULL,
+            workspace=repository,
+            keep_worktree=False,
+        )
+        with suppress_interactive_display():
+            async with fast.harness() as harness:
+                session = await harness.session("manual-review", agent_name="main")
+                runtime = session.transactional_runtime
+                assert runtime is not None
+                assert runtime.workspace is not None
+                worktree_path = runtime.workspace
+                worktree_path.joinpath("result.txt").write_text("review me\n", encoding="utf-8")
+
+                report = session.worktree_only_completion_report()
+                assert report is not None
+                assert report.added == ("result.txt",)
+                assert not repository.joinpath("result.txt").exists()
+
+        assert worktree_path is not None
+        assert worktree_path.joinpath("result.txt").read_text(encoding="utf-8") == "review me\n"
     finally:
         update_global_settings(old_settings)
 

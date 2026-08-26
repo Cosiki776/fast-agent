@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING
 
 from fast_agent.transactional.budget import RunBudgetTracker
 from fast_agent.transactional.checkpoint.checkpoint import CheckpointManager
+from fast_agent.transactional.completion import WorktreeOnlyCompletionReport
 from fast_agent.transactional.context.reducers import CodingToolResultReducer, ToolResultReducer
 from fast_agent.transactional.coordinator import TransactionCoordinator
 from fast_agent.transactional.governance import CodingToolGovernanceGate, CodingToolPolicy
@@ -24,6 +25,7 @@ from fast_agent.transactional.storage.run_event_store import SQLiteRunEventStore
 from fast_agent.transactional.verification import CompletionVerifier
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from pathlib import Path
 
     from fast_agent.mcp.tool_permission_handler import ToolPermissionHandler
@@ -50,11 +52,23 @@ class TransactionalRuntime:
     run_event_store: SQLiteRunEventStore | None = None
     controller: TransactionalCodingRun | None = None
     worktree: WorktreeMetadata | None = None
+    completion_reporter: Callable[[], WorktreeOnlyCompletionReport] | None = None
     _closed: bool = field(default=False, init=False)
 
     @property
     def workspace(self) -> Path | None:
         return self.worktree.worktree_path if self.worktree is not None else None
+
+    def worktree_only_completion_report(self) -> WorktreeOnlyCompletionReport | None:
+        """Return the manual-review handoff when verified promotion is unavailable."""
+        if self.completion_reporter is None:
+            return None
+        return self.completion_reporter()
+
+    @property
+    def requires_manual_review(self) -> bool:
+        """Whether this Run's only durable result is its retained Worktree."""
+        return self.completion_reporter is not None
 
     def close(self) -> None:
         if self._closed:
@@ -156,12 +170,15 @@ class TransactionalRuntimeAssembler:
         )
         checkpoints: dict[str, CheckpointMetadata] = {}
 
-        def create_checkpoint(request: ToolExecutionRequest) -> str:
-            del request
+        def save_checkpoint() -> str:
             checkpoint = checkpoint_manager.create()
             checkpoint_id = str(checkpoint.checkpoint_id)
             checkpoints[checkpoint_id] = checkpoint
             return checkpoint_id
+
+        def create_checkpoint(request: ToolExecutionRequest) -> str:
+            del request
+            return save_checkpoint()
 
         def restore_checkpoint(checkpoint_id: str) -> str:
             return str(checkpoint_manager.restore(checkpoints[checkpoint_id]))
@@ -219,7 +236,26 @@ class TransactionalRuntimeAssembler:
                 else lambda: str(checkpoint_manager.current_version())
             ),
             promote=promote,
+            create_verification_checkpoint=save_checkpoint,
+            restore_verification_checkpoint=restore_checkpoint,
         )
+        completion_reporter: Callable[[], WorktreeOnlyCompletionReport] | None = None
+        if (
+            self._settings.verification is None
+            and snapshot_manager is not None
+            and snapshot is not None
+        ):
+
+            def build_completion_report() -> WorktreeOnlyCompletionReport:
+                delta = snapshot_manager.agent_delta(snapshot, worktree)
+                return WorktreeOnlyCompletionReport.from_delta(
+                    run_id,
+                    worktree.worktree_path,
+                    delta,
+                )
+
+            completion_reporter = build_completion_report
+
         return TransactionalRuntime(
             run_id=run_id,
             profile=self._settings.profile,
@@ -231,6 +267,7 @@ class TransactionalRuntimeAssembler:
             run_event_store=run_events,
             controller=controller,
             worktree=worktree,
+            completion_reporter=completion_reporter,
         )
 
     def _result_reducer(self) -> ToolResultReducer | None:

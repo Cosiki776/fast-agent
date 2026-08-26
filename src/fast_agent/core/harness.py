@@ -53,6 +53,7 @@ if TYPE_CHECKING:
     from fast_agent.tools.local_shell_executor import LocalEnvironment
     from fast_agent.transactional.assembly import TransactionalRuntime
     from fast_agent.transactional.checkpoint.worktree import WorktreeManager
+    from fast_agent.transactional.completion import WorktreeOnlyCompletionReport
 
 ModelT = TypeVar("ModelT", bound=BaseModel)
 ResultT = TypeVar("ResultT")
@@ -106,6 +107,13 @@ class HarnessSession:
     def transactional_runtime(self) -> "TransactionalRuntime | None":
         """Transactional resources owned by this session, when enabled."""
         return self._record.transactional_runtime
+
+    def worktree_only_completion_report(self) -> "WorktreeOnlyCompletionReport | None":
+        """Return the latest deterministic manual-review handoff, when required."""
+        runtime = self._record.transactional_runtime
+        if runtime is None:
+            return None
+        return runtime.worktree_only_completion_report()
 
     @property
     def session_manager(self) -> "SessionManager | None":
@@ -1029,6 +1037,7 @@ class AgentHarness:
                     and transactional_runtime.worktree is not None
                     and self._fast_agent.context.config is not None
                     and not self._fast_agent.context.config.transactional.keep_worktree
+                    and not transactional_runtime.requires_manual_review
                 ):
                     worktree_manager.cleanup(transactional_runtime.worktree)
 

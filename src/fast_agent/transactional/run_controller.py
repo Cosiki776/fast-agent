@@ -31,6 +31,10 @@ class TransactionalRunTerminatedError(RuntimeError):
     """Raised when a caller tries to continue a failed transactional run."""
 
 
+class VerificationWorkspaceChangedError(RuntimeError):
+    """Raised when a successful verification command mutates the candidate workspace."""
+
+
 class TransactionalCodingRun:
     """Guard one transactional run's agent turns with shared state and budget."""
 
@@ -45,7 +49,11 @@ class TransactionalCodingRun:
         workspace: Path | None = None,
         workspace_version: Callable[[], str] | None = None,
         promote: Callable[[str], PromotionResult] | None = None,
+        create_verification_checkpoint: Callable[[], str] | None = None,
+        restore_verification_checkpoint: Callable[[str], str] | None = None,
     ) -> None:
+        if (create_verification_checkpoint is None) != (restore_verification_checkpoint is None):
+            raise ValueError("Verification checkpoint callbacks must be configured together")
         self.run_id = run_id
         self._run_events = run_events
         self._budget = budget
@@ -54,6 +62,8 @@ class TransactionalCodingRun:
         self._workspace = workspace
         self._workspace_version = workspace_version
         self._promote = promote
+        self._create_verification_checkpoint = create_verification_checkpoint
+        self._restore_verification_checkpoint = restore_verification_checkpoint
 
     @property
     def state(self) -> RunState:
@@ -132,6 +142,12 @@ class TransactionalCodingRun:
             return
         if self._workspace is None or self._workspace_version is None:
             raise RuntimeError("Completion verifier requires a workspace and version provider")
+        candidate_version = self._workspace_version()
+        verification_checkpoint = (
+            self._create_verification_checkpoint()
+            if self._create_verification_checkpoint is not None
+            else None
+        )
         self._run_events.append(
             RunVerificationStarted(
                 run_id=self.run_id,
@@ -139,6 +155,17 @@ class TransactionalCodingRun:
             )
         )
         result = await self._verifier.verify(self._verification_spec, self._workspace)
+        verified_version = self._workspace_version()
+        workspace_changed = verified_version != candidate_version
+        workspace_restored = False
+        if workspace_changed and verification_checkpoint is not None:
+            if self._restore_verification_checkpoint is None:
+                raise RuntimeError("Verification checkpoint restore is unavailable")
+            self._restore_verification_checkpoint(verification_checkpoint)
+            restored_version = self._workspace_version()
+            if restored_version != candidate_version:
+                raise RuntimeError("Could not restore the pre-verification Agent workspace")
+            workspace_restored = True
         if not result.passed:
             self._run_events.append(
                 RunVerificationFailed(
@@ -150,7 +177,22 @@ class TransactionalCodingRun:
                 )
             )
             raise CompletionVerificationError(result)
-        verified_version = self._workspace_version()
+        if workspace_changed:
+            if not workspace_restored:
+                self._run_events.append(
+                    RunVerificationFailed(
+                        run_id=self.run_id,
+                        exit_code=result.exit_code,
+                        timed_out=result.timed_out,
+                        stdout_artifact_id=result.stdout_artifact_id,
+                        stderr_artifact_id=result.stderr_artifact_id,
+                    )
+                )
+                raise VerificationWorkspaceChangedError(
+                    "Completion verification modified non-ignored workspace files; "
+                    "refused promotion because no verification checkpoint was available"
+                )
+            verified_version = candidate_version
         self._run_events.append(
             RunVerified(
                 run_id=self.run_id,

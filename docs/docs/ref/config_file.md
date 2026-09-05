@@ -80,6 +80,10 @@ transactional:
   max_artifact_output_bytes: 33554432
   max_tokens: null
   max_recovery_attempts: 3
+  verification:
+    command: uv run pytest -q
+    timeout_seconds: 300
+    max_evidence_bytes: 16384
 ```
 
 ## Namespaced Model References

@@ -63,6 +63,8 @@ class CodingToolResultReducer:
         /,
     ) -> CallToolResult:
         text = _result_text(result)
+        if len(text.encode("utf-8")) <= self.limits.max_result_bytes:
+            return result
         command = request.arguments.get("command")
         command_text = command if isinstance(command, str) else ""
         command_tokens = _command_tokens(command_text)
@@ -173,7 +175,7 @@ def _reduced_result(
     artifact_id: ArtifactId,
     max_result_bytes: int,
 ) -> CallToolResult:
-    reference = f"full_output_artifact: {artifact_id}"
+    reference = f"output_artifact: {artifact_id}"
     text = _fit_with_reference(summary, reference, max_result_bytes)
     return result.model_copy(
         update={

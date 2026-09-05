@@ -23,6 +23,15 @@ def _request(command: str) -> ToolExecutionRequest:
     )
 
 
+def _read_request() -> ToolExecutionRequest:
+    return ToolExecutionRequest(
+        run_id=RunId("run-1"),
+        tool_call_id=ToolCallId("call-1"),
+        tool_name="read_text_file",
+        arguments={"path": "source.py"},
+    )
+
+
 def _result(text: str, *, exit_code: int) -> CallToolResult:
     result = CallToolResult(
         content=[TextContent(type="text", text=text)],
@@ -61,7 +70,7 @@ def test_pytest_reducer_extracts_failures_and_bounds_long_output() -> None:
     assert "tests/test_orders.py::test_cutoff" in text
     assert "tests/test_orders.py:42" in text
     assert "AssertionError: expected accepted order" in text
-    assert f"full_output_artifact: {ARTIFACT_ID}" in text
+    assert f"output_artifact: {ARTIFACT_ID}" in text
     assert "captured log line 19999" not in text
     assert reduced.is_error is True
 
@@ -77,6 +86,7 @@ def test_git_diff_reducer_reports_files_counts_and_bounded_hunks() -> None:
             "-old default",
             "+new default",
             "+extra guard",
+            f" context {'x' * 2_000}",
         ]
     )
     reducer = CodingToolResultReducer(ReducerLimits(max_result_bytes=1024))
@@ -88,7 +98,7 @@ def test_git_diff_reducer_reports_files_counts_and_bounded_hunks() -> None:
     assert "added_lines: 2" in text
     assert "deleted_lines: 1" in text
     assert "@@ -1,2 +1,3 @@" in text
-    assert f"full_output_artifact: {ARTIFACT_ID}" in text
+    assert f"output_artifact: {ARTIFACT_ID}" in text
 
 
 def test_shell_fallback_preserves_exit_code_and_head_tail() -> None:
@@ -103,16 +113,54 @@ def test_shell_fallback_preserves_exit_code_and_head_tail() -> None:
     assert "line-0" in text
     assert "line-99" in text
     assert "truncated_bytes:" in text
-    assert f"full_output_artifact: {ARTIFACT_ID}" in text
+    assert f"output_artifact: {ARTIFACT_ID}" in text
 
 
-def test_single_item_fallback_does_not_expand_tail() -> None:
+def test_result_at_byte_limit_is_preserved_exactly() -> None:
+    text = "界" * 84 + "abcd"
+    assert len(text.encode("utf-8")) == 256
+    result = _result(text, exit_code=0)
+    reducer = CodingToolResultReducer(ReducerLimits(max_result_bytes=256, max_items=1))
+
+    for command in ("python job.py", "uv run pytest -q", "git diff HEAD"):
+        reduced = reducer(_request(command), result, ARTIFACT_ID)
+
+        assert reduced is result
+        assert _text(reduced) == text
+
+
+def test_short_read_result_is_preserved_exactly() -> None:
+    result = _result("first\nmiddle\nlast", exit_code=0)
     reducer = CodingToolResultReducer(ReducerLimits(max_result_bytes=512, max_items=1))
+
+    reduced = reducer(_read_request(), result, ARTIFACT_ID)
+
+    assert reduced is result
+    assert _text(reduced) == "first\nmiddle\nlast"
+
+
+def test_long_unicode_result_is_bounded_on_utf8_boundary() -> None:
+    reducer = CodingToolResultReducer(ReducerLimits(max_result_bytes=256, max_items=1))
 
     text = _text(
         reducer(
             _request("python job.py"),
-            _result("first\nmiddle\nlast", exit_code=0),
+            _result("界" * 1_000, exit_code=0),
+            ARTIFACT_ID,
+        )
+    )
+
+    assert len(text.encode("utf-8")) <= 256
+    assert f"output_artifact: {ARTIFACT_ID}" in text
+
+
+def test_single_item_fallback_does_not_expand_tail() -> None:
+    reducer = CodingToolResultReducer(ReducerLimits(max_result_bytes=256, max_items=1))
+
+    text = _text(
+        reducer(
+            _request("python job.py"),
+            _result(f"first\n{'middle' * 100}\nlast", exit_code=0),
             ARTIFACT_ID,
         )
     )

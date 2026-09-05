@@ -11,12 +11,15 @@ from fast_agent.transactional.events import (
 )
 from fast_agent.transactional.models import RunId, ToolCallId, ToolEffect, TransactionId
 from fast_agent.transactional.run_events import (
+    PromotionApplied,
     RunEventKind,
-    RunFailed,
     RunRecovered,
     RunRecoveryStarted,
     RunStarted,
     RunState,
+    RunVerificationFailed,
+    RunVerificationStarted,
+    RunVerified,
 )
 from fast_agent.transactional.storage.event_store import SCHEMA_VERSION, SQLiteEventStore
 from fast_agent.transactional.storage.run_event_store import SQLiteRunEventStore
@@ -43,7 +46,26 @@ def test_run_events_round_trip_and_project_recovery_state(tmp_path: Path) -> Non
             checkpoint_id="checkpoint-1",
         ),
         RunRecovered(run_id=RUN_ID, workspace_version="version-1"),
-        RunFailed(run_id=RUN_ID, reason="budget exhausted"),
+        RunVerificationStarted(run_id=RUN_ID, command="pytest"),
+        RunVerificationFailed(
+            run_id=RUN_ID,
+            exit_code=1,
+            timed_out=False,
+            stdout_artifact_id="stdout-1",
+            stderr_artifact_id="stderr-1",
+        ),
+        RunVerificationStarted(run_id=RUN_ID, command="pytest"),
+        RunVerified(
+            run_id=RUN_ID,
+            workspace_version="version-2",
+            stdout_artifact_id="stdout-2",
+            stderr_artifact_id="stderr-2",
+        ),
+        PromotionApplied(
+            run_id=RUN_ID,
+            workspace_version="version-2",
+            patch_artifact_id="patch-1",
+        ),
     ]
 
     with SQLiteRunEventStore(path) as store:
@@ -54,10 +76,19 @@ def test_run_events_round_trip_and_project_recovery_state(tmp_path: Path) -> Non
         stored = reopened.events_for_run(RUN_ID)
         projection = reopened.replay(RUN_ID)
 
-    assert [item.sequence for item in stored] == [1, 2, 3, 4]
+    assert [item.sequence for item in stored] == list(range(1, 9))
     assert [item.event for item in stored] == events
-    assert [item.event.kind for item in stored] == list(RunEventKind)
-    assert projection.state is RunState.FAILED
+    assert [item.event.kind for item in stored] == [
+        RunEventKind.STARTED,
+        RunEventKind.RECOVERY_STARTED,
+        RunEventKind.RECOVERED,
+        RunEventKind.VERIFICATION_STARTED,
+        RunEventKind.VERIFICATION_FAILED,
+        RunEventKind.VERIFICATION_STARTED,
+        RunEventKind.VERIFIED,
+        RunEventKind.PROMOTION_APPLIED,
+    ]
+    assert projection.state is RunState.PROMOTED
 
 
 def test_schema_v1_migrates_without_losing_tool_events(tmp_path: Path) -> None:

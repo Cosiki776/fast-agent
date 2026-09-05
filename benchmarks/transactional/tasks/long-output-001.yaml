@@ -1,0 +1,14 @@
+id: long-output-001
+repository: .txagent-fixtures/long-output-service
+base_commit: 30674e77a924d7e9124492a0d076ff8c74a2fcea
+issue: >-
+  Batch processing crashes when an input record omits its optional region. Preserve
+  explicitly supplied regions and use the documented fallback for missing regions.
+controlled_command: python3 -m unittest discover -s tests
+verification:
+  command: python3 -m unittest discover -s tests
+  timeout_seconds: 120
+  max_evidence_bytes: 8192
+budget:
+  max_llm_calls: 16
+  max_tool_calls: 50

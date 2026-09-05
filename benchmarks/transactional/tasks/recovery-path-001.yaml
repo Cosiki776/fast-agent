@@ -1,0 +1,12 @@
+id: recovery-path-001
+repository: .txagent-fixtures/recovery-path-service
+base_commit: 6f4bfbfe957c54a30e7499c97269b031d87c03ec
+issue: >-
+  Workspace containment accepts sibling-prefix and parent-traversal paths. Correct the
+  containment decision while preserving valid children and the workspace root itself.
+verification:
+  command: python3 -m unittest discover -s tests
+  timeout_seconds: 120
+budget:
+  max_llm_calls: 20
+  max_tool_calls: 80

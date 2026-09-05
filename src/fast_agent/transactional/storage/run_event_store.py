@@ -8,6 +8,9 @@ from typing import TYPE_CHECKING, Self
 
 from fast_agent.transactional.models import RunId
 from fast_agent.transactional.run_events import (
+    PromotionApplied,
+    PromotionRejected,
+    RunAgentCompleted,
     RunEvent,
     RunEventKind,
     RunFailed,
@@ -15,6 +18,9 @@ from fast_agent.transactional.run_events import (
     RunRecovered,
     RunRecoveryStarted,
     RunStarted,
+    RunVerificationFailed,
+    RunVerificationStarted,
+    RunVerified,
     replay_run,
 )
 from fast_agent.transactional.storage.event_store import SQLiteEventStore
@@ -88,7 +94,7 @@ class SQLiteRunEventStore:
         self.close()
 
 
-def _payload(event: RunEvent) -> dict[str, str]:
+def _payload(event: RunEvent) -> dict[str, object]:
     if isinstance(event, RunStarted):
         return {"profile": event.profile}
     if isinstance(event, RunRecoveryStarted):
@@ -96,8 +102,33 @@ def _payload(event: RunEvent) -> dict[str, str]:
             "failure_signature": event.failure_signature,
             "checkpoint_id": event.checkpoint_id,
         }
-    if isinstance(event, RunRecovered):
+    if isinstance(event, (RunRecovered, RunAgentCompleted)):
         return {"workspace_version": event.workspace_version}
+    if isinstance(event, RunVerificationStarted):
+        return {"command": event.command}
+    if isinstance(event, RunVerificationFailed):
+        return {
+            "exit_code": event.exit_code,
+            "timed_out": event.timed_out,
+            "stdout_artifact_id": event.stdout_artifact_id,
+            "stderr_artifact_id": event.stderr_artifact_id,
+        }
+    if isinstance(event, RunVerified):
+        return {
+            "workspace_version": event.workspace_version,
+            "stdout_artifact_id": event.stdout_artifact_id,
+            "stderr_artifact_id": event.stderr_artifact_id,
+        }
+    if isinstance(event, PromotionApplied):
+        return {
+            "workspace_version": event.workspace_version,
+            "patch_artifact_id": event.patch_artifact_id,
+        }
+    if isinstance(event, PromotionRejected):
+        return {
+            "reason": event.reason,
+            "patch_artifact_id": event.patch_artifact_id,
+        }
     return {"reason": event.reason}
 
 
@@ -121,6 +152,43 @@ def _stored_event(row: sqlite3.Row) -> StoredRunEvent:
             **fields,
             workspace_version=_required_string(payload, "workspace_version"),
         )
+    elif kind is RunEventKind.AGENT_COMPLETED:
+        event = RunAgentCompleted(
+            **fields,
+            workspace_version=_required_string(payload, "workspace_version"),
+        )
+    elif kind is RunEventKind.VERIFICATION_STARTED:
+        event = RunVerificationStarted(
+            **fields,
+            command=_required_string(payload, "command"),
+        )
+    elif kind is RunEventKind.VERIFICATION_FAILED:
+        event = RunVerificationFailed(
+            **fields,
+            exit_code=_required_int(payload, "exit_code"),
+            timed_out=_required_bool(payload, "timed_out"),
+            stdout_artifact_id=_required_string(payload, "stdout_artifact_id"),
+            stderr_artifact_id=_required_string(payload, "stderr_artifact_id"),
+        )
+    elif kind is RunEventKind.VERIFIED:
+        event = RunVerified(
+            **fields,
+            workspace_version=_required_string(payload, "workspace_version"),
+            stdout_artifact_id=_required_string(payload, "stdout_artifact_id"),
+            stderr_artifact_id=_required_string(payload, "stderr_artifact_id"),
+        )
+    elif kind is RunEventKind.PROMOTION_APPLIED:
+        event = PromotionApplied(
+            **fields,
+            workspace_version=_required_string(payload, "workspace_version"),
+            patch_artifact_id=_required_string(payload, "patch_artifact_id"),
+        )
+    elif kind is RunEventKind.PROMOTION_REJECTED:
+        event = PromotionRejected(
+            **fields,
+            reason=_required_string(payload, "reason"),
+            patch_artifact_id=_required_string(payload, "patch_artifact_id"),
+        )
     else:
         event = RunFailed(**fields, reason=_required_string(payload, "reason"))
     return StoredRunEvent(int(row["sequence"]), event)
@@ -130,4 +198,18 @@ def _required_string(payload: dict[object, object], key: str) -> str:
     value = payload.get(key)
     if not isinstance(value, str):
         raise ValueError(f"Run-event payload field '{key}' must be a string")
+    return value
+
+
+def _required_int(payload: dict[object, object], key: str) -> int:
+    value = payload.get(key)
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise ValueError(f"Run-event payload field '{key}' must be an integer")
+    return value
+
+
+def _required_bool(payload: dict[object, object], key: str) -> bool:
+    value = payload.get(key)
+    if not isinstance(value, bool):
+        raise ValueError(f"Run-event payload field '{key}' must be a boolean")
     return value

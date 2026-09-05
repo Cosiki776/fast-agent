@@ -5,23 +5,33 @@ from typing import TYPE_CHECKING
 
 from fast_agent.transactional.budget import RunBudgetTracker
 from fast_agent.transactional.checkpoint.checkpoint import CheckpointManager
-from fast_agent.transactional.context.reducers import CodingToolResultReducer
+from fast_agent.transactional.context.reducers import CodingToolResultReducer, ToolResultReducer
 from fast_agent.transactional.coordinator import TransactionCoordinator
 from fast_agent.transactional.governance import CodingToolGovernanceGate, CodingToolPolicy
 from fast_agent.transactional.models import RunId, new_run_id
 from fast_agent.transactional.recovery.controller import RecoveryController
 from fast_agent.transactional.run_controller import TransactionalCodingRun
-from fast_agent.transactional.run_events import RunStarted
-from fast_agent.transactional.settings import TransactionalProfile, TransactionalSettings
+from fast_agent.transactional.run_events import RunStarted, RunState
+from fast_agent.transactional.settings import (
+    SemanticReducerVersion,
+    ToolOutputStrategy,
+    TransactionalProfile,
+    TransactionalSettings,
+)
 from fast_agent.transactional.storage.artifact_store import FileArtifactStore
 from fast_agent.transactional.storage.event_store import SQLiteEventStore
 from fast_agent.transactional.storage.run_event_store import SQLiteRunEventStore
+from fast_agent.transactional.verification import CompletionVerifier
 
 if TYPE_CHECKING:
     from pathlib import Path
 
     from fast_agent.mcp.tool_permission_handler import ToolPermissionHandler
     from fast_agent.transactional.checkpoint.checkpoint import CheckpointMetadata
+    from fast_agent.transactional.checkpoint.snapshot import (
+        WorkspaceSnapshot,
+        WorkspaceSnapshotManager,
+    )
     from fast_agent.transactional.checkpoint.worktree import WorktreeMetadata
     from fast_agent.transactional.execution import ToolExecutionRequest
 
@@ -45,6 +55,11 @@ class TransactionalRuntime:
     @property
     def workspace(self) -> Path | None:
         return self.worktree.worktree_path if self.worktree is not None else None
+
+    @property
+    def requires_manual_review(self) -> bool:
+        """Whether this Run's Worktree must be retained for manual review."""
+        return self.controller is not None and self.controller.state is RunState.PROMOTION_REJECTED
 
     def close(self) -> None:
         if self._closed:
@@ -72,6 +87,8 @@ class TransactionalRuntimeAssembler:
         run_id: RunId | None = None,
         worktree: WorktreeMetadata | None = None,
         permission_handler: ToolPermissionHandler | None = None,
+        snapshot_manager: WorkspaceSnapshotManager | None = None,
+        snapshot: WorkspaceSnapshot | None = None,
     ) -> TransactionalRuntime | None:
         if self._settings.profile is TransactionalProfile.BASELINE:
             return None
@@ -81,7 +98,7 @@ class TransactionalRuntimeAssembler:
         event_store = SQLiteEventStore(run_root / "events.sqlite3")
         artifact_store = FileArtifactStore(run_root / "artifacts")
         budget = RunBudgetTracker(self._settings.budget_limits())
-        reducer = CodingToolResultReducer()
+        reducer = self._result_reducer()
 
         if self._settings.profile is TransactionalProfile.REDUCER:
             coordinator = TransactionCoordinator(
@@ -112,6 +129,8 @@ class TransactionalRuntimeAssembler:
             reducer,
             worktree,
             permission_handler,
+            snapshot_manager,
+            snapshot,
         )
 
     def _assemble_full(
@@ -121,9 +140,11 @@ class TransactionalRuntimeAssembler:
         event_store: SQLiteEventStore,
         artifact_store: FileArtifactStore,
         budget: RunBudgetTracker,
-        reducer: CodingToolResultReducer,
+        reducer: ToolResultReducer | None,
         worktree: WorktreeMetadata,
         permission_handler: ToolPermissionHandler | None,
+        snapshot_manager: WorkspaceSnapshotManager | None,
+        snapshot: WorkspaceSnapshot | None,
     ) -> TransactionalRuntime:
         if worktree.run_id != run_id:
             event_store.close()
@@ -140,12 +161,15 @@ class TransactionalRuntimeAssembler:
         )
         checkpoints: dict[str, CheckpointMetadata] = {}
 
-        def create_checkpoint(request: ToolExecutionRequest) -> str:
-            del request
+        def save_checkpoint() -> str:
             checkpoint = checkpoint_manager.create()
             checkpoint_id = str(checkpoint.checkpoint_id)
             checkpoints[checkpoint_id] = checkpoint
             return checkpoint_id
+
+        def create_checkpoint(request: ToolExecutionRequest) -> str:
+            del request
+            return save_checkpoint()
 
         def restore_checkpoint(checkpoint_id: str) -> str:
             return str(checkpoint_manager.restore(checkpoints[checkpoint_id]))
@@ -164,7 +188,49 @@ class TransactionalRuntimeAssembler:
             recovery_controller=recovery,
             run_event_store=run_events,
         )
-        controller = TransactionalCodingRun(run_id, run_events, budget)
+        verifier = None
+        promote = None
+        if self._settings.verification is not None:
+            from fast_agent.core.logging.logger import get_logger
+            from fast_agent.tools.local_shell_executor import LocalShellExecutor
+
+            verifier = CompletionVerifier(
+                LocalShellExecutor(
+                    logger=get_logger(__name__),
+                    working_directory=worktree.worktree_path,
+                ),
+                artifact_store,
+            )
+            if snapshot_manager is None or snapshot is None:
+                event_store.close()
+                run_events.close()
+                raise ValueError("workspace promotion requires the initial WorkspaceSnapshot")
+        if snapshot_manager is not None and snapshot is not None:
+            from fast_agent.transactional.checkpoint.promotion import WorkspacePromoter
+
+            promoter = WorkspacePromoter(
+                snapshot_manager,
+                snapshot,
+                worktree,
+                artifact_store,
+            )
+            promote = promoter.promote
+        controller = TransactionalCodingRun(
+            run_id,
+            run_events,
+            budget,
+            verifier=verifier,
+            verification_spec=self._settings.verification,
+            workspace=worktree.worktree_path,
+            workspace_version=(
+                (lambda: str(snapshot_manager.worktree_version(snapshot, worktree)))
+                if snapshot_manager is not None and snapshot is not None
+                else lambda: str(checkpoint_manager.current_version())
+            ),
+            promote=promote,
+            create_verification_checkpoint=save_checkpoint,
+            restore_verification_checkpoint=restore_checkpoint,
+        )
         return TransactionalRuntime(
             run_id=run_id,
             profile=self._settings.profile,
@@ -176,4 +242,14 @@ class TransactionalRuntimeAssembler:
             run_event_store=run_events,
             controller=controller,
             worktree=worktree,
+        )
+
+    def _result_reducer(self) -> ToolResultReducer | None:
+        tool_output = self._settings.tool_output
+        if tool_output.strategy is ToolOutputStrategy.UPSTREAM:
+            return None
+        if tool_output.semantic_reducer_version is SemanticReducerVersion.V1:
+            return CodingToolResultReducer()
+        raise ValueError(
+            f"Unsupported semantic reducer version: {tool_output.semantic_reducer_version}"
         )

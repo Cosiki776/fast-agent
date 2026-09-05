@@ -190,7 +190,7 @@ async def test_bounded_shell_result_enters_next_llm_request(tmp_path: Path) -> N
             for item in event_store.events_for_transaction(TRANSACTION_ID)
             if isinstance(item.event, ToolResultStored)
         )
-        assert f"full_output_artifact: {stored.artifact_id}" in visible_content.text
+        assert f"output_artifact: {stored.artifact_id}" in visible_content.text
         raw_artifact = artifact_store.read(ArtifactId(stored.artifact_id))
         assert raw_marker.encode() in raw_artifact
     finally:

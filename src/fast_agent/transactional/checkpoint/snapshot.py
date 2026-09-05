@@ -187,6 +187,27 @@ class WorkspaceSnapshotManager:
                 modified.append(path)
         return AgentDelta(tuple(added), tuple(modified), tuple(deleted))
 
+    def worktree_version(
+        self,
+        snapshot: WorkspaceSnapshot,
+        worktree: WorktreeMetadata,
+    ) -> SnapshotVersion:
+        self._validate_worktree(snapshot, worktree)
+        return _content_version(self._files_at(worktree.worktree_path, snapshot.base_commit))
+
+    def source_version(self, snapshot: WorkspaceSnapshot) -> SnapshotVersion:
+        self._validate_snapshot(snapshot)
+        return _content_version(self._files_at(self.source_root, snapshot.base_commit))
+
+    def stored_entry(self, snapshot: WorkspaceSnapshot, relative_path: str) -> Path:
+        self._validate_snapshot(snapshot)
+        if relative_path not in {entry.path for entry in snapshot.files if entry.exists}:
+            raise WorkspaceError(f"Snapshot entry does not exist: {relative_path}")
+        return _workspace_path(
+            self._snapshot_dir(snapshot.snapshot_id) / "files",
+            relative_path,
+        )
+
     def _capture(self, *, include_content: bool = True) -> _CapturedWorkspace:
         _validate_supported_workspace(self.source_root)
         branch = git(self.source_root, "symbolic-ref", "--short", "HEAD")

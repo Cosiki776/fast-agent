@@ -70,6 +70,8 @@ class _TwoTimeoutsThenDoneLlm(PassthroughLLM):
 
 
 class _OneCommandThenDoneLlm(PassthroughLLM):
+    completion_stop_reason = LlmStopReason.END_TURN
+
     def __init__(self, command: str) -> None:
         super().__init__()
         self._command = command
@@ -101,7 +103,7 @@ class _OneCommandThenDoneLlm(PassthroughLLM):
             )
 
         self.final_request = [message.model_copy(deep=True) for message in multipart_messages]
-        return Prompt.assistant("done", stop_reason=LlmStopReason.END_TURN)
+        return Prompt.assistant("done", stop_reason=self.completion_stop_reason)
 
 
 def _git_repository(root: Path) -> Path:
@@ -131,6 +133,7 @@ def _fast_agent(
     *,
     profile: TransactionalProfile,
     workspace: Path,
+    keep_worktree: bool = True,
 ) -> tuple[FastAgent, Path, Path]:
     runtime_root = tmp_path / "transactional-runtime"
     home = tmp_path / "home"
@@ -149,7 +152,7 @@ def _fast_agent(
                 "transactional:",
                 f"  profile: {profile.value}",
                 f"  runtime_root: {runtime_root}",
-                "  keep_worktree: true",
+                f"  keep_worktree: {str(keep_worktree).lower()}",
                 "  shell_terminal_timeout_seconds: 0.15",
                 "  max_wall_time_seconds: 30",
             ]
@@ -370,6 +373,53 @@ async def test_full_harness_sessions_own_isolated_transactional_resources(
 
 @pytest.mark.integration
 @pytest.mark.asyncio
+@pytest.mark.parametrize("stop_reason", [LlmStopReason.END_TURN, LlmStopReason.MAX_TOKENS])
+async def test_full_harness_promotes_without_fixed_verification_and_cleans_worktree(
+    tmp_path: Path,
+    stop_reason: LlmStopReason,
+) -> None:
+    repository = _git_repository(tmp_path / "repository")
+    old_settings = get_settings()
+    worktree_path: Path | None = None
+    try:
+        fast, _, _ = _fast_agent(
+            tmp_path,
+            profile=TransactionalProfile.FULL,
+            workspace=repository,
+            keep_worktree=False,
+        )
+        with suppress_interactive_display():
+            async with fast.harness() as harness:
+                session = await harness.session("manual-review", agent_name="main")
+                runtime = session.transactional_runtime
+                assert runtime is not None
+                assert runtime.workspace is not None
+                worktree_path = runtime.workspace
+                agent = cast("McpAgent", session.agent_app["main"])
+                llm = _OneCommandThenDoneLlm("printf abc > result.txt && cat result.txt")
+                llm.completion_stop_reason = stop_reason
+                agent._llm = llm
+                assert "check the result in proportion to the task" in agent.config.instruction
+                if stop_reason is LlmStopReason.END_TURN:
+                    await session.send("Create result.txt containing abc and check it.")
+                    assert repository.joinpath("result.txt").read_text(encoding="utf-8") == "abc"
+                else:
+                    from fast_agent.transactional.run_controller import (
+                        TransactionalRunTerminatedError,
+                    )
+
+                    with pytest.raises(TransactionalRunTerminatedError, match="did not complete"):
+                        await session.send("Create result.txt containing abc and check it.")
+                    assert not repository.joinpath("result.txt").exists()
+
+        assert worktree_path is not None
+        assert not worktree_path.exists()
+    finally:
+        update_global_settings(old_settings)
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
 @pytest.mark.skipif(os.name == "nt", reason="process death assertion uses Unix signals")
 async def test_full_harness_timeout_restores_checkpoint_and_hands_off_to_llm(
     tmp_path: Path,
@@ -449,6 +499,8 @@ async def test_full_harness_timeout_restores_checkpoint_and_hands_off_to_llm(
                 RunEventKind.STARTED,
                 RunEventKind.RECOVERY_STARTED,
                 RunEventKind.RECOVERED,
+                RunEventKind.AGENT_COMPLETED,
+                RunEventKind.PROMOTION_APPLIED,
             ]
 
             artifacts = b"\n".join(

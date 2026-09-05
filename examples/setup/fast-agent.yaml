@@ -77,6 +77,12 @@ compaction:
 #   max_artifact_output_bytes: 33554432
 #   max_tokens: null
 #   max_recovery_attempts: 3
+#   # Optional mandatory check for full; omitted means Agent self-checks using project instructions.
+#   # Both paths require an unchanged user Workspace before promotion.
+#   verification:
+#     command: uv run pytest -q
+#     timeout_seconds: 300
+#     max_evidence_bytes: 16384
 
 # otel:
 #   enabled: true

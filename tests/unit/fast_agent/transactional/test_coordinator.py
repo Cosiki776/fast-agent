@@ -155,7 +155,7 @@ async def test_error_result_is_stored_before_transaction_fails(tmp_path: Path) -
     async def call_next() -> ToolExecutionOutcome:
         return ToolExecutionOutcome(result=expected_result)
 
-    outcome = await coordinator.coordinate(_request("read_text_file"), call_next)
+    outcome = await coordinator.coordinate(_request("execute"), call_next)
     events = _events(event_store)
 
     assert outcome.result is expected_result
@@ -268,6 +268,7 @@ async def test_uncertain_tool_outcome_fails_run_without_restore(tmp_path: Path) 
 def test_effect_classifier_uses_explicit_first_phase_rules() -> None:
     assert classify_tool_effect("read_text_file") is ToolEffect.READ
     assert classify_tool_effect("write_text_file") is ToolEffect.WORKSPACE_WRITE
+    assert classify_tool_effect("edit_file") is ToolEffect.WORKSPACE_WRITE
     assert classify_tool_effect("apply_patch") is ToolEffect.WORKSPACE_WRITE
     assert classify_tool_effect("execute") is ToolEffect.WORKSPACE_WRITE
     assert classify_tool_effect("process") is ToolEffect.WORKSPACE_WRITE
@@ -573,7 +574,22 @@ async def test_reducer_returns_bounded_result_after_raw_artifact_is_stored(tmp_p
     assert isinstance(content, TextContent)
     assert len(content.text.encode("utf-8")) <= 512
     assert raw_text not in content.text
-    assert f"full_output_artifact: {stored.artifact_id}" in content.text
+    assert f"output_artifact: {stored.artifact_id}" in content.text
+    event_store.close()
+
+
+@pytest.mark.asyncio
+async def test_reducer_preserves_short_exact_result_after_storing_artifact(tmp_path: Path) -> None:
+    reducer = CodingToolResultReducer(ReducerLimits(max_result_bytes=512))
+    coordinator, event_store, _ = _coordinator(tmp_path, result_reducer=reducer)
+    expected_result = _result("source line one\nsource line two")
+
+    async def call_next() -> ToolExecutionOutcome:
+        return ToolExecutionOutcome(result=expected_result)
+
+    outcome = await coordinator.coordinate(_request("read_text_file"), call_next)
+
+    assert outcome.result is expected_result
     event_store.close()
 
 
@@ -600,7 +616,7 @@ async def test_reducer_failure_returns_bounded_fallback_with_artifact_reference(
     content = outcome.result.content[0]
     assert isinstance(content, TextContent)
     assert len(content.text.encode("utf-8")) <= 8 * 1024
-    assert f"full_output_artifact: {stored.artifact_id}" in content.text
+    assert f"output_artifact: {stored.artifact_id}" in content.text
     event_store.close()
 
 

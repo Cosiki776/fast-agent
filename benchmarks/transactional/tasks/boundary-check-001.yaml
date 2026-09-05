@@ -1,10 +1,12 @@
 id: boundary-check-001
-repository: fixtures/order-service
-base_commit: 8c13ab2
-issue: Orders created exactly at the cutoff time are rejected.
+repository: .txagent-fixtures/order-service
+base_commit: 9aad50b347d9c735fdb1e0c75bc743bec6b3595c
+issue: >-
+  Orders created exactly at the cutoff time are rejected. Fix the boundary handling
+  without changing behavior before or after the cutoff.
 verification:
-  command: uv run pytest -q
+  command: python3 -m unittest discover -s tests
   timeout_seconds: 120
 budget:
-  max_llm_calls: 20
-  max_tool_calls: 80
+  max_llm_calls: 12
+  max_tool_calls: 50

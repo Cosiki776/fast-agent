@@ -9,19 +9,14 @@ from typing import TYPE_CHECKING, Annotated
 import yaml
 from pydantic import BaseModel, ConfigDict, Field
 
+from fast_agent.transactional.verification import VerificationSpec  # noqa: TC001
+
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
     from pathlib import Path
 
 
 type NonNegativeInt = Annotated[int, Field(ge=0)]
-
-
-class VerificationSpec(BaseModel):
-    command: str = Field(min_length=1)
-    timeout_seconds: int = Field(gt=0)
-
-    model_config = ConfigDict(frozen=True, extra="forbid")
 
 
 class BenchmarkBudgetSpec(BaseModel):
@@ -36,6 +31,7 @@ class BenchmarkTaskManifest(BaseModel):
     repository: str = Field(min_length=1)
     base_commit: str = Field(min_length=1)
     issue: str = Field(min_length=1)
+    controlled_command: str | None = Field(default=None, min_length=1)
     verification: VerificationSpec
     budget: BenchmarkBudgetSpec
 
@@ -130,7 +126,7 @@ def load_task_manifests(directory: Path) -> list[BenchmarkTaskManifest]:
 
 def task_manifest_sha256(task: BenchmarkTaskManifest) -> str:
     payload = json.dumps(
-        task.model_dump(mode="json"),
+        task.model_dump(mode="json", exclude_none=True),
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),

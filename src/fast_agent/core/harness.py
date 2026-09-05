@@ -103,6 +103,11 @@ class HarnessSession:
         return self._record.instance.app
 
     @property
+    def transactional_runtime(self) -> "TransactionalRuntime | None":
+        """Transactional resources owned by this session, when enabled."""
+        return self._record.transactional_runtime
+
+    @property
     def session_manager(self) -> "SessionManager | None":
         """Persisted session manager when this session has file-backed state."""
         from fast_agent.session.session_manager import Session
@@ -125,10 +130,15 @@ class HarnessSession:
 
             async def execute() -> str:
                 result = await agent.send(message, request_params)
-                await self._save_persisted_history(agent)
+                await self._finish_agent_call(agent)
                 return result
 
-            return await self._call_agent_once(execute)
+            async def retry(evidence: str) -> str:
+                result = await agent.send(evidence, request_params)
+                await self._finish_agent_call(agent)
+                return result
+
+            return await self._call_agent_once(execute, retry)
         finally:
             await self._end_operation("send")
 
@@ -145,10 +155,15 @@ class HarnessSession:
 
             async def execute() -> PromptMessageExtended:
                 result = await agent.generate(messages, request_params)
-                await self._save_persisted_history(agent)
+                await self._finish_agent_call(agent)
                 return result
 
-            return await self._call_agent_once(execute)
+            async def retry(evidence: str) -> PromptMessageExtended:
+                result = await agent.generate(evidence, request_params)
+                await self._finish_agent_call(agent)
+                return result
+
+            return await self._call_agent_once(execute, retry)
         finally:
             await self._end_operation("generate")
 
@@ -176,10 +191,15 @@ class HarnessSession:
 
             async def execute() -> tuple[ModelT | None, PromptMessageExtended]:
                 result = await agent.structured(messages, model, request_params)
-                await self._save_persisted_history(agent)
+                await self._finish_agent_call(agent)
                 return result
 
-            return await self._call_agent_once(execute)
+            async def retry(evidence: str) -> tuple[ModelT | None, PromptMessageExtended]:
+                result = await agent.structured(evidence, model, request_params)
+                await self._finish_agent_call(agent)
+                return result
+
+            return await self._call_agent_once(execute, retry)
         finally:
             await self._end_operation("structured")
 
@@ -197,10 +217,15 @@ class HarnessSession:
 
             async def execute() -> tuple[Any | None, PromptMessageExtended]:
                 result = await agent.structured_schema(messages, schema, request_params)
-                await self._save_persisted_history(agent)
+                await self._finish_agent_call(agent)
                 return result
 
-            return await self._call_agent_once(execute)
+            async def retry(evidence: str) -> tuple[Any | None, PromptMessageExtended]:
+                result = await agent.structured_schema(evidence, schema, request_params)
+                await self._finish_agent_call(agent)
+                return result
+
+            return await self._call_agent_once(execute, retry)
         finally:
             await self._end_operation("structured_schema")
 
@@ -278,11 +303,17 @@ class HarnessSession:
         """Delete this session and dispose its owned instance."""
         await self._manager.delete(self.id)
 
-    async def _call_agent_once(self, call: Callable[[], Awaitable[ResultT]]) -> ResultT:
+    async def _call_agent_once(
+        self,
+        call: Callable[[], Awaitable[ResultT]],
+        retry: Callable[[str], Awaitable[ResultT]] | None = None,
+    ) -> ResultT:
         runtime = self._record.transactional_runtime
         if runtime is None or runtime.controller is None:
             return await call()
-        return await runtime.controller.call_agent_once(call)
+        if retry is None:
+            return await runtime.controller.call_agent_once(call)
+        return await runtime.controller.call_agent_until_verified(call, retry)
 
     async def _begin_operation(
         self,
@@ -335,6 +366,22 @@ class HarnessSession:
         if config is not None and config.compaction is not None:
             return config.compaction
         return CompactionSettings()
+
+    async def _finish_agent_call(self, agent: AgentProtocol) -> None:
+        from fast_agent.agents.mcp_agent import McpAgent
+        from fast_agent.transactional.run_controller import TransactionalRunTerminatedError
+        from fast_agent.types.llm_stop_reason import LlmStopReason
+
+        runtime = self._record.transactional_runtime
+        if runtime is not None and runtime.controller is not None and isinstance(agent, McpAgent):
+            if not agent.last_turn_messages or agent.last_turn_messages[-1].stop_reason not in {
+                LlmStopReason.END_TURN,
+                LlmStopReason.STOP_SEQUENCE,
+            }:
+                raise TransactionalRunTerminatedError(
+                    "Agent did not complete normally; workspace promotion was not attempted"
+                )
+        await self._save_persisted_history(agent)
 
     async def _save_persisted_history(self, agent: AgentProtocol) -> None:
         persistence_handle = self._record.persistence_handle
@@ -935,6 +982,8 @@ class AgentHarness:
         run_id = new_run_id()
         worktree_manager: WorktreeManager | None = None
         worktree = None
+        snapshot_manager = None
+        snapshot = None
         if transactional.profile is TransactionalProfile.FULL:
             snapshot_manager = WorkspaceSnapshotManager(
                 self._fast_agent.workspace_root,
@@ -952,6 +1001,8 @@ class AgentHarness:
             run_id=run_id,
             worktree=worktree,
             permission_handler=self._transactional_permission_handler,
+            snapshot_manager=snapshot_manager,
+            snapshot=snapshot,
         )
         if runtime is None:
             raise RuntimeError("Transactional runtime assembly unexpectedly returned baseline")
@@ -988,12 +1039,14 @@ class AgentHarness:
             resources = self._transactional_resources.pop(id(instance), None)
             if resources is not None:
                 transactional_runtime, worktree_manager = resources
+                requires_manual_review = transactional_runtime.requires_manual_review
                 transactional_runtime.close()
                 if (
                     worktree_manager is not None
                     and transactional_runtime.worktree is not None
                     and self._fast_agent.context.config is not None
                     and not self._fast_agent.context.config.transactional.keep_worktree
+                    and not requires_manual_review
                 ):
                     worktree_manager.cleanup(transactional_runtime.worktree)
 

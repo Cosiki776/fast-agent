@@ -10,6 +10,7 @@ from fast_agent.transactional.models import RunId
 from fast_agent.transactional.run_events import (
     PromotionApplied,
     PromotionRejected,
+    RunAgentCompleted,
     RunEvent,
     RunEventKind,
     RunFailed,
@@ -101,7 +102,7 @@ def _payload(event: RunEvent) -> dict[str, object]:
             "failure_signature": event.failure_signature,
             "checkpoint_id": event.checkpoint_id,
         }
-    if isinstance(event, RunRecovered):
+    if isinstance(event, (RunRecovered, RunAgentCompleted)):
         return {"workspace_version": event.workspace_version}
     if isinstance(event, RunVerificationStarted):
         return {"command": event.command}
@@ -148,6 +149,11 @@ def _stored_event(row: sqlite3.Row) -> StoredRunEvent:
         )
     elif kind is RunEventKind.RECOVERED:
         event = RunRecovered(
+            **fields,
+            workspace_version=_required_string(payload, "workspace_version"),
+        )
+    elif kind is RunEventKind.AGENT_COMPLETED:
+        event = RunAgentCompleted(
             **fields,
             workspace_version=_required_string(payload, "workspace_version"),
         )

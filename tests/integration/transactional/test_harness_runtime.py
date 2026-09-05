@@ -70,6 +70,8 @@ class _TwoTimeoutsThenDoneLlm(PassthroughLLM):
 
 
 class _OneCommandThenDoneLlm(PassthroughLLM):
+    completion_stop_reason = LlmStopReason.END_TURN
+
     def __init__(self, command: str) -> None:
         super().__init__()
         self._command = command
@@ -101,7 +103,7 @@ class _OneCommandThenDoneLlm(PassthroughLLM):
             )
 
         self.final_request = [message.model_copy(deep=True) for message in multipart_messages]
-        return Prompt.assistant("done", stop_reason=LlmStopReason.END_TURN)
+        return Prompt.assistant("done", stop_reason=self.completion_stop_reason)
 
 
 def _git_repository(root: Path) -> Path:
@@ -371,8 +373,10 @@ async def test_full_harness_sessions_own_isolated_transactional_resources(
 
 @pytest.mark.integration
 @pytest.mark.asyncio
-async def test_full_harness_retains_unverified_worktree_when_cleanup_is_requested(
+@pytest.mark.parametrize("stop_reason", [LlmStopReason.END_TURN, LlmStopReason.MAX_TOKENS])
+async def test_full_harness_promotes_without_fixed_verification_and_cleans_worktree(
     tmp_path: Path,
+    stop_reason: LlmStopReason,
 ) -> None:
     repository = _git_repository(tmp_path / "repository")
     old_settings = get_settings()
@@ -391,15 +395,25 @@ async def test_full_harness_retains_unverified_worktree_when_cleanup_is_requeste
                 assert runtime is not None
                 assert runtime.workspace is not None
                 worktree_path = runtime.workspace
-                worktree_path.joinpath("result.txt").write_text("review me\n", encoding="utf-8")
+                agent = cast("McpAgent", session.agent_app["main"])
+                llm = _OneCommandThenDoneLlm("printf abc > result.txt && cat result.txt")
+                llm.completion_stop_reason = stop_reason
+                agent._llm = llm
+                assert "check the result in proportion to the task" in agent.config.instruction
+                if stop_reason is LlmStopReason.END_TURN:
+                    await session.send("Create result.txt containing abc and check it.")
+                    assert repository.joinpath("result.txt").read_text(encoding="utf-8") == "abc"
+                else:
+                    from fast_agent.transactional.run_controller import (
+                        TransactionalRunTerminatedError,
+                    )
 
-                report = session.worktree_only_completion_report()
-                assert report is not None
-                assert report.added == ("result.txt",)
-                assert not repository.joinpath("result.txt").exists()
+                    with pytest.raises(TransactionalRunTerminatedError, match="did not complete"):
+                        await session.send("Create result.txt containing abc and check it.")
+                    assert not repository.joinpath("result.txt").exists()
 
         assert worktree_path is not None
-        assert worktree_path.joinpath("result.txt").read_text(encoding="utf-8") == "review me\n"
+        assert not worktree_path.exists()
     finally:
         update_global_settings(old_settings)
 
@@ -485,6 +499,8 @@ async def test_full_harness_timeout_restores_checkpoint_and_hands_off_to_llm(
                 RunEventKind.STARTED,
                 RunEventKind.RECOVERY_STARTED,
                 RunEventKind.RECOVERED,
+                RunEventKind.AGENT_COMPLETED,
+                RunEventKind.PROMOTION_APPLIED,
             ]
 
             artifacts = b"\n".join(

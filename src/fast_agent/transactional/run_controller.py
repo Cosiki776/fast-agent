@@ -6,6 +6,7 @@ from fast_agent.transactional.checkpoint.promotion import PromotionRejectedError
 from fast_agent.transactional.run_events import (
     PromotionApplied,
     PromotionRejected,
+    RunAgentCompleted,
     RunFailed,
     RunState,
     RunVerificationFailed,
@@ -73,6 +74,7 @@ class TransactionalCodingRun:
         if self.state in {
             RunState.FAILED,
             RunState.VERIFIED,
+            RunState.AGENT_COMPLETED,
             RunState.PROMOTED,
             RunState.PROMOTION_REJECTED,
         }:
@@ -95,6 +97,7 @@ class TransactionalCodingRun:
         if self.state in {
             RunState.FAILED,
             RunState.VERIFIED,
+            RunState.AGENT_COMPLETED,
             RunState.PROMOTED,
             RunState.PROMOTION_REJECTED,
         }:
@@ -138,8 +141,18 @@ class TransactionalCodingRun:
             return result
 
     async def _verify_completion(self) -> None:
-        if self._verifier is None or self._verification_spec is None:
+        if self._verification_spec is None:
+            if self._promote is not None:
+                if self._workspace_version is None:
+                    raise RuntimeError("Workspace promotion requires a version provider")
+                candidate_version = self._workspace_version()
+                self._run_events.append(
+                    RunAgentCompleted(run_id=self.run_id, workspace_version=candidate_version)
+                )
+                self._promote_completion(candidate_version)
             return
+        if self._verifier is None:
+            raise RuntimeError("Configured verification requires a verifier")
         if self._workspace is None or self._workspace_version is None:
             raise RuntimeError("Completion verifier requires a workspace and version provider")
         candidate_version = self._workspace_version()
@@ -201,9 +214,12 @@ class TransactionalCodingRun:
                 stderr_artifact_id=result.stderr_artifact_id,
             )
         )
+        self._promote_completion(verified_version)
+
+    def _promote_completion(self, candidate_version: str) -> None:
         if self._promote is not None:
             try:
-                promotion = self._promote(verified_version)
+                promotion = self._promote(candidate_version)
             except PromotionRejectedError as exc:
                 self._run_events.append(
                     PromotionRejected(

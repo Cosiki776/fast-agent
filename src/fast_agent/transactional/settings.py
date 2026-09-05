@@ -62,7 +62,13 @@ class TransactionalSettings(BaseModel):
     max_tokens: NonNegativeInt | None = None
     max_recovery_attempts: NonNegativeInt | None = 3
     shell_terminal_timeout_seconds: NonNegativeFloat = 300
-    verification: VerificationSpec | None = None
+    verification: VerificationSpec | None = Field(
+        default=None,
+        description=(
+            "Optional mandatory completion command for Full. When omitted, the Agent "
+            "uses project instructions to self-check; promotion still checks the source fingerprint."
+        ),
+    )
 
     def budget_limits(self) -> RunBudgetLimits:
         return RunBudgetLimits(

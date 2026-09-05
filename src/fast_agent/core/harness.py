@@ -53,7 +53,6 @@ if TYPE_CHECKING:
     from fast_agent.tools.local_shell_executor import LocalEnvironment
     from fast_agent.transactional.assembly import TransactionalRuntime
     from fast_agent.transactional.checkpoint.worktree import WorktreeManager
-    from fast_agent.transactional.completion import WorktreeOnlyCompletionReport
 
 ModelT = TypeVar("ModelT", bound=BaseModel)
 ResultT = TypeVar("ResultT")
@@ -108,13 +107,6 @@ class HarnessSession:
         """Transactional resources owned by this session, when enabled."""
         return self._record.transactional_runtime
 
-    def worktree_only_completion_report(self) -> "WorktreeOnlyCompletionReport | None":
-        """Return the latest deterministic manual-review handoff, when required."""
-        runtime = self._record.transactional_runtime
-        if runtime is None:
-            return None
-        return runtime.worktree_only_completion_report()
-
     @property
     def session_manager(self) -> "SessionManager | None":
         """Persisted session manager when this session has file-backed state."""
@@ -138,12 +130,12 @@ class HarnessSession:
 
             async def execute() -> str:
                 result = await agent.send(message, request_params)
-                await self._save_persisted_history(agent)
+                await self._finish_agent_call(agent)
                 return result
 
             async def retry(evidence: str) -> str:
                 result = await agent.send(evidence, request_params)
-                await self._save_persisted_history(agent)
+                await self._finish_agent_call(agent)
                 return result
 
             return await self._call_agent_once(execute, retry)
@@ -163,12 +155,12 @@ class HarnessSession:
 
             async def execute() -> PromptMessageExtended:
                 result = await agent.generate(messages, request_params)
-                await self._save_persisted_history(agent)
+                await self._finish_agent_call(agent)
                 return result
 
             async def retry(evidence: str) -> PromptMessageExtended:
                 result = await agent.generate(evidence, request_params)
-                await self._save_persisted_history(agent)
+                await self._finish_agent_call(agent)
                 return result
 
             return await self._call_agent_once(execute, retry)
@@ -199,12 +191,12 @@ class HarnessSession:
 
             async def execute() -> tuple[ModelT | None, PromptMessageExtended]:
                 result = await agent.structured(messages, model, request_params)
-                await self._save_persisted_history(agent)
+                await self._finish_agent_call(agent)
                 return result
 
             async def retry(evidence: str) -> tuple[ModelT | None, PromptMessageExtended]:
                 result = await agent.structured(evidence, model, request_params)
-                await self._save_persisted_history(agent)
+                await self._finish_agent_call(agent)
                 return result
 
             return await self._call_agent_once(execute, retry)
@@ -225,12 +217,12 @@ class HarnessSession:
 
             async def execute() -> tuple[Any | None, PromptMessageExtended]:
                 result = await agent.structured_schema(messages, schema, request_params)
-                await self._save_persisted_history(agent)
+                await self._finish_agent_call(agent)
                 return result
 
             async def retry(evidence: str) -> tuple[Any | None, PromptMessageExtended]:
                 result = await agent.structured_schema(evidence, schema, request_params)
-                await self._save_persisted_history(agent)
+                await self._finish_agent_call(agent)
                 return result
 
             return await self._call_agent_once(execute, retry)
@@ -374,6 +366,22 @@ class HarnessSession:
         if config is not None and config.compaction is not None:
             return config.compaction
         return CompactionSettings()
+
+    async def _finish_agent_call(self, agent: AgentProtocol) -> None:
+        from fast_agent.agents.mcp_agent import McpAgent
+        from fast_agent.transactional.run_controller import TransactionalRunTerminatedError
+        from fast_agent.types.llm_stop_reason import LlmStopReason
+
+        runtime = self._record.transactional_runtime
+        if runtime is not None and runtime.controller is not None and isinstance(agent, McpAgent):
+            if not agent.last_turn_messages or agent.last_turn_messages[-1].stop_reason not in {
+                LlmStopReason.END_TURN,
+                LlmStopReason.STOP_SEQUENCE,
+            }:
+                raise TransactionalRunTerminatedError(
+                    "Agent did not complete normally; workspace promotion was not attempted"
+                )
+        await self._save_persisted_history(agent)
 
     async def _save_persisted_history(self, agent: AgentProtocol) -> None:
         persistence_handle = self._record.persistence_handle

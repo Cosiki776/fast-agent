@@ -52,7 +52,6 @@ async def run_one_shot_payload(
             else await agent_obj.generate(prompt_payload)
         )
         print(response.last_text() or "")
-        _print_worktree_only_completion_report(harness_session)
         return response
 
     if harness_session is not None:
@@ -77,20 +76,7 @@ async def run_one_shot_payload(
         )
         raise typer.Exit(1)
     sys.stdout.write(json.dumps(_structured_output_payload(parsed), ensure_ascii=False))
-    _print_worktree_only_completion_report(harness_session, file=sys.stderr)
     return response
-
-
-def _print_worktree_only_completion_report(
-    harness_session: "HarnessSession | None",
-    *,
-    file: Any | None = None,
-) -> None:
-    if harness_session is None:
-        return
-    report = harness_session.worktree_only_completion_report()
-    if report is not None:
-        print(f"\n{report.render_text()}", file=file)
 
 
 async def _structured_harness_call(

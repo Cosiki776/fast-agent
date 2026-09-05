@@ -16,6 +16,7 @@ class RunEventKind(StrEnum):
     VERIFICATION_STARTED = "run.verification_started"
     VERIFICATION_FAILED = "run.verification_failed"
     VERIFIED = "run.verified"
+    AGENT_COMPLETED = "run.agent_completed"
     PROMOTION_APPLIED = "promotion.applied"
     PROMOTION_REJECTED = "promotion.rejected"
     FAILED = "run.failed"
@@ -27,6 +28,7 @@ class RunState(StrEnum):
     VERIFYING = "verifying"
     VERIFICATION_FAILED = "verification_failed"
     VERIFIED = "verified"
+    AGENT_COMPLETED = "agent_completed"
     PROMOTED = "promoted"
     PROMOTION_REJECTED = "promotion_rejected"
     FAILED = "failed"
@@ -85,6 +87,14 @@ class RunVerified(RunEventBase):
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
+class RunAgentCompleted(RunEventBase):
+    """Agent finished without an independent verification command."""
+
+    kind: ClassVar[RunEventKind] = RunEventKind.AGENT_COMPLETED
+    workspace_version: str
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
 class PromotionApplied(RunEventBase):
     kind: ClassVar[RunEventKind] = RunEventKind.PROMOTION_APPLIED
     workspace_version: str
@@ -111,6 +121,7 @@ type RunEvent = (
     | RunVerificationStarted
     | RunVerificationFailed
     | RunVerified
+    | RunAgentCompleted
     | PromotionApplied
     | PromotionRejected
     | RunFailed
@@ -154,13 +165,17 @@ def replay_run(events: list[RunEvent]) -> RunProjection:
             if state is not RunState.VERIFYING:
                 raise ValueError("run.verified requires active verification")
             state = RunState.VERIFIED
+        elif isinstance(event, RunAgentCompleted):
+            if state is not RunState.ACTIVE:
+                raise ValueError("run.agent_completed requires an active run")
+            state = RunState.AGENT_COMPLETED
         elif isinstance(event, PromotionApplied):
-            if state is not RunState.VERIFIED:
-                raise ValueError("promotion.applied requires a verified run")
+            if state not in {RunState.VERIFIED, RunState.AGENT_COMPLETED}:
+                raise ValueError("promotion.applied requires a completed run")
             state = RunState.PROMOTED
         elif isinstance(event, PromotionRejected):
-            if state is not RunState.VERIFIED:
-                raise ValueError("promotion.rejected requires a verified run")
+            if state not in {RunState.VERIFIED, RunState.AGENT_COMPLETED}:
+                raise ValueError("promotion.rejected requires a completed run")
             state = RunState.PROMOTION_REJECTED
         elif isinstance(event, RunFailed):
             state = RunState.FAILED

@@ -658,6 +658,19 @@ async def _create_basic_agent(
 ) -> None:
     config = cast("AgentConfig", agent_data["config"])
     child_names = cast("Sequence[str]", agent_data.get("child_agents", []) or [])
+    if build_ctx.transactional_workspace is not None:
+        config = replace(
+            config,
+            instruction=config.instruction
+            + (
+                "\nBefore completing the task, follow the project's checking instructions "
+                "and use tools to check the result in proportion to the task: read back "
+                "simple file edits; run relevant tests for code changes. Fix failed checks "
+                "when possible and report checks performed and any remaining uncertainty. "
+                "Do not claim independent verification or workspace promotion; these are "
+                "handled by the runtime.\n"
+            ),
+        )
     if child_names:
         inputs = _build_agents_as_tools_inputs(name, agent_data, build_ctx)
 

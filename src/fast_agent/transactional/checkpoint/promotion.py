@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import shlex
 import shutil
 import tempfile
 from dataclasses import asdict, dataclass
@@ -11,7 +12,6 @@ from typing import TYPE_CHECKING
 
 from fast_agent.transactional.checkpoint._git import WorkspaceError
 from fast_agent.transactional.checkpoint.snapshot import WorkspaceChangedError
-from fast_agent.transactional.completion import worktree_review_lines
 from fast_agent.transactional.storage.artifact_store import ArtifactId, ArtifactKind
 
 if TYPE_CHECKING:
@@ -40,19 +40,23 @@ class PromotionRejectedError(WorkspaceChangedError):
         self.reason = reason
         self.patch_artifact_id = patch_artifact_id
         self.worktree_path = worktree_path
+        quoted_worktree = shlex.quote(str(worktree_path))
         super().__init__(
             "\n".join(
                 (
                     f"Promotion rejected: {reason}",
                     f"Patch artifact: {patch_artifact_id}",
-                    *worktree_review_lines(worktree_path),
+                    f"Agent result retained at: {worktree_path}",
+                    "Review commands:",
+                    f"  git -C {quoted_worktree} status --short",
+                    f"  git -C {quoted_worktree} diff --no-ext-diff",
                 )
             )
         )
 
 
 class WorkspacePromoter:
-    """Apply a verified Agent Delta only while the source fingerprint is unchanged."""
+    """Apply a completion candidate's Agent Delta while the source fingerprint is unchanged."""
 
     def __init__(
         self,
@@ -66,16 +70,16 @@ class WorkspacePromoter:
         self._worktree = worktree
         self._artifacts = artifacts
 
-    def promote(self, verified_version: str) -> PromotionResult:
+    def promote(self, candidate_version: str) -> PromotionResult:
         current_agent_version = str(
             self._snapshots.worktree_version(self._snapshot, self._worktree)
         )
-        if current_agent_version != verified_version:
-            raise WorkspaceError("Agent workspace changed after completion verification")
+        if current_agent_version != candidate_version:
+            raise WorkspaceError("Agent workspace no longer matches the completion candidate")
 
         delta = self._snapshots.agent_delta(self._snapshot, self._worktree)
         patch = self._artifacts.put(
-            _encode_patch(self._worktree.worktree_path, delta, verified_version),
+            _encode_patch(self._worktree.worktree_path, delta, candidate_version),
             media_type="application/json",
             kind=ArtifactKind.WORKSPACE_PATCH,
         )
@@ -91,10 +95,8 @@ class WorkspacePromoter:
         try:
             self._apply(delta)
             promoted_version = str(self._snapshots.source_version(self._snapshot))
-            if promoted_version != verified_version:
-                raise WorkspaceError(
-                    "Promoted workspace does not match the verified Agent workspace"
-                )
+            if promoted_version != candidate_version:
+                raise WorkspaceError("Promoted workspace does not match the completion candidate")
         except Exception:
             self._restore(delta)
             raise
@@ -130,7 +132,7 @@ class WorkspacePromoter:
                 )
 
 
-def _encode_patch(root: Path, delta: AgentDelta, verified_version: str) -> bytes:
+def _encode_patch(root: Path, delta: AgentDelta, candidate_version: str) -> bytes:
     entries: list[dict[str, object]] = []
     for relative_path in (*delta.added, *delta.modified):
         path = _workspace_path(root, relative_path)
@@ -152,7 +154,7 @@ def _encode_patch(root: Path, delta: AgentDelta, verified_version: str) -> bytes
     payload = {
         "delta": asdict(delta),
         "entries": entries,
-        "verified_workspace_version": verified_version,
+        "candidate_workspace_version": candidate_version,
     }
     return json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
 

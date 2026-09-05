@@ -178,7 +178,6 @@ async def test_full_profile_verifies_and_promotes_agent_workspace(tmp_path: Path
 
     assert runtime is not None
     assert runtime.controller is not None
-    assert runtime.worktree_only_completion_report() is None
     assert runtime.requires_manual_review is False
     try:
 
@@ -244,7 +243,7 @@ async def test_full_profile_discards_verification_side_effects_before_promotion(
 
 
 @pytest.mark.asyncio
-async def test_full_profile_without_verification_retains_worktree_for_review(
+async def test_full_profile_without_verification_promotes_without_claiming_verified(
     tmp_path: Path,
 ) -> None:
     repository = _repository(tmp_path)
@@ -266,7 +265,7 @@ async def test_full_profile_without_verification_retains_worktree_for_review(
 
     assert runtime is not None
     assert runtime.controller is not None
-    assert runtime.requires_manual_review is True
+    assert runtime.requires_manual_review is False
     try:
 
         async def finish() -> str:
@@ -277,23 +276,25 @@ async def test_full_profile_without_verification_retains_worktree_for_review(
             return "done"
 
         assert await runtime.controller.call_agent_once(finish) == "done"
-        report = runtime.worktree_only_completion_report()
-
-        assert report is not None
-        assert report.worktree_path == worktree.worktree_path
-        assert report.added == ("result.txt",)
-        assert not repository.joinpath("result.txt").exists()
+        assert repository.joinpath("result.txt").read_text(encoding="utf-8") == "agent result\n"
         assert worktree.worktree_path.joinpath("result.txt").read_text(encoding="utf-8") == (
             "agent result\n"
         )
-        assert runtime.controller.state is RunState.ACTIVE
+        assert runtime.controller.state is RunState.PROMOTED
+        assert runtime.run_event_store is not None
+        assert [
+            item.event.kind.value for item in runtime.run_event_store.events_for_run(run_id)
+        ] == ["run.started", "run.agent_completed", "promotion.applied"]
     finally:
         runtime.close()
         worktree_manager.cleanup(worktree)
 
 
 @pytest.mark.asyncio
-async def test_full_profile_rejects_promotion_after_source_change(tmp_path: Path) -> None:
+@pytest.mark.parametrize("verify", [False, True])
+async def test_full_profile_rejects_promotion_after_source_change(
+    tmp_path: Path, verify: bool
+) -> None:
     repository = _repository(tmp_path)
     run_id = RunId("full-rejected-promotion")
     snapshots = WorkspaceSnapshotManager(repository, tmp_path / "snapshots")
@@ -304,7 +305,11 @@ async def test_full_profile_rejects_promotion_after_source_change(tmp_path: Path
     runtime = TransactionalRuntimeAssembler(
         TransactionalSettings(
             profile=TransactionalProfile.FULL,
-            verification=VerificationSpec(command="test -f result.txt", timeout_seconds=5),
+            verification=(
+                VerificationSpec(command="test -f result.txt", timeout_seconds=5)
+                if verify
+                else None
+            ),
         ),
         tmp_path / "runtime",
     ).assemble(

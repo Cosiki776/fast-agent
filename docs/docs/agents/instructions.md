@@ -73,6 +73,22 @@ Always confirm before destructive operations.
 
 ## Using Instructions
 
+### Completion checks in TxAgent Full
+
+Full asks the agent to follow project checking instructions and choose tools appropriate
+to the task, such as reading back text edits or running relevant tests. Put reusable
+project rules in `AGENTS.md`; custom prompts must include `{{file_silent:AGENTS.md}}`
+to load it automatically.
+
+If `transactional.verification` is configured, its command is an additional mandatory
+check before promotion. Failure cannot fall back to agent self-checks. Without a fixed
+command, normal agent completion permits promotion and records `run.agent_completed`,
+not `run.verified`; this does not independently certify that the task is correct.
+
+Both paths check the original Workspace fingerprint before applying the Agent Delta.
+A changed Workspace rejects promotion and retains the Worktree with review instructions.
+Otherwise, Worktree cleanup follows `transactional.keep_worktree`.
+
 When defining an Agent, you can load the instruction as either a `String`, `Path` or `AnyUrl`.
 
 Instructions support embedding the current date, as well as content from other URLs and `hf://` URIs. This is really helpful if you want to refer to files on GitHub, assemble useful prompts/content in Gists, or reuse prompt assets stored in Hugging Face Hub.

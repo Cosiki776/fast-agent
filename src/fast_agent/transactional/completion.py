@@ -43,13 +43,11 @@ class WorktreeOnlyCompletionReport:
         return len(self.added) + len(self.modified) + len(self.deleted)
 
     def render_text(self) -> str:
-        quoted_worktree = shlex.quote(str(self.worktree_path))
         lines = [
             "TxAgent result retained for manual review",
             f"Run: {self.run_id}",
             "Verification: not configured",
             "Promotion: not applied",
-            f"Worktree: {self.worktree_path}",
             (
                 "Changes: "
                 f"{len(self.added)} added, {len(self.modified)} modified, "
@@ -59,15 +57,20 @@ class WorktreeOnlyCompletionReport:
         _append_paths(lines, "Added", self.added)
         _append_paths(lines, "Modified", self.modified)
         _append_paths(lines, "Deleted", self.deleted)
-        lines.extend(
-            [
-                "Review commands:",
-                f"  git -C {quoted_worktree} status --short",
-                f"  git -C {quoted_worktree} diff --no-ext-diff",
-                ("Configure transactional.verification.command to enable verified promotion."),
-            ]
-        )
+        lines.extend(worktree_review_lines(self.worktree_path))
+        lines.append("Configure transactional.verification.command to enable verified promotion.")
         return "\n".join(lines)
+
+
+def worktree_review_lines(worktree_path: Path) -> tuple[str, ...]:
+    """Return the shared manual-review locator and commands for a retained Worktree."""
+    quoted_worktree = shlex.quote(str(worktree_path))
+    return (
+        f"Agent result retained at: {worktree_path}",
+        "Review commands:",
+        f"  git -C {quoted_worktree} status --short",
+        f"  git -C {quoted_worktree} diff --no-ext-diff",
+    )
 
 
 def _append_paths(lines: list[str], label: str, paths: tuple[str, ...]) -> None:

@@ -3,7 +3,6 @@ from __future__ import annotations
 import base64
 import json
 import os
-import shlex
 import shutil
 import tempfile
 from dataclasses import asdict, dataclass
@@ -12,6 +11,7 @@ from typing import TYPE_CHECKING
 
 from fast_agent.transactional.checkpoint._git import WorkspaceError
 from fast_agent.transactional.checkpoint.snapshot import WorkspaceChangedError
+from fast_agent.transactional.completion import worktree_review_lines
 from fast_agent.transactional.storage.artifact_store import ArtifactId, ArtifactKind
 
 if TYPE_CHECKING:
@@ -40,16 +40,12 @@ class PromotionRejectedError(WorkspaceChangedError):
         self.reason = reason
         self.patch_artifact_id = patch_artifact_id
         self.worktree_path = worktree_path
-        quoted_worktree = shlex.quote(str(worktree_path))
         super().__init__(
             "\n".join(
                 (
                     f"Promotion rejected: {reason}",
-                    f"Agent result retained at: {worktree_path}",
                     f"Patch artifact: {patch_artifact_id}",
-                    "Review commands:",
-                    f"  git -C {quoted_worktree} status --short",
-                    f"  git -C {quoted_worktree} diff --no-ext-diff",
+                    *worktree_review_lines(worktree_path),
                 )
             )
         )

@@ -23,7 +23,7 @@ def test_worktree_only_completion_report_describes_manual_review_handoff() -> No
     assert report.changed_file_count == 3
     assert "Verification: not configured" in rendered
     assert "Promotion: not applied" in rendered
-    assert "Worktree: /tmp/agent worktree" in rendered
+    assert "Agent result retained at: /tmp/agent worktree" in rendered
     assert "Changes: 1 added, 1 modified, 1 deleted" in rendered
     assert "  - new.py" in rendered
     assert "  - src/existing.py" in rendered

@@ -1031,13 +1031,14 @@ class AgentHarness:
             resources = self._transactional_resources.pop(id(instance), None)
             if resources is not None:
                 transactional_runtime, worktree_manager = resources
+                requires_manual_review = transactional_runtime.requires_manual_review
                 transactional_runtime.close()
                 if (
                     worktree_manager is not None
                     and transactional_runtime.worktree is not None
                     and self._fast_agent.context.config is not None
                     and not self._fast_agent.context.config.transactional.keep_worktree
-                    and not transactional_runtime.requires_manual_review
+                    and not requires_manual_review
                 ):
                     worktree_manager.cleanup(transactional_runtime.worktree)
 

@@ -16,7 +16,7 @@ if TYPE_CHECKING:
 
 
 @pytest.mark.asyncio
-async def test_verifier_persists_complete_output_and_bounds_failure_evidence(
+async def test_verifier_passes_through_complete_short_failure_output(
     tmp_path: Path,
 ) -> None:
     workspace = tmp_path / "workspace"
@@ -29,7 +29,7 @@ async def test_verifier_persists_complete_output_and_bounds_failure_evidence(
 
     result = await verifier.verify(
         VerificationSpec(
-            command="printf '0123456789'; printf 'failure' >&2; exit 7",
+            command="printf 'first\\nmiddle detail\\nlast\\n'; printf 'stderr detail\\n' >&2; exit 7",
             timeout_seconds=5,
             max_evidence_bytes=512,
         ),
@@ -39,11 +39,54 @@ async def test_verifier_persists_complete_output_and_bounds_failure_evidence(
     assert result.passed is False
     assert result.exit_code == 7
     assert result.timed_out is False
-    assert artifacts.read(result.stdout_artifact_id) == b"0123456789"
-    assert artifacts.read(result.stderr_artifact_id) == b"failure"
+    assert artifacts.read(result.stdout_artifact_id) == b"first\nmiddle detail\nlast\n"
+    assert artifacts.read(result.stderr_artifact_id) == b"stderr detail\n"
     assert len(result.evidence.encode()) <= 512
+    assert "command: printf" in result.evidence
     assert "exit_code: 7" in result.evidence
+    assert "stdout:\nfirst\nmiddle detail\nlast\n" in result.evidence
+    assert "stderr:\nstderr detail\n" in result.evidence
+    assert "output_head:" not in result.evidence
     assert f"full_stdout_artifact: {result.stdout_artifact_id}" in result.evidence
+
+
+@pytest.mark.asyncio
+async def test_verifier_summarizes_long_failure_and_preserves_required_metadata(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    artifacts = FileArtifactStore(tmp_path / "artifacts")
+    verifier = CompletionVerifier(
+        LocalShellExecutor(logger=logging.getLogger(__name__), working_directory=workspace),
+        artifacts,
+    )
+    script = "\n".join(
+        [
+            "for index in range(200):",
+            "    print(f'noise-{index:03d}')",
+            "print('FAILED tests/test_example.py::test_value - AssertionError')",
+            "raise SystemExit(7)",
+        ]
+    )
+
+    result = await verifier.verify(
+        VerificationSpec(
+            command=shlex.join([sys.executable, "-c", script]),
+            timeout_seconds=5,
+            max_evidence_bytes=512,
+        ),
+        workspace,
+    )
+
+    assert result.passed is False
+    assert len(result.evidence.encode()) <= 512
+    assert "command:" in result.evidence
+    assert "exit_code: 7" in result.evidence
+    assert "key_errors:" in result.evidence
+    assert "FAILED tests/test_example.py::test_value - AssertionError" in result.evidence
+    assert f"full_stdout_artifact: {result.stdout_artifact_id}" in result.evidence
+    assert f"full_stderr_artifact: {result.stderr_artifact_id}" in result.evidence
 
 
 @pytest.mark.asyncio
@@ -62,6 +105,7 @@ async def test_verifier_passes_only_for_zero_exit_without_timeout(tmp_path: Path
 
     assert result.passed is True
     assert result.exit_code == 0
+    assert result.evidence == ""
 
 
 @pytest.mark.asyncio

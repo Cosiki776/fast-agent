@@ -208,7 +208,7 @@ class TransactionalCodingRun:
                 self._run_events.append(
                     PromotionRejected(
                         run_id=self.run_id,
-                        reason=str(exc),
+                        reason=exc.reason,
                         patch_artifact_id=exc.patch_artifact_id,
                     )
                 )

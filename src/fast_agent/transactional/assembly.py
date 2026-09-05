@@ -12,7 +12,7 @@ from fast_agent.transactional.governance import CodingToolGovernanceGate, Coding
 from fast_agent.transactional.models import RunId, new_run_id
 from fast_agent.transactional.recovery.controller import RecoveryController
 from fast_agent.transactional.run_controller import TransactionalCodingRun
-from fast_agent.transactional.run_events import RunStarted
+from fast_agent.transactional.run_events import RunStarted, RunState
 from fast_agent.transactional.settings import (
     SemanticReducerVersion,
     ToolOutputStrategy,
@@ -67,8 +67,10 @@ class TransactionalRuntime:
 
     @property
     def requires_manual_review(self) -> bool:
-        """Whether this Run's only durable result is its retained Worktree."""
-        return self.completion_reporter is not None
+        """Whether this Run's Worktree must be retained for manual review."""
+        return self.completion_reporter is not None or (
+            self.controller is not None and self.controller.state is RunState.PROMOTION_REJECTED
+        )
 
     def close(self) -> None:
         if self._closed:

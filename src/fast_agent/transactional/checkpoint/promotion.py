@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import shlex
 import shutil
 import tempfile
 from dataclasses import asdict, dataclass
@@ -30,9 +31,28 @@ class PromotionResult:
 
 
 class PromotionRejectedError(WorkspaceChangedError):
-    def __init__(self, reason: str, patch_artifact_id: ArtifactId) -> None:
+    def __init__(
+        self,
+        reason: str,
+        patch_artifact_id: ArtifactId,
+        worktree_path: Path,
+    ) -> None:
+        self.reason = reason
         self.patch_artifact_id = patch_artifact_id
-        super().__init__(reason)
+        self.worktree_path = worktree_path
+        quoted_worktree = shlex.quote(str(worktree_path))
+        super().__init__(
+            "\n".join(
+                (
+                    f"Promotion rejected: {reason}",
+                    f"Agent result retained at: {worktree_path}",
+                    f"Patch artifact: {patch_artifact_id}",
+                    "Review commands:",
+                    f"  git -C {quoted_worktree} status --short",
+                    f"  git -C {quoted_worktree} diff --no-ext-diff",
+                )
+            )
+        )
 
 
 class WorkspacePromoter:
@@ -66,7 +86,11 @@ class WorkspacePromoter:
         try:
             self._snapshots.assert_source_unchanged(self._snapshot)
         except WorkspaceChangedError as exc:
-            raise PromotionRejectedError(str(exc), patch.artifact_id) from exc
+            raise PromotionRejectedError(
+                str(exc),
+                patch.artifact_id,
+                self._worktree.worktree_path,
+            ) from exc
 
         try:
             self._apply(delta)

@@ -323,14 +323,16 @@ async def test_full_profile_rejects_promotion_after_source_change(tmp_path: Path
             repository.joinpath("tracked.txt").write_text("user\n", encoding="utf-8")
             return "done"
 
-        with pytest.raises(WorkspaceChangedError, match="changed after snapshot"):
+        with pytest.raises(WorkspaceChangedError, match="changed after snapshot") as raised:
             await runtime.controller.call_agent_once(finish)
+        assert f"Agent result retained at: {worktree.worktree_path}" in str(raised.value)
         assert repository.joinpath("tracked.txt").read_text(encoding="utf-8") == "user\n"
         assert not repository.joinpath("result.txt").exists()
         assert (
             worktree.worktree_path.joinpath("result.txt").read_text(encoding="utf-8") == "agent\n"
         )
         assert runtime.controller.state is RunState.PROMOTION_REJECTED
+        assert runtime.requires_manual_review is True
     finally:
         runtime.close()
         worktree_manager.cleanup(worktree)

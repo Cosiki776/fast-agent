@@ -91,6 +91,10 @@ def test_promotion_rejects_changed_source_without_writing_agent_delta(tmp_path: 
 
     assert source.joinpath("modify.txt").read_text(encoding="utf-8") == "user\n"
     assert worktree.worktree_path.joinpath("modify.txt").read_text(encoding="utf-8") == "agent\n"
+    assert raised.value.worktree_path == worktree.worktree_path
+    assert f"Agent result retained at: {worktree.worktree_path}" in str(raised.value)
+    assert f"Patch artifact: {raised.value.patch_artifact_id}" in str(raised.value)
+    assert "git -C" in str(raised.value)
     patch = json.loads(artifacts.read(raised.value.patch_artifact_id))
     assert patch["delta"]["modified"] == ["modify.txt"]
 

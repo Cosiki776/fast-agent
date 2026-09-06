@@ -27,6 +27,12 @@ if TYPE_CHECKING:
 POLICY_VERSION = "coding-v1"
 
 _PATH_ARGUMENTS = ("path", "cwd", "working_directory")
+# This exact find predicate excludes Git entries; its pattern is not a path access.
+# Keep the exception narrow: extra find expressions/actions still use the normal gate.
+_FIND_GIT_EXCLUSION = re.compile(
+    r"\A(find[ \t]+\.[ \t]+-type[ \t]+f[ \t]+(?:-not|!)[ \t]+-path[ \t]+)"
+    r"(['\"])\./\.git/\*\2(?=[ \t]*(?:$|[;&|]))"
+)
 _PATCH_PATH = re.compile(r"^\*\*\* (?:Add|Delete|Update) File: (.+)$", re.MULTILINE)
 _PATCH_MOVE_PATH = re.compile(r"^\*\*\* Move to: (.+)$", re.MULTILINE)
 _SHELL_PRIVILEGE_ESCALATION = re.compile(
@@ -215,6 +221,7 @@ class CodingToolPolicy:
         return None
 
     def _contains_protected_shell_path(self, command: str) -> bool:
+        command = _FIND_GIT_EXCLUSION.sub(r"\1'__excluded_git_entries__'", command)
         normalized = command.replace("\\", "/")
         if "../" in normalized or "/.git/" in normalized or " .git/" in normalized:
             return True

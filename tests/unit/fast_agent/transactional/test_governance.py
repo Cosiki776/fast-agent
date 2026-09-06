@@ -81,6 +81,44 @@ def test_policy_denies_patch_escape(tmp_path: Path) -> None:
     assert decision.disposition is GovernanceDisposition.DENY
 
 
+@pytest.mark.parametrize("negation", ["-not", "!"])
+def test_policy_allows_find_excluding_git_metadata(tmp_path: Path, negation: str) -> None:
+    policy, _ = _policy(tmp_path)
+    command = (
+        f'find . -type f {negation} -path "./.git/*" | head -50 '
+        '&& echo "---" && ls -la order_service tests'
+    )
+    assert (
+        policy.evaluate(
+            _request("execute", {"command": command}), ToolEffect.WORKSPACE_WRITE
+        ).disposition
+        is GovernanceDisposition.ALLOW
+    )
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        'find . -type f -path "./.git/*"',
+        'find .git -type f -not -path "./.git/*"',
+        'find . -type f -not -path "./.git/*" -o -path "./.git/config"',
+        'find . -type f -not -path "./.git/*" -exec cat .git/config \\;',
+        'find . -type f -not -path "./.git/*" && cat .git/config',
+        'find . -type f -not -path "./.git/*" > .git/config',
+        'find . -type f -not -path "./.git/*" | cat /tmp/outside',
+        'find . -type f -not -path "./.git/*"; cat ../outside',
+    ],
+)
+def test_find_exclusion_does_not_bypass_protected_path_checks(tmp_path: Path, command: str) -> None:
+    policy, _ = _policy(tmp_path)
+    assert (
+        policy.evaluate(
+            _request("execute", {"command": command}), ToolEffect.WORKSPACE_WRITE
+        ).disposition
+        is GovernanceDisposition.DENY
+    )
+
+
 @pytest.mark.parametrize(
     "command",
     [

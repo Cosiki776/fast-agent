@@ -23,15 +23,33 @@ has changed commits, and a single trajectory per task is only exploratory.
 Formal inclusion of a fourth group must be decided before held-out runs and
 executed at the same frozen implementation commit as its comparators.
 
-After committing the Runner change, run all three supplementary tasks with:
+## Batch entry points
+
+Both entry points share the batch loop, model selection, provenance recording,
+logging and failure handling in `run_development_pilot.sh`.
+
+| Command (run with `bash`) | Runs | Packages |
+| --- | ---: | --- |
+| `benchmarks/transactional/run_development_pilot.sh` | 9 | baseline/upstream, reducer/semantic-v1, full/semantic-v1 on each task |
+| `benchmarks/transactional/run_full_upstream_pilot.sh` | 3 | full/upstream on each task |
+
+Run the original nine task/profile combinations:
+
+```bash
+bash benchmarks/transactional/run_development_pilot.sh
+```
+
+Run the three supplementary task/profile combinations:
 
 ```bash
 bash benchmarks/transactional/run_full_upstream_pilot.sh
 ```
 
-The script uses `aliyun.qwen3.8-max` (an optional first argument overrides it),
-unsets proxy variables only for its own process tree, and saves logs, results,
-commit and manifest provenance under `.txagent-runs/full-upstream-<commit>.*`.
+Both commands use `aliyun.qwen3.8-max` (an optional first argument overrides it),
+unset proxy variables only for their own process tree, and save logs, results,
+commit and manifest provenance under `.txagent-runs/development-pilot-<commit>.*`
+or `.txagent-runs/full-upstream-<commit>.*`, respectively. Each invocation creates
+a fresh directory; result subdirectories include task, profile and strategy.
 Task failures are retained and the next task runs; provider failures, cancellation
 or missing result files stop the batch. Keep implementation and config unchanged
 throughout the batch. This command uses the real provider; unit and scripted

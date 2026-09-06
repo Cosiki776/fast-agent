@@ -106,62 +106,29 @@ def test_shell_allows_local_paths_and_non_path_patterns(tmp_path: Path, command:
 
 
 @pytest.mark.parametrize(
-    "command",
+    ("working_directory", "expected"),
     [
-        "cat src/../../outside",
-        "cd src && cat ../../outside",
-        "cat .env",
-        "echo data > .git/config",
-        "> .git/config echo data",
-        "echo data > ../outside",
-        "echo data\ncat ../outside",
-        "grep -e harmless .git/config",
-        "grep -f .git/config README.md",
-        "find . -path './.git' -prune -o -type f -print; cat .git/config",
+        (".", GovernanceDisposition.ALLOW),
+        ("src", GovernanceDisposition.ALLOW),
+        ("../outside", GovernanceDisposition.DENY),
+        (".git", GovernanceDisposition.DENY),
     ],
 )
-def test_shell_still_denies_real_protected_operands(tmp_path: Path, command: str) -> None:
-    policy, workspace = _policy(tmp_path)
-    (workspace / "src").mkdir()
-    decision = policy.evaluate(
-        _request("execute", {"command": command}), ToolEffect.WORKSPACE_WRITE
-    )
-    assert decision.disposition is GovernanceDisposition.DENY
-
-
-def test_shell_resolves_request_cwd_and_symlinks(tmp_path: Path) -> None:
-    policy, workspace = _policy(tmp_path)
-    (workspace / "src").mkdir()
-    (workspace / "link").symlink_to(tmp_path, target_is_directory=True)
-    for command, cwd, expected in [
-        ("cat ../README.md", "src", GovernanceDisposition.ALLOW),
-        ("cat ../outside", ".", GovernanceDisposition.DENY),
-        ("cat link/outside", ".", GovernanceDisposition.DENY),
-    ]:
-        decision = policy.evaluate(
-            _request("execute", {"command": command, "working_directory": cwd}),
-            ToolEffect.WORKSPACE_WRITE,
-        )
-        assert decision.disposition is expected
-
-
-@pytest.mark.parametrize(
-    "command",
-    [
-        "python3 -c \"print('../outside')\"",
-        "python3 -c \"open('../outside').read()\"",
-        "python3 - <<'PY'\nprint('../outside')\nPY",
-    ],
-)
-def test_ambiguous_inline_paths_require_review_instead_of_claiming_access(
-    tmp_path: Path, command: str
+def test_shell_validates_structured_working_directory(
+    tmp_path: Path,
+    working_directory: str,
+    expected: GovernanceDisposition,
 ) -> None:
-    policy, _ = _policy(tmp_path)
+    policy, workspace = _policy(tmp_path)
+    (workspace / "src").mkdir()
     decision = policy.evaluate(
-        _request("execute", {"command": command}), ToolEffect.WORKSPACE_WRITE
+        _request(
+            "execute",
+            {"command": "python3 -c 'print(1)'", "working_directory": working_directory},
+        ),
+        ToolEffect.WORKSPACE_WRITE,
     )
-    assert decision.disposition is GovernanceDisposition.REQUIRE_APPROVAL
-    assert "review" in decision.reason
+    assert decision.disposition is expected
 
 
 @pytest.mark.parametrize("negation", ["-not", "!"])
@@ -192,13 +159,15 @@ def test_policy_allows_find_excluding_git_metadata(tmp_path: Path, negation: str
         'find . -type f -not -path "./.git/*"; cat ../outside',
     ],
 )
-def test_find_exclusion_does_not_bypass_protected_path_checks(tmp_path: Path, command: str) -> None:
+def test_shell_policy_does_not_interpret_path_like_command_text(
+    tmp_path: Path, command: str
+) -> None:
     policy, _ = _policy(tmp_path)
     assert (
         policy.evaluate(
             _request("execute", {"command": command}), ToolEffect.WORKSPACE_WRITE
         ).disposition
-        is GovernanceDisposition.DENY
+        is GovernanceDisposition.ALLOW
     )
 
 

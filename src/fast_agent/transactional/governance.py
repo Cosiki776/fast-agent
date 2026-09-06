@@ -3,7 +3,6 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-import shlex
 from copy import deepcopy
 from dataclasses import dataclass
 from enum import StrEnum
@@ -24,7 +23,7 @@ if TYPE_CHECKING:
     from fast_agent.transactional.execution import ToolExecutionRequest
 
 
-POLICY_VERSION = "coding-v2"
+POLICY_VERSION = "coding-v3"
 
 _PATH_ARGUMENTS = ("path", "cwd", "working_directory")
 _PATCH_PATH = re.compile(r"^\*\*\* (?:Add|Delete|Update) File: (.+)$", re.MULTILINE)
@@ -201,117 +200,18 @@ class CodingToolPolicy:
         ):
             return GovernanceDecision.deny("shell output limit exceeds the coding policy limit")
 
+        # Deliberately avoid treating arbitrary command tokens as paths. Shell
+        # syntax is too dynamic for this application policy to be a sandbox.
         normalized = " ".join(command.split())
         if _SHELL_PRIVILEGE_ESCALATION.search(normalized):
             return GovernanceDecision.deny("privilege escalation command is forbidden")
         if any(pattern.search(normalized) for pattern in _SHELL_HARD_DENIES):
             return GovernanceDecision.deny("destructive remote command is forbidden")
-        path_decision = self._shell_path_decision(command, request)
-        if path_decision is not None:
-            return path_decision
         if _SHELL_APPROVAL_COMMAND.search(normalized):
             return GovernanceDecision.require_approval(
                 "shell command may produce external network side effects"
             )
         return None
-
-    def _shell_path_decision(
-        self, command: str, request: ToolExecutionRequest
-    ) -> GovernanceDecision | None:
-        # Resolve literal operands, not substrings of the entire command. This
-        # remains a best-effort policy; it does not interpret embedded programs.
-        lexer = shlex.shlex(command, posix=True, punctuation_chars="();<>|&\n")
-        lexer.whitespace = " \t\r"
-        lexer.whitespace_split = True
-        lexer.commenters = ""
-        try:
-            tokens = list(lexer)
-        except ValueError:
-            return GovernanceDecision.deny("shell command could not be parsed")
-
-        if any(token in {"<<", "<<-", "<<<"} for token in tokens):
-            return GovernanceDecision.require_approval(
-                "inline shell input requires review; path literals may be data or file access"
-            )
-
-        cwd = self._workspace
-        for key in ("cwd", "working_directory"):
-            value = request.arguments.get(key)
-            if isinstance(value, str):
-                cwd = (self._workspace / value).resolve()
-        command_start = True
-        executable = ""
-        grep_pattern = False
-        skip_argument = False
-        redirect = False
-        pending: GovernanceDecision | None = None
-        for index, token in enumerate(tokens):
-            if token in {";", "&&", "||", "|", "&", "\n"} or set(token) <= {";", "\n"}:
-                command_start = True
-                skip_argument = False
-                continue
-            if token in {">", ">>", "<", "<>"}:
-                redirect = True
-                continue
-            if any(marker in token for marker in ("$", "`")):
-                pending = GovernanceDecision.require_approval("dynamic shell paths require review")
-            if command_start and not redirect:
-                command_start = False
-                executable = Path(token).name
-                grep_pattern = executable in {"grep", "rg"}
-                continue
-            if skip_argument:
-                skip_argument = False
-                continue
-            if token in {"-c", "-Command"} and (
-                re.fullmatch(r"python(?:\d+(?:\.\d+)*)?", executable)
-                or executable in {"bash", "sh", "zsh", "pwsh", "powershell"}
-            ):
-                payload = tokens[index + 1] if index + 1 < len(tokens) else ""
-                paths = re.findall(r"""(?:~?/|\.\.?/)[^\s'"(),;]+""", payload)
-                if "credentials.json" in payload.casefold() or any(
-                    self._validate_path(path, cwd=cwd) is not None for path in paths
-                ):
-                    pending = GovernanceDecision.require_approval(
-                        "inline program requires review; path literals may be data or file access"
-                    )
-                skip_argument = True
-                continue
-            previous = tokens[index - 1]
-            following = tokens[index + 1] if index + 1 < len(tokens) else ""
-            if not redirect and executable == "find" and previous in {"-path", "-ipath"}:
-                negated = index >= 2 and tokens[index - 2] in {"!", "-not"}
-                if negated or following == "-prune":
-                    continue
-            if not redirect and executable in {"echo", "printf"}:
-                continue
-            if not redirect and executable in {"grep", "rg"} and token == "-e":
-                skip_argument = True
-                grep_pattern = False
-                continue
-            if not redirect and executable in {"grep", "rg"} and token == "-f":
-                grep_pattern = False
-                continue
-            if token.startswith("-") or "://" in token:
-                continue
-            if not redirect and grep_pattern:
-                grep_pattern = False
-                continue
-            if any(marker in token for marker in ("$", "`")):
-                continue
-            denial = (
-                None if redirect and token == "/dev/null" else self._validate_path(token, cwd=cwd)
-            )
-            if denial is not None:
-                return GovernanceDecision.deny(denial)
-            if executable == "cd" and not redirect:
-                cwd = (cwd / token).resolve()
-                if following and following != "&&":
-                    pending = GovernanceDecision.require_approval(
-                        "conditional shell working directory requires review; use cd ... && ..."
-                    )
-            redirect = False
-        return pending
 
 
 class CodingToolGovernanceGate:

@@ -196,7 +196,6 @@ if TYPE_CHECKING:
     from fast_agent.agents.llm_decorator import LlmDecorator
     from fast_agent.agents.tool_call_planning import PlannedToolCall
     from fast_agent.context import Context
-    from fast_agent.llm.usage_tracking import UsageAccumulator
     from fast_agent.mcp.app_integrations import AppServerConfig
     from fast_agent.tools.environment_filesystem_runtime import EnvironmentFilesystemRuntime
     from fast_agent.tools.execution_environment import (
@@ -544,6 +543,7 @@ class McpAgent(ABC, ToolAgent):
         self.enable_shell(root)
         if self._shell_runtime is None:
             raise RuntimeError("Transactional coding requires a shell runtime")
+        from fast_agent.tools.local_filesystem_runtime import LocalFilesystemRuntime
         from fast_agent.tools.shell_runtime import ShellTerminalExecutionPolicy
 
         self._shell_runtime.set_terminal_execution_policy(

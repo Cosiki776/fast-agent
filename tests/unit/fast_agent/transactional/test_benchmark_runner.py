@@ -26,8 +26,9 @@ def test_development_task_manifests_are_frozen_and_complete() -> None:
         "long-output-001",
         "recovery-path-001",
     ]
-    assert {task.budget.max_llm_calls for task in tasks} == {12, 16, 20}
-    assert {task.budget.max_tool_calls for task in tasks} == {50, 80}
+    assert {task.budget.max_llm_calls for task in tasks} == {40}
+    assert {task.budget.max_tool_calls for task in tasks} == {80}
+    assert {task.budget.max_wall_time_seconds for task in tasks} == {600}
     assert all(
         task.verification.command == "python3 -m unittest discover -s tests" for task in tasks
     )

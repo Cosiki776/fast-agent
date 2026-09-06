@@ -281,7 +281,7 @@ Responses-family providers can also be toggled per run in the model string:
 - `responses.gpt-5?web_search=on`
 - `openresponses.openai/gpt-oss-120b:groq?web_search=on`
 - `codexresponses.gpt-5.3-codex?web_search=off`
-- `metaai.muse-spark-1.2?web_search=on`
+- `metaai.muse-spark-1.3?web_search=on`
 
 Allowed values: `on`/`off` (also accepts `true`/`false`, `1`/`0`).
 
@@ -395,7 +395,7 @@ xai:
 metaai:
   api_key: "${META_AI_API_KEY}"
   base_url: "https://api.meta.ai/v1"  # Optional, defaults to this value
-  default_model: "muse-spark-1.2"
+  default_model: "muse-spark-1.3"
   web_search:
     enabled: false
     search_context_size: medium  # Optional: low | medium | high
@@ -405,7 +405,7 @@ metaai:
 ```
 
 MetaAI search grounding can also be toggled per run with
-`metaai.muse-spark-1.2?web_search=on`. See the
+`metaai.muse-spark-1.3?web_search=on`. See the
 [MetaAI provider guide](../models/providers/metaai/) for supported media,
 interactive toggles, and search-result behavior.
 
@@ -835,7 +835,7 @@ shell_execution:
   durable_output_max_bytes: 2097152  # Per persistent stdout/stderr/combined log
   retained_output_temp_directory: null  # Optional parent directory
   process_poll_max_wait_seconds: 3600  # Accepted range: 1–3600
-  foreground_auto_await_max_seconds: 240  # Total runtime; range: 0–3600; 0 disables
+  foreground_auto_await_max_seconds: 30  # Total runtime; range: 0–3600; 0 disables
   managed_process_poll_history_folding: auto  # auto | on | off
 ```
 
@@ -881,16 +881,18 @@ session-scoped process to the model and does not stop it. Explicit background
 commands and explicit hard timeouts are unchanged. Set the value to `0` to
 return live foreground processes at the initial yield boundary.
 
-The 240-second default follows fast-agent's common managed-process wait cadence
-and avoids holding a shell call for a full five minutes. It reduces cache-expiry
-risk but cannot guarantee a cache hit: it bounds only the foreground shell
-invocation, while model generation, parallel sibling tools, hooks, result
-assembly, provider behavior, and network latency can add time.
+The 30-second default matches the initial total-runtime yield and keeps longer
+commands model-interruptible. It still lets shorter commands finish in their
+original shell call without a model turn spent scheduling a process wait.
 
 `process_poll_max_wait_seconds` caps a single model-initiated managed-process
 wait. Catalogue and overlay defaults are capped for compatibility. An explicit
 model-string `poll_period` above the configured maximum is rejected instead of
 being silently reduced.
+
+See [Foreground auto-await and outer-budget-aware process waits](shell_runtime_budgeting.md)
+for the model-interruptibility tradeoff, external-deadline integration gap,
+proposed budget-aware semantics, telemetry, and acceptance tests.
 
 `managed_process_poll_history_folding` controls whether repetitive quiet
 managed-process polling exchanges are collapsed before the next model call:

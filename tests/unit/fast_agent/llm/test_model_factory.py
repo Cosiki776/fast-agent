@@ -40,6 +40,21 @@ TEST_ALIASES = {
 }
 
 
+@pytest.mark.parametrize(
+    ("model", "expected"),
+    [
+        ("muse-spark-1.2", "muse-spark-1.2"),
+        ("muse-spark-1.2-contributor", "muse-spark-1.2-contributor"),
+        ("Muse Spark 1.2", "muse-spark-1.2"),
+        ("Muse Spark 1.2 (Contributor)", "muse-spark-1.2-contributor"),
+    ],
+)
+def test_metaai_legacy_models_still_resolve(model: str, expected: str) -> None:
+    config = ModelFactory.parse_model_string(model)
+    assert config.provider == Provider.META_AI
+    assert config.model_name == expected
+
+
 def test_simple_model_names():
     """Test parsing of simple model names"""
     cases = [
@@ -446,7 +461,7 @@ def test_minimax25_alias_sets_sampling_defaults() -> None:
 def test_model_query_transport_websocket_alias():
     config = ModelFactory.parse_model_string("codexplan?transport=ws")
     assert config.provider == Provider.CODEX_RESPONSES
-    assert config.model_name == "gpt-5.6-sol"
+    assert config.model_name == "gpt-6-astra"
     assert config.transport == "websocket"
 
 
@@ -548,6 +563,14 @@ def test_codexresponses_fast_service_tier_query() -> None:
     assert config.provider == Provider.CODEX_RESPONSES
     assert config.model_name == "gpt-5.4"
     assert config.service_tier == "fast"
+
+
+@pytest.mark.parametrize("model_name", ["o3", "unknown-model"])
+def test_codexresponses_fast_service_tier_query_requires_model_support(
+    model_name: str,
+) -> None:
+    with pytest.raises(ModelConfigError, match="does not support service_tier=fast"):
+        ModelFactory.parse_model_string(f"codexresponses.{model_name}?service_tier=fast")
 
 
 def test_codexresponses_flex_service_tier_query_rejected() -> None:
@@ -1083,12 +1106,20 @@ def test_gemini35_flash_aliases_resolve_to_current_google_flash(alias: str):
     assert config.model_name == "gemini-3.5-flash"
 
 
-@pytest.mark.parametrize("alias", ["gemini", "gemini37", "gemini37flash", "gemini3.7flash"])
+@pytest.mark.parametrize("alias", ["gemini37", "gemini37flash", "gemini3.7flash"])
 def test_gemini37_flash_aliases_resolve_to_current_google_flash(alias: str) -> None:
     config = ModelFactory.parse_model_string(alias)
 
     assert config.provider == Provider.GOOGLE
     assert config.model_name == "gemini-3.7-flash"
+
+
+@pytest.mark.parametrize("alias", ["gemini", "gemini38", "gemini38flash", "gemini3.8flash"])
+def test_gemini38_flash_aliases_resolve_to_current_google_flash(alias: str) -> None:
+    config = ModelFactory.parse_model_string(alias)
+
+    assert config.provider == Provider.GOOGLE
+    assert config.model_name == "gemini-3.8-flash"
 
 
 def test_deepseek_alias_resolves_to_deepseek_responses_model():
@@ -1104,6 +1135,17 @@ def test_deepseek_pro_alias_resolves_to_deepseek_responses_model() -> None:
     assert config.model_name == "deepseek-v4-pro"
 
 
+@pytest.mark.parametrize(
+    "model",
+    ("deepseekvision", "deepseek-v4-flash-vision-exp"),
+)
+def test_deepseek_vision_model_resolves_to_deepseek_responses(model: str) -> None:
+    config = ModelFactory.parse_model_string(model)
+
+    assert config.provider == Provider.DEEPSEEK
+    assert config.model_name == "deepseek-v4-flash-vision-exp"
+
+
 def test_deepseek_hf_aliases_resolve_to_hf_deepseek_v4_pro():
     for alias in ("deepseek-hf", "deepseek4-hf", "deepseek4pro-hf", "deepseekv4pro-hf"):
         config = ModelFactory.parse_model_string(alias)
@@ -1111,7 +1153,10 @@ def test_deepseek_hf_aliases_resolve_to_hf_deepseek_v4_pro():
         assert config.model_name == "deepseek-ai/DeepSeek-V4-Pro:together"
 
 
-@pytest.mark.parametrize("model", ["deepseek-v4-flash", "deepseek-v4-pro"])
+@pytest.mark.parametrize(
+    "model",
+    ["deepseek-v4-flash", "deepseek-v4-flash-vision-exp", "deepseek-v4-pro"],
+)
 def test_deepseek_responses_model_resolves_to_official_provider(model: str) -> None:
     config = ModelFactory.parse_model_string(model)
 
@@ -1571,3 +1616,130 @@ def test_hf_kimi26instant_alias_disables_thinking_via_chat_template_kwargs() -> 
     extra_body = args.get("extra_body")
     assert isinstance(extra_body, dict)
     assert extra_body["chat_template_kwargs"] == {"thinking": False}
+
+
+@pytest.mark.parametrize(
+    ("query", "expected"),
+    [
+        ("long_context=true", True),
+        ("long_context=false", False),
+        ("long_context=%20TRUE%20&reasoning=high", True),
+        ("long_context=true&long_context=false", False),
+        ("long_context=false&long_context=true", True),
+        ("context=1M", True),
+    ],
+)
+def test_astra_long_context_query(query: str, expected: bool) -> None:
+    config = ModelFactory.parse_model_string(f"astra?{query}")
+    assert config.long_context is expected
+    assert config.provider == Provider.CODEX_RESPONSES
+    assert config.model_name == "gpt-6-astra"
+
+
+@pytest.mark.parametrize("value", ["", "maybe", "2", "1m", "null"])
+def test_long_context_rejects_invalid_boolean(value: str) -> None:
+    with pytest.raises(ModelConfigError, match="Invalid long_context query value"):
+        ModelFactory.parse_model_string(f"astra?long_context={value}")
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "context=1m&long_context=true",
+        "long_context=false&context=1m",
+        "long_context=true&context=1m",
+    ],
+)
+def test_long_context_rejects_competing_settings(query: str) -> None:
+    with pytest.raises(ModelConfigError, match="Multiple long context settings"):
+        ModelFactory.parse_model_string(f"astra?{query}")
+
+
+@pytest.mark.parametrize("default", ["context=1m", "long_context=true"])
+def test_long_context_false_overrides_preset(default: str) -> None:
+    presets = {"long": f"gpt-6-astra?{default}"}
+    assert ModelFactory.parse_model_string("long", presets=presets).long_context is True
+    assert (
+        ModelFactory.parse_model_string("long?long_context=false", presets=presets).long_context
+        is False
+    )
+
+
+@pytest.mark.parametrize(
+    "model",
+    [
+        "astra",
+        "codexplan",
+        "gpt6astra",
+        "gpt-6-astra",
+        "codexresponses.gpt-6-astra",
+        "responses.gpt-6-astra",
+    ],
+)
+@pytest.mark.parametrize(("query", "expected"), [("", "medium"), ("?reasoning=low", "low")])
+def test_astra_reasoning_default_and_override(model: str, query: str, expected: str) -> None:
+    llm = ModelFactory.create_factory(f"{model}{query}")(LlmAgent(AgentConfig(name="test")))
+
+    assert isinstance(llm, ResponsesLLM)
+    assert llm._resolve_reasoning_effort() == expected
+
+
+@pytest.mark.parametrize(("model", "window"), [("astra", 872_000), ("gpt-6-astra", 1_050_000)])
+@pytest.mark.parametrize("query", ["", "?long_context=false", "?long_context=true", "?context=1m"])
+def test_astra_long_context_real_llm(model: str, window: int, query: str) -> None:
+    from fast_agent.commands.model_details import _iter_model_identity_lines
+    from fast_agent.llm.provider.openai.codex_responses import CodexResponsesLLM
+
+    llm = ModelFactory.create_factory(f"{model}{query}")(LlmAgent(AgentConfig(name="test")))
+    assert isinstance(llm, CodexResponsesLLM if model == "astra" else ResponsesLLM)
+    enabled = query in {"?long_context=true", "?context=1m"}
+    expected = window if enabled else 272_000
+    assert llm._context_window_override == (window if enabled else None)
+    assert llm._usage_accumulator.context_window_size == expected
+    assert llm.model_info is not None
+    assert llm.model_info.context_window == expected
+    assert llm.resolved_model.context_window == expected
+    resolved_info = llm.resolved_model.build_model_info()
+    assert resolved_info is not None
+    assert resolved_info.context_window == expected
+    assert ("Context window", str(expected), False) in _iter_model_identity_lines(llm)
+
+
+def test_long_context_preserves_explicit_context_window_override() -> None:
+    resolved = ModelFactory.resolve_model_spec("astra?long_context=true")
+
+    info = resolved.build_model_info(context_window_override=8192)
+
+    assert info is not None
+    assert info.context_window == 8192
+
+
+@pytest.mark.parametrize("model", ["openai.gpt-6-astra", "responses.gpt-5"])
+def test_long_context_does_not_enable_unsupported_models_or_routes(model: str) -> None:
+    from fast_agent.commands.model_details import _iter_model_identity_lines
+
+    llm = ModelFactory.create_factory(f"{model}?long_context=true")(
+        LlmAgent(AgentConfig(name="test"))
+    )
+    assert isinstance(llm, OpenAILLM | ResponsesLLM)
+    assert llm._context_window_override is None
+    assert llm.model_info is not None
+    assert llm._usage_accumulator.context_window_size == llm.model_info.context_window
+    assert llm.resolved_model.context_window == llm.model_info.context_window
+    assert (
+        "Context window",
+        str(llm.model_info.context_window),
+        False,
+    ) in _iter_model_identity_lines(llm)
+
+
+def test_anthropic_does_not_advertise_astra_long_context() -> None:
+    llm = ModelFactory.create_factory("claude-sonnet-4-5")(LlmAgent(AgentConfig(name="test")))
+    assert isinstance(llm, AnthropicLLM)
+    assert "gpt-6-astra" not in llm._list_supported_long_context_models()
+
+
+def test_fable_51_resolves_to_anthropic():
+    config = ModelFactory.parse_model_string("claude-fable-5-1?reasoning=max")
+    assert config.provider == Provider.ANTHROPIC
+    assert config.model_name == "claude-fable-5-1"

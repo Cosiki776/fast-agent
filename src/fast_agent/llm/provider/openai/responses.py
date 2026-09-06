@@ -4,6 +4,7 @@ import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any, ClassVar, Literal
+from uuid import uuid4
 
 from mcp import Tool
 from mcp_types import ContentBlock, TextContent
@@ -32,6 +33,7 @@ from fast_agent.llm.provider.openai._stream_capture import (
 from fast_agent.llm.provider.openai._stream_capture import (
     stream_capture_filename as _stream_capture_filename,
 )
+from fast_agent.llm.provider.openai.responses_cache import prepare_cached_request
 from fast_agent.llm.provider.openai.responses_content import ResponsesContentMixin
 from fast_agent.llm.provider.openai.responses_files import ResponsesFileMixin
 from fast_agent.llm.provider.openai.responses_output import ResponsesOutputMixin
@@ -46,11 +48,12 @@ from fast_agent.llm.provider.openai.responses_websocket import (
     WebSocketResponsesStream,
     build_ws_headers,
     connect_websocket,
+    merge_headers_case_insensitive,
     resolve_responses_ws_url,
     send_response_request,
+    websocket_reuse_key,
 )
 from fast_agent.llm.provider.openai.schema_sanitizer import (
-    sanitize_response_format_schema,
     sanitize_tool_input_schema,
     should_strip_tool_schema_defaults,
 )
@@ -156,6 +159,7 @@ class _ResponsesWsAttemptState:
 
 
 class ResponsesLLM(
+    OpenAIStructuredOutputMixin,
     ResponsesContentMixin,
     ResponsesFileMixin,
     ResponsesOutputMixin,
@@ -180,24 +184,6 @@ class ResponsesLLM(
         "response_format",
     }
 
-    _prepare_structured_request = OpenAIStructuredOutputMixin._prepare_structured_request
-    _apply_prompt_provider_specific_structured_schema = (
-        OpenAIStructuredOutputMixin._apply_prompt_provider_specific_structured_schema
-    )
-
-    @staticmethod
-    def schema_to_response_format(
-        schema: dict[str, Any],
-        *,
-        name: str = "structured_output",
-        strict: bool = True,
-    ) -> dict[str, Any]:
-        return FastAgentLLM.schema_to_response_format(
-            sanitize_response_format_schema(schema) if strict else schema,
-            name=name,
-            strict=strict,
-        )
-
     def _finalize_turn_usage(
         self,
         usage: TurnUsage | None = None,
@@ -213,6 +199,7 @@ class ResponsesLLM(
         )
 
     def __init__(self, provider: Provider = Provider.RESPONSES, **kwargs) -> None:
+        long_context_requested = kwargs.pop("long_context", False)
         web_search_override = kwargs.pop("web_search", None)
         kwargs.pop("provider", None)
         super().__init__(provider=provider, **kwargs)
@@ -225,8 +212,22 @@ class ResponsesLLM(
         self._configure_service_tier(settings)
         chosen_model = self._configure_reasoning_mode()
         self._configure_transport(kwargs, settings, chosen_model)
+        if long_context_requested:
+            self._configure_long_context(chosen_model)
+
+    def _configure_long_context(self, model_name: str | None) -> None:
+        window = self._get_model_long_context_window(model_name)
+        if self.provider in {Provider.RESPONSES, Provider.CODEX_RESPONSES} and window is not None:
+            self._context_window_override = window
+            self._usage_accumulator.set_context_window_size(window)
+        else:
+            self.logger.warning(
+                f"Long context is not supported for model '{model_name}' "
+                f"on provider '{self.provider.value}'. Ignoring."
+            )
 
     def _initialize_response_state(self, web_search_override: Any) -> None:
+        self._responses_prompt_cache_key = uuid4().hex
         self._tool_call_id_map: dict[str, str] = {}
         self._tool_name_map: dict[str, str] = {}
         self._tool_kind_map: dict[str, Literal["function", "custom"]] = {}
@@ -400,12 +401,14 @@ class ResponsesLLM(
     def _available_service_tiers_for_model(
         self, model_name: str | None
     ) -> tuple[ResponsesServiceTier, ...]:
+        model_name = model_name or self.default_request_params.model
+        configured_tiers = (
+            self._get_model_response_service_tiers(model_name) if model_name else None
+        )
         if self.provider == Provider.CODEX_RESPONSES:
-            return ("fast",)
-        if model_name:
-            configured_tiers = self._get_model_response_service_tiers(model_name)
-            if configured_tiers is not None:
-                return configured_tiers
+            return ("fast",) if configured_tiers and "fast" in configured_tiers else ()
+        if configured_tiers is not None:
+            return configured_tiers
         return ("fast", "flex")
 
     def _normalize_service_tier(self, raw_value: Any) -> ResponsesServiceTier | None:
@@ -800,7 +803,18 @@ class ResponsesLLM(
         if last_message.role == "assistant":
             return last_message
 
-        input_items = self._convert_to_provider_format(multipart_messages)
+        cache_state = None
+        if self.provider in {Provider.RESPONSES, Provider.CODEX_RESPONSES}:
+            input_items, cache_state, req_params = prepare_cached_request(
+                multipart_messages,
+                req_params,
+                key=self._responses_prompt_cache_key,
+                default_effort=self._resolve_reasoning_effort(),
+                convert=self._convert_message_to_items,
+            )
+            input_items = self._dedupe_input_items(input_items)
+        else:
+            input_items = self._convert_to_provider_format(multipart_messages)
         if not input_items:
             input_items = [
                 {
@@ -810,7 +824,10 @@ class ResponsesLLM(
                 }
             ]
 
-        return await self._responses_completion(input_items, req_params, tools)
+        response = await self._responses_completion(input_items, req_params, tools)
+        if cache_state is not None:
+            cache_state.attach(response)
+        return response
 
     def _build_web_search_tool(
         self,
@@ -968,6 +985,8 @@ class ResponsesLLM(
             "include": [RESPONSE_INCLUDE_REASONING],
             "parallel_tool_calls": request_params.parallel_tool_calls,
         }
+        if self.provider in {Provider.RESPONSES, Provider.CODEX_RESPONSES}:
+            base_args["prompt_cache_key"] = self._responses_prompt_cache_key
 
         system_prompt = self.instruction or request_params.system_prompt
         if system_prompt:
@@ -1457,9 +1476,10 @@ class ResponsesLLM(
         arguments = self._build_response_args(normalized_input, request_params, tools)
         request_headers = arguments.pop("extra_headers", None)
         self._prepare_websocket_arguments(arguments)
-        ws_headers = self._build_websocket_headers()
-        if isinstance(request_headers, dict):
-            ws_headers.update(request_headers)
+        ws_headers = merge_headers_case_insensitive(
+            self._build_websocket_headers(),
+            request_headers if isinstance(request_headers, dict) else None,
+        )
         self._record_ws_phase(phase_timings, "build_args", phase_started_at)
         self.logger.debug("Responses websocket request", data=arguments)
         capture_filename = _stream_capture_filename(self.chat_turn())
@@ -1489,7 +1509,10 @@ class ResponsesLLM(
             )
 
         phase_started_at = time.perf_counter()
-        connection, is_reusable = await self._ws_connections.acquire(_create_connection)
+        connection, is_reusable = await self._ws_connections.acquire(
+            _create_connection,
+            reuse_key=websocket_reuse_key(context.ws_url, context.ws_headers),
+        )
         self._record_ws_phase(context.phase_timings, "acquire_connection", phase_started_at)
         reused_existing_connection = is_reusable and connection.last_used_monotonic > 0.0
         planner = connection.session_state.request_planner
@@ -1770,6 +1793,7 @@ class ResponsesLLM(
 
     def clear(self, *, clear_prompts: bool = False) -> None:
         super().clear(clear_prompts=clear_prompts)
+        self._responses_prompt_cache_key = uuid4().hex
         self._tool_call_id_map.clear()
         self._tool_kind_map.clear()
         self._seen_tool_call_ids.clear()

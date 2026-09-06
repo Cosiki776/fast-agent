@@ -39,7 +39,11 @@ from fast_agent.context import Context
 from fast_agent.core.exceptions import ModelConfigError
 from fast_agent.core.logging.logger import get_logger
 from fast_agent.event_progress import ProgressAction
-from fast_agent.llm.provider.openai.codex_responses import CodexResponsesLLM
+from fast_agent.llm.provider.openai.codex_responses import (
+    CODEX_RESPONSES_LITE_HEADER,
+    CODEX_ROUTING_HINT_HEADER,
+    CodexResponsesLLM,
+)
 from fast_agent.llm.provider.openai.openresponses import (
     OpenResponsesLLM,
     _OpenResponsesRawStream,
@@ -911,8 +915,9 @@ def test_codexresponses_provider_defaults_to_websocket_preferred_transport() -> 
     assert llm.configured_transport == "auto"
 
 
-def test_codexresponses_lite_uses_internal_request_contract() -> None:
-    llm = _build_responses_family_llm(Provider.CODEX_RESPONSES, model_name="gpt-5.6-luna")
+@pytest.mark.parametrize("model_name", ["gpt-5.6-luna", "gpt-6-astra"])
+def test_codexresponses_lite_uses_internal_request_contract(model_name: str) -> None:
+    llm = _build_responses_family_llm(Provider.CODEX_RESPONSES, model_name=model_name)
     input_items = [
         {
             "type": "message",
@@ -924,11 +929,14 @@ def test_codexresponses_lite_uses_internal_request_contract() -> None:
 
     args = llm._build_response_args(
         input_items,
-        RequestParams(model="gpt-5.6-luna", system_prompt="instructions"),
+        RequestParams(model=model_name, system_prompt="instructions"),
         [tool],
     )
 
-    assert args["extra_headers"] == {"x-openai-internal-codex-responses-lite": "true"}
+    assert args["extra_headers"] == {
+        CODEX_RESPONSES_LITE_HEADER: "true",
+        CODEX_ROUTING_HINT_HEADER: f"model={model_name}",
+    }
     assert "instructions" not in args
     assert "tools" not in args
     assert args["parallel_tool_calls"] is False
@@ -940,6 +948,78 @@ def test_codexresponses_lite_uses_internal_request_contract() -> None:
     ]
     assert args["input"][0]["tools"][0]["name"] == "lookup"
     assert args["input"][1]["role"] == "developer"
+
+
+def test_codexresponses_lite_fast_preserves_both_routing_headers() -> None:
+    llm = _build_responses_family_llm(
+        Provider.CODEX_RESPONSES,
+        model_name="gpt-5.6-luna",
+    )
+
+    args = llm._build_response_args(
+        [],
+        RequestParams(model="gpt-5.6-luna", service_tier="fast"),
+        None,
+    )
+
+    assert args["service_tier"] == "priority"
+    assert args["extra_headers"] == {
+        CODEX_RESPONSES_LITE_HEADER: "true",
+        CODEX_ROUTING_HINT_HEADER: "model=gpt-5.6-luna;tier=priority",
+    }
+
+
+def test_gpt_6_astra_sends_max_reasoning_to_codexresponses() -> None:
+    llm = _build_responses_family_llm(
+        Provider.CODEX_RESPONSES,
+        model_name="gpt-6-astra",
+    )
+    llm.set_reasoning_effort(ReasoningEffortSetting(kind="effort", value="max"))
+
+    args = llm._build_response_args(
+        [],
+        RequestParams(model="gpt-6-astra"),
+        None,
+    )
+
+    assert args["reasoning"]["effort"] == "max"
+    assert args["reasoning"]["context"] == "all_turns"
+
+
+def test_gpt_6_astra_uses_standard_contract_through_responses_api() -> None:
+    llm = _build_responses_family_llm(
+        Provider.RESPONSES,
+        model_name="gpt-6-astra",
+    )
+    llm.set_reasoning_effort(ReasoningEffortSetting(kind="effort", value="max"))
+
+    args = llm._build_response_args(
+        [],
+        RequestParams(model="gpt-6-astra"),
+        None,
+    )
+
+    assert args["model"] == "gpt-6-astra"
+    assert args["reasoning"]["effort"] == "max"
+    assert "extra_headers" not in args
+
+
+def test_gpt_6_astra_codex_client_meets_minimum_version() -> None:
+    payload = base64.urlsafe_b64encode(
+        json.dumps(
+            {
+                "https://api.openai.com/auth": {
+                    "chatgpt_account_id": "account-test",
+                }
+            }
+        ).encode()
+    ).decode()
+    token = f"header.{payload.rstrip('=')}.signature"
+    llm = CodexResponsesLLM(model="gpt-6-astra", api_key=token)
+
+    headers = llm._build_websocket_headers()
+
+    assert headers["User-Agent"].startswith("codex_cli_rs/0.153.0 ")
 
 
 def test_codexresponses_lite_adds_per_request_websocket_metadata() -> None:
@@ -983,7 +1063,7 @@ def test_codexresponses_standard_model_omits_lite_contract(model_name: str) -> N
         None,
     )
 
-    assert "extra_headers" not in args
+    assert args["extra_headers"] == {CODEX_ROUTING_HINT_HEADER: f"model={model_name}"}
     assert args["instructions"] == "instructions"
     assert "client_metadata" not in args
 
@@ -1301,7 +1381,16 @@ def test_tool_fallback_notifications_for_custom_tool_call() -> None:
 
 def test_dedupes_duplicate_reasoning_ids():
     harness = _ContentHarness()
-    payload = {"type": "reasoning", "encrypted_content": "abc", "id": "rs_dup"}
+    payload = {
+        "schema": "fast-agent.openai-responses.reasoning-replay",
+        "version": 1,
+        "item": {
+            "type": "reasoning",
+            "id": "rs_dup",
+            "summary": [],
+            "encrypted_content": "abc",
+        },
+    }
     reasoning_block = TextContent(type="text", text=json.dumps(payload))
     channels = {OPENAI_REASONING_ENCRYPTED: [reasoning_block]}
 
@@ -1331,6 +1420,24 @@ def test_encrypted_reasoning_replay_preserves_raw_summary_and_omits_status() -> 
     )
 
     blocks = output_harness._extract_encrypted_reasoning(response)
+    assert len(blocks) == 1
+    assert isinstance(blocks[0], TextContent)
+    persisted = json.loads(blocks[0].text)
+    assert persisted == {
+        "schema": "fast-agent.openai-responses.reasoning-replay",
+        "version": 1,
+        "item": {
+            "type": "reasoning",
+            "id": "rs_123",
+            "summary": [
+                {
+                    "type": "summary_text",
+                    "text": "Checked the arithmetic.",
+                }
+            ],
+            "encrypted_content": "encrypted-reasoning",
+        },
+    }
     message = PromptMessageExtended(
         role="assistant",
         content=[],
@@ -1348,7 +1455,6 @@ def test_encrypted_reasoning_replay_preserves_raw_summary_and_omits_status() -> 
                     "text": "Checked the arithmetic.",
                 }
             ],
-            "content": None,
             "encrypted_content": "encrypted-reasoning",
         }
     ]
@@ -2076,6 +2182,52 @@ def test_build_response_args_maps_service_tier_values(
     assert args["service_tier"] == wire_value
 
 
+@pytest.mark.parametrize(
+    ("service_tier", "expected_hint"),
+    [
+        (None, "model=gpt-5.3-codex"),
+        ("fast", "model=gpt-5.3-codex;tier=priority"),
+    ],
+)
+def test_codexresponses_request_adds_routing_hint(
+    service_tier: Literal["fast"] | None,
+    expected_hint: str,
+) -> None:
+    llm = _build_responses_family_llm(
+        Provider.CODEX_RESPONSES,
+        model_name="gpt-5.3-codex",
+    )
+    params = RequestParams(model="gpt-5.3-codex")
+    if service_tier is not None:
+        params.service_tier = service_tier
+
+    args = llm._build_response_args([], params, None)
+
+    assert args["extra_headers"][CODEX_ROUTING_HINT_HEADER] == expected_hint
+    if service_tier is None:
+        assert "service_tier" not in args
+    else:
+        assert args["service_tier"] == "priority"
+
+
+def test_codexresponses_routing_hint_overrides_configured_header_case_insensitively() -> None:
+    llm = _build_responses_family_llm(
+        Provider.CODEX_RESPONSES,
+        model_name="gpt-5.3-codex",
+    )
+
+    args = llm._build_response_args(
+        [],
+        RequestParams(
+            model="gpt-5.3-codex",
+            metadata={"extra_headers": {"X-Codex-Routing-Hint": "stale"}},
+        ),
+        None,
+    )
+
+    assert args["extra_headers"] == {CODEX_ROUTING_HINT_HEADER: "model=gpt-5.3-codex"}
+
+
 def test_build_response_args_omits_service_tier_when_unset() -> None:
     llm = _build_responses_family_llm(Provider.RESPONSES)
 
@@ -2143,6 +2295,19 @@ def test_codexresponses_set_service_tier_rejects_flex() -> None:
 
     with pytest.raises(ValueError, match="standard"):
         llm.set_service_tier("flex")
+
+
+def test_codexresponses_model_without_fast_metadata_hides_service_tier() -> None:
+    llm = CodexResponsesLLM(
+        provider=Provider.CODEX_RESPONSES,
+        model="o3",
+        transport="sse",
+    )
+
+    assert llm.available_service_tiers == ()
+    assert llm.service_tier_supported is False
+    with pytest.raises(ValueError, match="standard"):
+        llm.set_service_tier("fast")
 
 
 def test_responses_chatgpt_model_reports_fast_only_service_tier() -> None:

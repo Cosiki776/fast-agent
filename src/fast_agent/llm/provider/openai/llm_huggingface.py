@@ -31,12 +31,24 @@ class HuggingFaceLLM(OpenAICompatibleLLM):
         self._hf_provider_suffix: str | None = None
         kwargs.pop("provider", None)
         super().__init__(provider=Provider.HUGGINGFACE, **kwargs)
+        self._apply_prompt_context_window()
         if not explicit_reasoning_effort:
             # HuggingFace inherits the OpenAI-compatible transport, but not the
             # OpenAI provider's default reasoning_effort. When no HF model query
             # or preset supplied reasoning explicitly, use the model metadata
             # default during request shaping.
             self.set_reasoning_effort(None)
+
+    def _apply_prompt_context_window(self) -> None:
+        profile = self._route_profile(self.default_request_params.model)
+        if profile is None or profile.prompt_context_window is None:
+            return
+        prompt_context_window = profile.prompt_context_window
+        max_tokens = self.default_request_params.max_tokens
+        model_context_window = self._resolved_model_spec.context_window
+        if max_tokens is not None and model_context_window is not None:
+            prompt_context_window = max(model_context_window - max_tokens, 1)
+        self._usage_accumulator.set_context_window_size(prompt_context_window)
 
     def _initialize_default_params(self, kwargs: dict) -> RequestParams:
         """Initialize HuggingFace-specific default parameters"""
@@ -55,6 +67,9 @@ class HuggingFaceLLM(OpenAICompatibleLLM):
 
         # Get base defaults from parent (includes ModelDatabase lookup)
         base_params = super()._initialize_default_params(kwargs)
+        profile = self._route_profile(base_model)
+        if profile and profile.omit_default_max_tokens:
+            base_params.max_tokens = None
 
         # Override with HuggingFace-specific settings
         base_params.model = base_model

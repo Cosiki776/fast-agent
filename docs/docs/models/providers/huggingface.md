@@ -96,6 +96,12 @@ Muse Glimmer supports text and image input with text output and a 131,072-token
 context window. Its reasoning control is a chat-template setting rather than an
 OpenAI `reasoning_effort` field. Fast-agent maps `low`, `medium`, `high`, and
 `xhigh` to `chat_template_kwargs.reasoning_strength`; the default is `high`.
+The model advertises a 128,000-token output capability, but fast-agent omits
+`max_tokens` by default so the serving backend can account for the serialized
+input. Glimmer routes reserve 32,768 output tokens when that field is omitted,
+so fast-agent uses the resulting 98,304-token prompt window for context
+monitoring and automatic compaction. Use `glimmer?max_tokens=...` to send an
+explicit output cap; the monitored prompt window adjusts to that reservation.
 
 Meta's released chat template and [Together's model page](https://www.together.ai/models/muse-glimmer)
 describe tool calling, while Together's serverless model catalog currently marks

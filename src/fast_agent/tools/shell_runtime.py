@@ -67,7 +67,7 @@ from fast_agent.tools.shell_command import (
 from fast_agent.tools.shell_command import (
     classify_shell_detachment as classify_shell_detachment,
 )
-from fast_agent.tools.shell_output import ShellOutputBuffer
+from fast_agent.tools.shell_output import ShellOutputBuffer, process_output_preview
 from fast_agent.tools.shell_process import (
     ActiveProcessPoll,
     ForegroundAutoAwaitMetadata,
@@ -186,6 +186,24 @@ class _ManagedProcessOperation:
     kind: Literal["list", "status", "wait", "stop", "read_output"]
     process_id: str | None
     wait_sec: int | None
+
+
+ProcessTerminationState = Literal[
+    "terminated",
+    "stop_requested",
+    "stop_already_requested",
+    "already_exited",
+    "unavailable",
+    "not_found",
+    "termination_failed",
+]
+
+
+@dataclass(frozen=True, slots=True)
+class ProcessTerminationOutcome:
+    process_id: str
+    state: ProcessTerminationState
+    error: str | None = None
 
 
 class _ProcessListEntry(TypedDict):
@@ -960,6 +978,7 @@ class ShellRuntime:
         self,
         process_id: str,
         snapshot: DurableProcessSnapshot,
+        output_preview_limit: int | None = None,
     ) -> tuple[str, int]:
         store = self._durable_process_store
         if store is None:
@@ -974,7 +993,21 @@ class ShellRuntime:
             snapshot.spec.output_byte_limit,
             MAX_TERMINAL_OUTPUT_BYTE_LIMIT,
         )
-        if unread_bytes <= output_limit:
+        if output_preview_limit is not None:
+            output = await asyncio.to_thread(
+                store.read_output,
+                process_id,
+                stream=DurableProcessStream.COMBINED,
+                offset=offset,
+                # Read through a possible UTF-8 boundary before capping the preview.
+                limit=min(unread_bytes, min(output_preview_limit, output_limit) + 3),
+            )
+            text = process_output_preview(
+                output.text.encode("utf-8"),
+                limit=min(output_preview_limit, output_limit),
+                total_bytes=unread_bytes,
+            )
+        elif unread_bytes <= output_limit:
             output = await asyncio.to_thread(
                 store.read_output,
                 process_id,
@@ -1027,6 +1060,7 @@ class ShellRuntime:
         *,
         wait_sec: int,
         wake_on_output: bool,
+        output_preview_limit: int | None = None,
     ) -> CallToolResult:
         store = self._durable_process_store
         if store is None or process_id not in self._attached_durable_processes:
@@ -1066,6 +1100,7 @@ class ShellRuntime:
             output, _ = await self._read_durable_output_delta(
                 process_id,
                 snapshot,
+                output_preview_limit,
             )
         except (DurableProcessRecordError, OSError) as exc:
             return _text_result(
@@ -2181,6 +2216,7 @@ class ShellRuntime:
         process: ManagedShellProcess,
         *,
         yielded_reason: str | None = None,
+        output_preview_limit: int | None = None,
     ) -> CallToolResult:
         self._record_buffered_process_result(process)
         result = build_managed_process_result(
@@ -2195,6 +2231,7 @@ class ShellRuntime:
                 else None
             ),
             io_drain_timeout_seconds=_IO_DRAIN_TIMEOUT_SECONDS,
+            output_preview_limit=output_preview_limit,
         )
         metadata = process_result_metadata(result)
         if metadata is not None and process.foreground_auto_await is not None:
@@ -2206,6 +2243,7 @@ class ShellRuntime:
         arguments: dict[str, Any] | None = None,
         *,
         progress_tool_use_id: str | None = None,
+        output_preview_limit: int | None = None,
     ) -> CallToolResult:
         """Return incremental output and status for a managed process."""
         poll_started_at = time.monotonic()
@@ -2228,6 +2266,7 @@ class ShellRuntime:
                         parsed.process_id,
                         wait_sec=parsed.wait_sec,
                         wake_on_output=parsed.wake_on_output,
+                        output_preview_limit=output_preview_limit,
                     )
             return _text_result(
                 f"Error: managed shell process {parsed.process_id!r} was not found",
@@ -2297,7 +2336,9 @@ class ShellRuntime:
                     0.0,
                 )
                 output_observed = process.output_state.had_stream_output
-                result = self._managed_process_result(process)
+                result = self._managed_process_result(
+                    process, output_preview_limit=output_preview_limit
+                )
                 metadata = cast("ProcessResultMetadata", process_result_metadata(result))
                 metadata["process_yield_reason"] = poll_yield_reason
                 metadata["output_bytes_since_last_poll"] = output_bytes_since_last_poll
@@ -2394,92 +2435,138 @@ class ShellRuntime:
         except ValueError as exc:
             return _text_result(str(exc), is_error=True)
 
+        outcome = await self._terminate_process_by_id(
+            process_id,
+            include_unattached_durable=False,
+        )
+        return self._termination_tool_result(outcome)
+
+    async def terminate_interactive_process(
+        self,
+        process_id: str,
+    ) -> ProcessTerminationOutcome:
+        """Terminate a managed or discoverable durable process by explicit user request."""
+
+        return await self._terminate_process_by_id(
+            process_id,
+            include_unattached_durable=True,
+        )
+
+    async def _terminate_process_by_id(
+        self,
+        process_id: str,
+        *,
+        include_unattached_durable: bool,
+    ) -> ProcessTerminationOutcome:
         process = await self._get_managed_process(process_id)
         if process is None:
-            if (
-                process_id in self._attached_durable_processes
-                and self._durable_process_store is not None
+            store = self._durable_process_store
+            if store is not None and (
+                include_unattached_durable or process_id in self._attached_durable_processes
             ):
                 try:
-                    snapshot = await asyncio.to_thread(
-                        self._durable_process_store.get,
-                        process_id,
-                    )
+                    snapshot = await asyncio.to_thread(store.get, process_id)
                     status = self._durable_status(snapshot)
                     if status == "unavailable":
-                        return process_result(
-                            f"process_id: {process_id}\noutcome: unavailable\n"
-                            "The supervisor is no longer available; no stop request was sent.",
-                            is_error=True,
-                            metadata={
-                                "process_id": process_id,
-                                "process_status": "unavailable",
-                            },
+                        return ProcessTerminationOutcome(
+                            process_id=process_id,
+                            state="unavailable",
                         )
                     if status != "running":
-                        return process_result(
-                            f"process_id: {process_id}\noutcome: already_exited",
-                            is_error=False,
-                            metadata={
-                                "process_id": process_id,
-                                "process_status": "already_exited",
-                            },
+                        return ProcessTerminationOutcome(
+                            process_id=process_id,
+                            state="already_exited",
                         )
-                    created = await asyncio.to_thread(
-                        self._durable_process_store.request_stop,
-                        process_id,
+                    created = await asyncio.to_thread(store.request_stop, process_id)
+                except ValueError:
+                    return ProcessTerminationOutcome(
+                        process_id=process_id,
+                        state="not_found",
                     )
                 except (DurableProcessRecordError, OSError) as exc:
-                    return _text_result(
-                        f"Error: durable process {process_id!r} could not be stopped: {exc}",
-                        is_error=True,
+                    return ProcessTerminationOutcome(
+                        process_id=process_id,
+                        state="termination_failed",
+                        error=f"durable process {process_id!r} could not be stopped: {exc}",
                     )
-                return process_result(
-                    f"process_id: {process_id}\noutcome: "
-                    f"{'stop_requested' if created else 'stop_already_requested'}",
-                    is_error=False,
-                    metadata={
-                        "process_id": process_id,
-                        "process_status": "stopping",
-                    },
+                return ProcessTerminationOutcome(
+                    process_id=process_id,
+                    state="stop_requested" if created else "stop_already_requested",
                 )
-            return _text_result(
-                f"Error: managed shell process {process_id!r} was not found",
-                is_error=True,
+            return ProcessTerminationOutcome(
+                process_id=process_id,
+                state="not_found",
             )
 
         async with process.lock:
             if process.task.done():
-                return process_result(
-                    f"process_id: {process_id}\noutcome: already_exited",
-                    is_error=False,
-                    metadata={
-                        "process_id": process_id,
-                        "process_status": "already_exited",
-                    },
+                return ProcessTerminationOutcome(
+                    process_id=process_id,
+                    state="already_exited",
                 )
             await self._terminate_managed_process_task(process)
             if not process.task.cancelled():
                 exception = process.task.exception()
                 if exception is not None:
                     process.terminated = False
-                    return process_result(
-                        f"process_id: {process_id}\noutcome: termination_failed\n"
-                        f"error: {exception}",
-                        is_error=True,
-                        metadata={
-                            "process_id": process_id,
-                            "process_status": "termination_failed",
-                        },
+                    return ProcessTerminationOutcome(
+                        process_id=process_id,
+                        state="termination_failed",
+                        error=str(exception),
                     )
+            return ProcessTerminationOutcome(
+                process_id=process_id,
+                state="terminated",
+            )
+
+    @staticmethod
+    def _termination_tool_result(outcome: ProcessTerminationOutcome) -> CallToolResult:
+        process_id = outcome.process_id
+        if outcome.state == "not_found":
+            return _text_result(
+                f"Error: managed shell process {process_id!r} was not found",
+                is_error=True,
+            )
+        if outcome.state == "termination_failed":
+            error = outcome.error or "process termination failed"
+            prefix = (
+                "Error: "
+                if error.startswith("durable process ")
+                else f"process_id: {process_id}\noutcome: termination_failed\nerror: "
+            )
+            if prefix == "Error: ":
+                return _text_result(f"{prefix}{error}", is_error=True)
             return process_result(
-                f"process_id: {process_id}\noutcome: terminated",
-                is_error=False,
+                f"{prefix}{error}",
+                is_error=True,
                 metadata={
                     "process_id": process_id,
-                    "process_status": "terminated",
+                    "process_status": "termination_failed",
                 },
             )
+        if outcome.state == "unavailable":
+            return process_result(
+                f"process_id: {process_id}\noutcome: unavailable\n"
+                "The supervisor is no longer available; no stop request was sent.",
+                is_error=True,
+                metadata={
+                    "process_id": process_id,
+                    "process_status": "unavailable",
+                },
+            )
+        process_status = (
+            "stopping"
+            if outcome.state in {"stop_requested", "stop_already_requested"}
+            else outcome.state
+        )
+        return process_result(
+            f"process_id: {process_id}\noutcome: {outcome.state}",
+            is_error=False,
+            metadata={
+                "process_id": process_id,
+                "process_status": process_status,
+            },
+        )
 
     async def call_tool(
         self,
@@ -2545,6 +2632,7 @@ class ShellRuntime:
                     "wait_sec": wait_sec,
                 },
                 tool_use_id=tool_use_id,
+                output_preview_limit=parsed_process.limit,
             )
         if name == GROK_SHELL_TOOL_NAME and self._grok_shell_profile:
             try:
@@ -2595,6 +2683,7 @@ class ShellRuntime:
         arguments: dict[str, Any] | None,
         *,
         tool_use_id: str | None,
+        output_preview_limit: int | None = None,
     ) -> CallToolResult:
         process_id = (arguments or {}).get("process_id")
         payload = arguments or {}
@@ -2604,6 +2693,7 @@ class ShellRuntime:
             operation = self.poll_process(
                 arguments,
                 progress_tool_use_id=tool_use_id,
+                output_preview_limit=output_preview_limit,
             )
         else:
             operation = self.terminate_process(arguments)

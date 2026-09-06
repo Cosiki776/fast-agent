@@ -106,6 +106,7 @@ def test_muse_glimmer_together_applies_chat_template_contract(
     assert request["model"] == "meta-models/Muse-Glimmer-30B:together"
     assert request["temperature"] == 1.0
     assert request["top_p"] == 0.95
+    assert "max_tokens" not in request
     assert "reasoning_effort" not in request
     assert isinstance(extra_body, dict)
     assert extra_body == {
@@ -114,6 +115,60 @@ def test_muse_glimmer_together_applies_chat_template_contract(
             "reasoning_strength": reasoning_strength,
         },
     }
+
+
+def test_muse_glimmer_together_uses_effective_prompt_context_window() -> None:
+    agent = LlmAgent(AgentConfig(name="router-profile-test"))
+    llm = ModelFactory.create_factory("glimmer")(agent=agent)
+
+    assert isinstance(llm, HuggingFaceLLM)
+    assert llm.usage_accumulator.context_window_size == 98_304
+
+
+def test_muse_glimmer_other_backend_uses_effective_prompt_context_window() -> None:
+    agent = LlmAgent(AgentConfig(name="router-profile-test"))
+    llm = ModelFactory.create_factory("hf.meta-models/Muse-Glimmer-30B:novita")(agent=agent)
+
+    assert isinstance(llm, HuggingFaceLLM)
+    assert llm.usage_accumulator.context_window_size == 98_304
+
+
+def test_muse_glimmer_explicit_output_cap_adjusts_prompt_context_window() -> None:
+    agent = LlmAgent(AgentConfig(name="router-profile-test"))
+    llm = ModelFactory.create_factory("glimmer?max_tokens=4096")(agent=agent)
+
+    assert isinstance(llm, HuggingFaceLLM)
+    assert llm.usage_accumulator.context_window_size == 126_976
+
+
+def test_muse_glimmer_other_backend_explicit_output_cap_adjusts_prompt_window() -> None:
+    agent = LlmAgent(AgentConfig(name="router-profile-test"))
+    llm = ModelFactory.create_factory("hf.meta-models/Muse-Glimmer-30B:novita?max_tokens=4096")(
+        agent=agent
+    )
+
+    assert isinstance(llm, HuggingFaceLLM)
+    assert llm.usage_accumulator.context_window_size == 126_976
+
+
+@pytest.mark.parametrize(
+    "model",
+    (
+        "glimmer?max_tokens=4096",
+        "hf.meta-models/Muse-Glimmer-30B:novita?max_tokens=4096",
+    ),
+)
+def test_muse_glimmer_preserves_explicit_max_tokens(model: str) -> None:
+    request = _factory_request(model)
+
+    assert request["max_tokens"] == 4096
+
+
+def test_muse_glimmer_other_backend_omits_default_max_tokens() -> None:
+    request = _factory_request("hf.meta-models/Muse-Glimmer-30B:novita")
+
+    assert "max_tokens" not in request
+    assert "extra_body" not in request
 
 
 @pytest.mark.parametrize(

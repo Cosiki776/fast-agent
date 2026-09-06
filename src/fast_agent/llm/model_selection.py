@@ -56,6 +56,7 @@ class ModelSelectionCatalog:
 
     CATALOG_ENTRIES_BY_PROVIDER: ClassVar[dict[Provider, tuple[CatalogModelEntry, ...]]] = {
         Provider.RESPONSES: (
+            _builtin_entry("gpt-6-astra"),
             _builtin_entry("gpt-5.6-sol"),
             _builtin_entry("gpt-5.6-terra", fast=True),
             _builtin_entry("gpt-5.6-luna", fast=True),
@@ -93,9 +94,9 @@ class ModelSelectionCatalog:
         ),
         Provider.GOOGLE: (
             CatalogModelEntry(
-                alias="gemini37flash",
-                display_label="Gemini 3.7 Flash",
-                model="google.gemini-3.7-flash",
+                alias="gemini38flash",
+                display_label="Gemini 3.8 Flash",
+                model="google.gemini-3.8-flash",
                 fast=True,
                 description=(
                     "GA coding and agent model. Through Dec 31, 2026, Standard is "
@@ -134,8 +135,8 @@ class ModelSelectionCatalog:
             _builtin_entry("Grok 4.3"),
         ),
         Provider.META_AI: (
-            _builtin_entry("Muse Spark 1.2"),
-            _builtin_entry("Muse Spark 1.2 (Contributor)"),
+            _builtin_entry("Muse Spark 1.3"),
+            _builtin_entry("Muse Spark 1.3 (Contributor)"),
             _builtin_entry("Muse Spark 1.1"),
         ),
         Provider.DEEPSEEK: (
@@ -145,11 +146,20 @@ class ModelSelectionCatalog:
                 fast=True,
             ),
             _builtin_entry(
+                "deepseekvision",
+                display_label="DeepSeek V4 Flash Vision (experimental)",
+                fast=True,
+            ),
+            _builtin_entry(
                 "DeepSeek V4 Pro",
                 display_label="DeepSeek V4 Pro",
             ),
         ),
-        Provider.ZAI: (_builtin_entry("zaiglm", display_label="GLM 5.2"),),
+        Provider.ZAI: (
+            _builtin_entry("zaiglm53", display_label="GLM 5.3"),
+            _builtin_entry("zaiglm53flash", display_label="GLM 5.3 Flash", fast=True),
+            _builtin_entry("zaiglm", display_label="GLM 5.2", current=True),
+        ),
         Provider.MOONSHOT: (_builtin_entry("kimik3", display_label="Kimi K3"),),
         Provider.OPENROUTER: (),
         Provider.ALIYUN: (
@@ -258,6 +268,7 @@ class ModelSelectionCatalog:
             _builtin_entry("deepseek32", current=False),
         ),
         Provider.CODEX_RESPONSES: (
+            _builtin_entry("astra", display_label="GPT-6-Astra"),
             _builtin_entry("sol"),
             _builtin_entry("terra"),
             _builtin_entry("luna"),

@@ -18,6 +18,7 @@ from fast_agent.constants import (
     FAST_AGENT_PENDING_MEDIA_ATTACHMENTS,
     FAST_AGENT_SYNTHETIC_FINAL_CHANNEL,
     FAST_AGENT_TIMING,
+    FAST_AGENT_TOOL_MEDIA_MESSAGE,
     FAST_AGENT_USAGE,
 )
 from fast_agent.core.logging.logger import get_logger
@@ -701,7 +702,15 @@ class ToolRunner:
             del visible_channels[FAST_AGENT_PENDING_MEDIA_ATTACHMENTS]
             staged_messages = [
                 tool_message.model_copy(update={"channels": visible_channels or None}),
-                PromptMessageExtended(role="user", content=list(pending_media)),
+                PromptMessageExtended(
+                    role="user",
+                    content=list(pending_media),
+                    channels={
+                        FAST_AGENT_TOOL_MEDIA_MESSAGE: [
+                            TextContent(type="text", text="Tool media continuation")
+                        ]
+                    },
+                ),
             ]
 
         if self._use_history_enabled():
@@ -888,6 +897,9 @@ class ToolRunner:
             )
             if self._last_message is not None:
                 self._last_message.stop_reason = LlmStopReason.MAX_ITERATIONS
+            if self._use_history_enabled():
+                self._stage_tool_response(tool_message)
+                self._append_history_messages(*self._delta_messages)
             self._done = True
             return
 

@@ -5,6 +5,8 @@ This class provides default implementations of the standard agent methods
 and delegates operations to an attached FastAgentLLMProtocol instance.
 """
 
+from __future__ import annotations
+
 import asyncio
 import fnmatch
 import os
@@ -55,7 +57,6 @@ from fast_agent.agents.mcp_tool_presentation import (
 )
 from fast_agent.agents.subagent_directive import resolve_subagent_directive
 from fast_agent.agents.tool_agent import ToolAgent
-from fast_agent.agents.tool_call_planning import PlannedToolCall
 from fast_agent.commands.model_capabilities import (
     resolve_model_name,
     resolve_model_params,
@@ -78,7 +79,6 @@ from fast_agent.llm.terminal_output_limits import (
     calculate_terminal_output_limit_for_model,
     calculate_terminal_output_limit_for_resolved_model,
 )
-from fast_agent.mcp.app_integrations import AppServerConfig
 from fast_agent.mcp.common import (
     create_namespaced_name,
     get_resource_name,
@@ -108,27 +108,17 @@ from fast_agent.paths import resolve_home_paths
 from fast_agent.skills import SKILLS_DEFAULT, SkillManifest
 from fast_agent.skills.registry import SkillRegistry
 from fast_agent.tools.apply_patch_tool import APPLY_PATCH_TOOL_NAME
-from fast_agent.tools.composite_filesystem_runtime import CompositeFilesystemRuntime
+from fast_agent.tools.codex_web_search import CodexWebSearchAdapter
 from fast_agent.tools.edit_file_tool import EDIT_FILE_TOOL_NAME
 from fast_agent.tools.elicitation import (
     get_elicitation_tool,
     run_elicitation_form,
     set_elicitation_input_callback,
 )
-from fast_agent.tools.environment_filesystem_runtime import EnvironmentFilesystemRuntime
-from fast_agent.tools.execution_environment import (
-    EnvironmentFilesystem,
-    EnvironmentTemporaryArtifacts,
-)
-from fast_agent.tools.external_runtime_protocol import ExternalRuntime
-from fast_agent.tools.filesystem_runtime_protocol import FilesystemRuntime
 from fast_agent.tools.filesystem_tool_definitions import (
     READ_TEXT_FILE_TOOL_NAME,
     WRITE_TEXT_FILE_TOOL_NAME,
 )
-from fast_agent.tools.local_filesystem_runtime import LocalFilesystemRuntime
-from fast_agent.tools.shell_profiles import ResolvedShellToolProfile, ShellToolProfile
-from fast_agent.tools.shell_runtime import ShellRuntime
 from fast_agent.tools.skill_reader import READ_SKILL_TOOL_NAME, SkillReader
 from fast_agent.transactional.execution import (
     ToolExecutionRequest,
@@ -204,9 +194,20 @@ if TYPE_CHECKING:
     from rich.text import Text
 
     from fast_agent.agents.llm_decorator import LlmDecorator
+    from fast_agent.agents.tool_call_planning import PlannedToolCall
     from fast_agent.context import Context
     from fast_agent.llm.usage_tracking import UsageAccumulator
-    from fast_agent.tools.execution_environment import ShellEnvironment
+    from fast_agent.mcp.app_integrations import AppServerConfig
+    from fast_agent.tools.environment_filesystem_runtime import EnvironmentFilesystemRuntime
+    from fast_agent.tools.execution_environment import (
+        EnvironmentTemporaryArtifacts,
+        ShellEnvironment,
+    )
+    from fast_agent.tools.external_runtime_protocol import ExternalRuntime
+    from fast_agent.tools.filesystem_runtime_protocol import FilesystemRuntime
+    from fast_agent.tools.local_filesystem_runtime import LocalFilesystemRuntime
+    from fast_agent.tools.shell_profiles import ResolvedShellToolProfile, ShellToolProfile
+    from fast_agent.tools.shell_runtime import ShellRuntime
     from fast_agent.transactional.execution import ToolExecutionInterceptor
     from fast_agent.transactional.models import JsonValue, RunId
 
@@ -299,6 +300,7 @@ class McpAgent(ABC, ToolAgent):
 
         # set with the "attach" method
         self._llm: FastAgentLLMProtocol | None = None
+        self._codex_web_search = CodexWebSearchAdapter(self)
 
         # Instantiate human input tool once if enabled in config
         self._human_input_tool = self._initial_human_input_tool()
@@ -696,6 +698,8 @@ class McpAgent(ABC, ToolAgent):
         return kwargs
 
     def _temporary_artifact_environment(self) -> EnvironmentTemporaryArtifacts | None:
+        from fast_agent.tools.execution_environment import EnvironmentTemporaryArtifacts
+
         environment = self._shell_environment
         if not isinstance(environment, EnvironmentTemporaryArtifacts):
             return None
@@ -712,6 +716,8 @@ class McpAgent(ABC, ToolAgent):
     async def _configure_cloned_instance(self, clone: "LlmDecorator") -> None:
         await super()._configure_cloned_instance(clone)
         mcp_clone = cast("McpAgent", clone)
+        # Tool invocations can share names and context, but not search references.
+        mcp_clone._codex_web_search.detached = True
         attached = set(mcp_clone.list_attached_mcp_servers())
         for server_name in self.list_attached_mcp_servers():
             if server_name not in attached:
@@ -728,6 +734,9 @@ class McpAgent(ABC, ToolAgent):
         return self._skill_manifests
 
     def _local_filesystem_runtime(self) -> LocalFilesystemRuntime | None:
+        from fast_agent.tools.composite_filesystem_runtime import CompositeFilesystemRuntime
+        from fast_agent.tools.local_filesystem_runtime import LocalFilesystemRuntime
+
         runtime = self._filesystem_runtime
         if isinstance(runtime, LocalFilesystemRuntime):
             return runtime
@@ -741,6 +750,9 @@ class McpAgent(ABC, ToolAgent):
         return None
 
     def _environment_filesystem_runtime(self) -> EnvironmentFilesystemRuntime | None:
+        from fast_agent.tools.composite_filesystem_runtime import CompositeFilesystemRuntime
+        from fast_agent.tools.environment_filesystem_runtime import EnvironmentFilesystemRuntime
+
         runtime = self._filesystem_runtime
         if isinstance(runtime, EnvironmentFilesystemRuntime):
             return runtime
@@ -754,6 +766,8 @@ class McpAgent(ABC, ToolAgent):
         return None
 
     def _drop_local_filesystem_runtime(self) -> None:
+        from fast_agent.tools.composite_filesystem_runtime import CompositeFilesystemRuntime
+
         local_runtime = self._local_filesystem_runtime()
         if local_runtime is None:
             return
@@ -1110,6 +1124,11 @@ class McpAgent(ABC, ToolAgent):
         if not self._shell_runtime_enabled:
             return
 
+        from fast_agent.tools.composite_filesystem_runtime import CompositeFilesystemRuntime
+        from fast_agent.tools.environment_filesystem_runtime import EnvironmentFilesystemRuntime
+        from fast_agent.tools.execution_environment import EnvironmentFilesystem
+        from fast_agent.tools.local_filesystem_runtime import LocalFilesystemRuntime
+
         enable_read = self._shell_read_text_file_enabled()
         enable_attach_media = self._shell_attach_media_mode()
         model_info = self.llm.model_info if self.llm else None
@@ -1362,6 +1381,8 @@ class McpAgent(ABC, ToolAgent):
         if activation_reason is not None and self._external_runtime is not None:
             return
 
+        from fast_agent.tools.shell_runtime import ShellRuntime
+
         self._warn_if_invalid_shell_working_directory(working_directory)
 
         shell_settings = self._resolve_shell_runtime_settings()
@@ -1475,15 +1496,6 @@ class McpAgent(ABC, ToolAgent):
         """
         self._instruction_context.update(context)
         self.logger.debug(f"Set instruction context for agent {self._name}: {list(context.keys())}")
-
-    async def __call__(
-        self,
-        message: str
-        | PromptMessage
-        | PromptMessageExtended
-        | Sequence[str | PromptMessage | PromptMessageExtended],
-    ) -> str:
-        return await self.send(message)
 
     def _matches_pattern(self, name: str, pattern: str) -> bool:
         """
@@ -1616,6 +1628,9 @@ class McpAgent(ABC, ToolAgent):
         Args:
             runtime: Runtime instance with tools property and read_text_file/write_text_file methods
         """
+        from fast_agent.tools.composite_filesystem_runtime import CompositeFilesystemRuntime
+        from fast_agent.tools.local_filesystem_runtime import LocalFilesystemRuntime
+
         local_runtime = self._local_filesystem_runtime()
         if isinstance(runtime, (LocalFilesystemRuntime, CompositeFilesystemRuntime)):
             self._filesystem_runtime = runtime
@@ -1652,12 +1667,17 @@ class McpAgent(ABC, ToolAgent):
         Returns:
             Result of the tool call
         """
-        local_result = await self._call_local_tool(
-            name,
-            arguments,
-            tool_use_id,
-            request_params=request_params,
-        )
+        with self._codex_web_search.turn(request_params):
+            self._codex_web_search.sync()
+            denial = await self._codex_web_search.permission_error(name, arguments, tool_use_id)
+            if denial is not None:
+                return denial
+            local_result = await self._call_local_tool(
+                name,
+                arguments,
+                tool_use_id,
+                request_params=request_params,
+            )
         if local_result is not None:
             return local_result
 
@@ -1974,6 +1994,14 @@ class McpAgent(ABC, ToolAgent):
         return response.first_text()
 
     async def run_tools(
+        self,
+        request: PromptMessageExtended,
+        request_params: RequestParams | None = None,
+    ) -> PromptMessageExtended:
+        with self._codex_web_search.turn(request_params):
+            return await self._run_mcp_tools(request, request_params)
+
+    async def _run_mcp_tools(
         self,
         request: PromptMessageExtended,
         request_params: RequestParams | None = None,
@@ -2634,6 +2662,28 @@ class McpAgent(ABC, ToolAgent):
 
         return filtered_result
 
+    async def _generate_tool_turn_impl(
+        self,
+        messages: list[PromptMessageExtended],
+        request_params: RequestParams | None = None,
+        tools: list[Tool] | None = None,
+    ) -> PromptMessageExtended:
+        with self._codex_web_search.turn(request_params):
+            return await super()._generate_tool_turn_impl(messages, request_params, tools)
+
+    def clear(self, *, clear_prompts: bool = False) -> None:
+        super().clear(clear_prompts=clear_prompts)
+        self._codex_web_search.history_loaded(None)
+
+    def load_message_history(
+        self, messages: list[PromptMessageExtended] | None, *, clear_state: bool = False
+    ) -> None:
+        if clear_state:
+            # Reset provider/agent state without overwriting persisted search identity.
+            super().clear(clear_prompts=True)
+        super().load_message_history(messages)
+        self._codex_web_search.history_loaded(messages)
+
     async def list_tools(self) -> ListToolsResult:
         """
         List all tools available to this agent, filtered by configuration.
@@ -2641,6 +2691,7 @@ class McpAgent(ABC, ToolAgent):
         Returns:
             ListToolsResult with available tools
         """
+        self._codex_web_search.sync()
         # Start with filtered aggregator tools and merge in subclass/local tools
         merged_tools: list[Tool] = await self._get_filtered_mcp_tools()
         existing_names = {tool.name for tool in merged_tools}
@@ -2918,29 +2969,3 @@ class McpAgent(ABC, ToolAgent):
             # https://github.com/modelcontextprotocol/modelcontextprotocol/pull/93
             output_modes=None,  # ,["text/plain", "image/*"],
         )
-
-    @property
-    def message_history(self) -> list[PromptMessageExtended]:
-        """
-        Return the agent's message history as PromptMessageExtended objects.
-
-        This history can be used to transfer state between agents or for
-        analysis and debugging purposes.
-
-        Returns:
-            List of PromptMessageExtended objects representing the conversation history
-        """
-        # Conversation history is maintained at the agent layer; LLM history is diagnostic only.
-        return super().message_history
-
-    @property
-    def usage_accumulator(self) -> "UsageAccumulator | None":
-        """
-        Return the usage accumulator for tracking token usage across turns.
-
-        Returns:
-            UsageAccumulator object if LLM is attached, None otherwise
-        """
-        if self.llm:
-            return self.llm.usage_accumulator
-        return None

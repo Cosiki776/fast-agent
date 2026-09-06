@@ -34,6 +34,7 @@ nav = [
     "guides/structured-outputs.md",
     { "Privacy Filter" = "guides/privacy_filter.md" },
     { "Compaction" = "guides/compaction.md" },
+    { "Responses prompt caching" = "guides/responses-caching.md" },
   ] },
   { "Agents" = [
     { "Defining Agents" = [
@@ -120,6 +121,8 @@ nav = [
     { "Export Command" = "ref/export_command.md" },
     { "Batch Processing" = "ref/batch.md" },
     { "Config File" = "ref/config_file.md" },
+    { "Shell Runtime Budgeting" = "ref/shell_runtime_budgeting.md" },
+    { "Reasoning Replay Canonicalization" = "ref/reasoning_replay_canonicalization.md" },
     { "Command Line" = "ref/cmd_switches.md" },
     { "Class Reference" = "ref/class_reference.md" },
     { "Extension Reference" = "ref/extension_reference.md" },

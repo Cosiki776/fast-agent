@@ -378,7 +378,7 @@ class ShellSettings(BaseModel):
         description="Maximum duration of one model-initiated managed-process wait",
     )
     foreground_auto_await_max_seconds: int = Field(
-        default=240,
+        default=30,
         ge=0,
         le=MAX_FOREGROUND_AUTO_AWAIT_SECONDS,
         description=(
@@ -1683,11 +1683,11 @@ class BedrockSettings(BaseModel):
     )
     reasoning: ReasoningEffortSetting | str | int | bool | None = Field(
         default=None,
-        description="Unified reasoning setting (effort level or budget)",
+        description="Unified reasoning setting (effort level or legacy mapped budget)",
     )
-    reasoning_effort: Literal["minimal", "low", "medium", "high"] = Field(
+    reasoning_effort: Literal["minimal", "low", "medium", "high", "xhigh", "max"] = Field(
         default="minimal",
-        description="Default reasoning effort: minimal, low, medium, high",
+        description="Default reasoning effort: minimal, low, medium, high, xhigh, max",
     )
 
     model_config = ConfigDict(extra="allow", arbitrary_types_allowed=True)

@@ -10,6 +10,7 @@ from benchmarks.transactional.run_development_pilot import (
     PilotResult,
     _controlled_command_metrics,
     _find_controlled_result,
+    _pilot_tool_output,
     _task_prompt,
     _verify_workspace,
 )
@@ -18,6 +19,29 @@ from fast_agent.transactional.benchmark import load_task_manifest, task_manifest
 from fast_agent.transactional.settings import ToolOutputStrategy, TransactionalProfile
 
 CONTROLLED_COMMAND = "python3 -m unittest discover -s tests"
+
+
+@pytest.mark.parametrize(
+    ("profile", "expected"),
+    [
+        (TransactionalProfile.BASELINE, "upstream"),
+        (TransactionalProfile.REDUCER, "semantic"),
+        (TransactionalProfile.FULL, "semantic"),
+    ],
+)
+def test_pilot_default_packages_are_preserved(profile: TransactionalProfile, expected: str) -> None:
+    assert _pilot_tool_output(profile, None).strategy.value == expected
+
+
+def test_full_upstream_removes_semantic_version() -> None:
+    settings = _pilot_tool_output(TransactionalProfile.FULL, "upstream")
+    assert settings.strategy is ToolOutputStrategy.UPSTREAM
+    assert settings.semantic_reducer_version is None
+
+
+def test_baseline_cannot_claim_to_install_a_semantic_reducer() -> None:
+    with pytest.raises(ValueError, match="does not install"):
+        _pilot_tool_output(TransactionalProfile.BASELINE, "semantic")
 
 
 def test_controlled_command_requires_an_exact_completed_shell_call() -> None:

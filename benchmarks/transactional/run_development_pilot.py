@@ -30,6 +30,7 @@ from fast_agent.transactional.events import ToolResultStored
 from fast_agent.transactional.run_events import RunState
 from fast_agent.transactional.settings import (
     SemanticReducerVersion,
+    ToolOutputSettings,
     ToolOutputStrategy,
     TransactionalProfile,
 )
@@ -204,14 +205,9 @@ async def run(args: argparse.Namespace) -> PilotResult:
     manifest_path = Path(args.manifest).resolve()
     task = load_task_manifest(manifest_path)
     profile = TransactionalProfile(args.profile)
-    tool_output_strategy = (
-        ToolOutputStrategy.UPSTREAM
-        if profile is TransactionalProfile.BASELINE
-        else ToolOutputStrategy.SEMANTIC
-    )
-    semantic_reducer_version = (
-        SemanticReducerVersion.V1 if tool_output_strategy is ToolOutputStrategy.SEMANTIC else None
-    )
+    tool_output = _pilot_tool_output(profile, args.tool_output_strategy)
+    tool_output_strategy = tool_output.strategy
+    semantic_reducer_version = tool_output.semantic_reducer_version
     output = Path(args.output).resolve()
     if output.exists():
         raise FileExistsError(f"Pilot output already exists: {output}")
@@ -592,6 +588,27 @@ def _git(root: Path, *arguments: str) -> str:
     ).stdout.strip()
 
 
+def _pilot_tool_output(
+    profile: TransactionalProfile,
+    requested_strategy: str | None,
+) -> ToolOutputSettings:
+    strategy = (
+        ToolOutputStrategy(requested_strategy)
+        if requested_strategy is not None
+        else ToolOutputStrategy.UPSTREAM
+        if profile is TransactionalProfile.BASELINE
+        else ToolOutputStrategy.SEMANTIC
+    )
+    if profile is TransactionalProfile.BASELINE and strategy is ToolOutputStrategy.SEMANTIC:
+        raise ValueError("Pilot baseline does not install a semantic reducer; use reducer or full")
+    return ToolOutputSettings(
+        strategy=strategy,
+        semantic_reducer_version=(
+            SemanticReducerVersion.V1 if strategy is ToolOutputStrategy.SEMANTIC else None
+        ),
+    )
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--manifest", required=True)
@@ -601,6 +618,12 @@ def parse_args() -> argparse.Namespace:
         choices=[item.value for item in TransactionalProfile],
     )
     parser.add_argument("--model", default="aliyun.qwen3.8-max")
+    parser.add_argument(
+        "--tool-output-strategy",
+        choices=[item.value for item in ToolOutputStrategy],
+        default=None,
+        help="Development-only override; defaults to upstream for baseline and semantic-v1 otherwise",
+    )
     parser.add_argument("--output", required=True)
     return parser.parse_args()
 

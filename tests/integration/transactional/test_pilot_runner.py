@@ -46,7 +46,11 @@ def _git_repository(root: Path) -> Path:
 
 @pytest.mark.integration
 @pytest.mark.asyncio
-@pytest.mark.parametrize("profile", list(TransactionalProfile))
+@pytest.mark.parametrize(
+    ("profile", "strategy"),
+    [(profile, None) for profile in TransactionalProfile]
+    + [pytest.param(TransactionalProfile.FULL, "upstream", id="full-upstream")],
+)
 @pytest.mark.parametrize(
     "scenario", ["llm_limit", "tool_limit", "provider_error", "wall_limit", "success"]
 )
@@ -54,6 +58,7 @@ async def test_pilot_budget_and_failure_evidence_through_real_harness(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     profile: TransactionalProfile,
+    strategy: str | None,
     scenario: str,
 ) -> None:
     root = _git_repository(tmp_path / "root")
@@ -128,12 +133,19 @@ async def test_pilot_budget_and_failure_evidence_through_real_harness(
             argparse.Namespace(
                 manifest=str(manifest),
                 profile=profile.value,
+                tool_output_strategy=strategy,
                 model="passthrough",
                 output=str(output),
             )
         )
     saved = pilot.PilotResult.model_validate_json((output / "result.json").read_text())
     assert saved == result
+    expected_strategy = strategy or (
+        "upstream" if profile is TransactionalProfile.BASELINE else "semantic"
+    )
+    assert result.tool_output_strategy.value == expected_strategy
+    if expected_strategy == "upstream":
+        assert result.semantic_reducer_version is None
     assert result.llm_calls == calls == (1 if scenario == "wall_limit" else 2)
     assert result.tool_calls == (
         0 if scenario == "wall_limit" else 2 if scenario == "llm_limit" else 1

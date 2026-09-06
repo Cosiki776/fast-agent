@@ -8,6 +8,35 @@ The comparison packages remain baseline + upstream tool output, reducer +
 semantic v1, and full + semantic v1. Profile and output strategy are independent
 product settings; these packages are the Pilot's experimental choice.
 
+For an additional development comparison, select `--profile full
+--tool-output-strategy upstream`. This keeps Full's isolation, recovery,
+mandatory verifier and promotion while disabling semantic reduction. Upstream
+Shell output limits still apply. The result records `tool_output_strategy:
+upstream` and `semantic_reducer_version: null`; omitting the override preserves
+the original three packages. Baseline with semantic output is rejected because
+the baseline runtime does not install the semantic reducer.
+
+Run this extra group once per development task, with the same model and manifest
+budgets, and save each run to a fresh path under `.txagent-runs/`. Keep these
+three supplementary runs separate from the nine runs at `feb21746`: the Runner
+has changed commits, and a single trajectory per task is only exploratory.
+Formal inclusion of a fourth group must be decided before held-out runs and
+executed at the same frozen implementation commit as its comparators.
+
+After committing the Runner change, run all three supplementary tasks with:
+
+```bash
+bash benchmarks/transactional/run_full_upstream_pilot.sh
+```
+
+The script uses `aliyun.qwen3.8-max` (an optional first argument overrides it),
+unsets proxy variables only for its own process tree, and saves logs, results,
+commit and manifest provenance under `.txagent-runs/full-upstream-<commit>.*`.
+Task failures are retained and the next task runs; provider failures, cancellation
+or missing result files stop the batch. Keep implementation and config unchanged
+throughout the batch. This command uses the real provider; unit and scripted
+integration tests do not.
+
 ## Common limits
 
 All three manifests now allow 40 logical LLM calls, 80 tool calls and 600 seconds

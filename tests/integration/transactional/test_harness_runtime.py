@@ -134,6 +134,7 @@ def _fast_agent(
     profile: TransactionalProfile,
     workspace: Path,
     keep_worktree: bool = True,
+    verification_command: str | None = None,
 ) -> tuple[FastAgent, Path, Path]:
     runtime_root = tmp_path / "transactional-runtime"
     home = tmp_path / "home"
@@ -155,6 +156,15 @@ def _fast_agent(
                 f"  keep_worktree: {str(keep_worktree).lower()}",
                 "  shell_terminal_timeout_seconds: 0.15",
                 "  max_wall_time_seconds: 30",
+                *(
+                    [
+                        "  verification:",
+                        f"    command: {verification_command}",
+                        "    timeout_seconds: 5",
+                    ]
+                    if verification_command is not None
+                    else []
+                ),
             ]
         ),
         encoding="utf-8",
@@ -519,5 +529,149 @@ async def test_full_harness_timeout_restores_checkpoint_and_hands_off_to_llm(
             await run_cli_flow(fast, request, flow=flow)
 
         assert observed is True
+    finally:
+        update_global_settings(old_settings)
+
+
+class _HandoffThenFixLlm(PassthroughLLM):
+    def __init__(self, source: Path, isolated: Path, failure_command: str) -> None:
+        super().__init__()
+        self.retry_count = 0
+        self.failure_command = failure_command
+        self.source = source
+        self.isolated = isolated
+        self.turns = 0
+        self.saw_handoff = False
+        self.handoff_version: str | None = None
+
+    async def _apply_prompt_provider_specific(
+        self,
+        multipart_messages: list[PromptMessageExtended],
+        request_params: RequestParams | None = None,
+        tools: list[Tool] | None = None,
+        is_template: bool = False,
+    ) -> PromptMessageExtended:
+        del request_params, tools, is_template
+        self.turns += 1
+        assert (self.source / "tracked.txt").read_text() == "baseline\n"
+        if self.turns == 2:
+            assert (self.isolated / "tracked.txt").read_text() == "wrong"
+        if self.turns <= 2:
+            command = self.failure_command
+        elif self.turns == 3:
+            handoffs = [
+                result.structured_content
+                for message in multipart_messages
+                for result in (message.tool_results or {}).values()
+                if result.structured_content
+                and result.structured_content.get("status") == "recovery_handoff"
+            ]
+            assert len(handoffs) == 1
+            handoff = handoffs[0]["handoff"]
+            assert isinstance(handoff, dict)
+            assert handoff["rolled_back"] is True
+            # Coordinator currently leaves reverted_files empty. Check the real file
+            # and restored version instead of claiming per-file metadata exists.
+            assert isinstance(handoff["workspace_version"], str)
+            self.handoff_version = handoff["workspace_version"]
+            assert handoff["forbidden_repeat"]
+            assert handoff["required_next_step"]
+            assert (self.isolated / "tracked.txt").read_text() == "baseline\n"
+            self.saw_handoff = True
+            command = "printf 'corrected\\n' > tracked.txt"
+        else:
+            assert self.turns == 4
+            assert (self.isolated / "tracked.txt").read_text() == "corrected\n"
+            return Prompt.assistant("fixed with a new plan", stop_reason=LlmStopReason.END_TURN)
+        return Prompt.assistant(
+            "Try the repair",
+            stop_reason=LlmStopReason.TOOL_USE,
+            tool_calls={
+                f"repair-{self.turns}": CallToolRequest(
+                    method="tools/call",
+                    params=CallToolRequestParams(
+                        name="execute",
+                        arguments={"command": command},
+                    ),
+                )
+            },
+        )
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+@pytest.mark.skipif(os.name == "nt", reason="uses Unix shell commands and timeout recovery")
+@pytest.mark.parametrize("nonzero_exit", [False, True], ids=["timeout", "nonzero-exit"])
+async def test_handoff_replans_through_tool_runner_then_verifies_and_promotes(
+    tmp_path: Path,
+    nonzero_exit: bool,
+) -> None:
+    repository = _git_repository(tmp_path / "repository")
+    old_settings = get_settings()
+    try:
+        fast, config_path, home = _fast_agent(
+            tmp_path,
+            profile=TransactionalProfile.FULL,
+            workspace=repository,
+            verification_command="grep -qx corrected tracked.txt",
+        )
+        request = _request(
+            config_path=config_path, home=home, workspace=repository, message="repair"
+        )
+        observed = False
+
+        async def flow(
+            agent_app: AgentApp,
+            request: AgentRunRequest,
+            *,
+            session_manager: SessionManager | None = None,
+            harness_session: HarnessSession | None = None,
+        ) -> None:
+            nonlocal observed
+            del request, session_manager
+            from fast_agent.agents.mcp_agent import McpAgent
+            from fast_agent.transactional.run_events import (
+                PromotionApplied,
+                RunRecovered,
+                RunVerified,
+            )
+
+            assert harness_session is not None
+            runtime = harness_session.transactional_runtime
+            assert runtime is not None and runtime.worktree is not None
+            assert runtime.run_event_store is not None
+            agent = agent_app["main"]
+            assert isinstance(agent, McpAgent)
+            if nonzero_exit:
+                failure_command = "printf wrong > tracked.txt; exit 1"
+            else:
+                script = "from pathlib import Path; import time; Path('tracked.txt').write_text('wrong'); time.sleep(30)"
+                failure_command = shlex.join([sys.executable, "-c", script])
+            llm = _HandoffThenFixLlm(repository, runtime.worktree.worktree_path, failure_command)
+            agent._llm = llm
+            await harness_session.send("repair")
+            assert llm.saw_handoff and llm.turns == 4
+            assert (repository / "tracked.txt").read_text() == "corrected\n"
+            events = [item.event for item in runtime.run_event_store.events_for_run(runtime.run_id)]
+            kinds = [event.kind for event in events]
+            assert kinds == [
+                RunEventKind.STARTED,
+                RunEventKind.RECOVERY_STARTED,
+                RunEventKind.RECOVERED,
+                RunEventKind.VERIFICATION_STARTED,
+                RunEventKind.VERIFIED,
+                RunEventKind.PROMOTION_APPLIED,
+            ]
+            recovered = next(event for event in events if isinstance(event, RunRecovered))
+            assert recovered.workspace_version == llm.handoff_version
+            verified = next(event for event in events if isinstance(event, RunVerified))
+            promoted = next(event for event in events if isinstance(event, PromotionApplied))
+            assert verified.workspace_version == promoted.workspace_version
+            assert runtime.budget.snapshot.recovery_attempts == 1
+            observed = True
+
+        with suppress_interactive_display():
+            await run_cli_flow(fast, request, flow=flow)
+        assert observed
     finally:
         update_global_settings(old_settings)

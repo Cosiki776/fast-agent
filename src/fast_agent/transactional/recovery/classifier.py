@@ -14,8 +14,10 @@ from fast_agent.tools.filesystem_tool_definitions import (
     READ_TEXT_FILE_TOOL_NAME,
     WRITE_TEXT_FILE_TOOL_NAME,
 )
+from fast_agent.tools.shell_process import process_result_metadata
 from fast_agent.transactional.execution import ToolExecutionRequest
 from fast_agent.transactional.models import RunId, ToolCallId, ToolEffect
+from fast_agent.utils.tool_names import SHELL_COMMAND_TOOL_NAMES
 
 _WORKSPACE_WRITE_TOOLS = frozenset(
     {
@@ -75,11 +77,12 @@ class FailureClassifier:
         status, error_type, message = _failure_fields(result)
         kind = _failure_kind(status, error_type, message)
         summary = message or status or f"{tool_name} returned an error"
+        signature_message = _signature_message(tool_name, result, summary)
         payload = json.dumps(
             {
                 "error_type": error_type.casefold(),
                 "kind": kind.value,
-                "message": " ".join(summary.casefold().split()),
+                "message": " ".join(signature_message.casefold().split()),
                 "tool_name": tool_name,
             },
             sort_keys=True,
@@ -121,6 +124,42 @@ def _string_field(value: dict[str, object] | None, key: str) -> str:
 
 def _result_text(result: CallToolResult) -> str:
     return "\n".join(block.text for block in result.content if isinstance(block, TextContent))
+
+
+def _signature_message(tool_name: str, result: CallToolResult, message: str) -> str:
+    """Remove only the native session shell's generated nonzero-exit ID footer.
+
+    Keep program output, exit codes, structured errors and diagnostic evidence
+    intact. Matching the canonical metadata prevents stripping arbitrary text
+    that merely resembles a shell process ID.
+    """
+    if tool_name not in SHELL_COMMAND_TOOL_NAMES or _string_field(
+        result.structured_content, "message"
+    ):
+        return message
+    metadata = process_result_metadata(result)
+    if (
+        metadata is None
+        or metadata.get("lifecycle") != "session"
+        or metadata.get("process_status") != "failed"
+    ):
+        return message
+    process_id = metadata.get("process_id")
+    exit_code = metadata.get("exit_code")
+    if (
+        not isinstance(process_id, str)
+        or not isinstance(exit_code, int)
+        or isinstance(exit_code, bool)
+        or exit_code == 0
+    ):
+        return message
+    before_exit, separator, exit_line = message.rpartition("\n")
+    if not separator or exit_line != f"process exit code was {exit_code}":
+        return message
+    output, separator, id_line = before_exit.rpartition("\n")
+    if id_line != f"process_id: {process_id}":
+        return message
+    return f"{output}{separator}{exit_line}"
 
 
 def _failure_kind(status: str, error_type: str, message: str) -> FailureKind:

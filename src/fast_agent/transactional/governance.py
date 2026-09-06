@@ -24,15 +24,9 @@ if TYPE_CHECKING:
     from fast_agent.transactional.execution import ToolExecutionRequest
 
 
-POLICY_VERSION = "coding-v1"
+POLICY_VERSION = "coding-v2"
 
 _PATH_ARGUMENTS = ("path", "cwd", "working_directory")
-# This exact find predicate excludes Git entries; its pattern is not a path access.
-# Keep the exception narrow: extra find expressions/actions still use the normal gate.
-_FIND_GIT_EXCLUSION = re.compile(
-    r"\A(find[ \t]+\.[ \t]+-type[ \t]+f[ \t]+(?:-not|!)[ \t]+-path[ \t]+)"
-    r"(['\"])\./\.git/\*\2(?=[ \t]*(?:$|[;&|]))"
-)
 _PATCH_PATH = re.compile(r"^\*\*\* (?:Add|Delete|Update) File: (.+)$", re.MULTILINE)
 _PATCH_MOVE_PATH = re.compile(r"^\*\*\* Move to: (.+)$", re.MULTILINE)
 _SHELL_PRIVILEGE_ESCALATION = re.compile(
@@ -164,12 +158,12 @@ class CodingToolPolicy:
                 return denial
         return None
 
-    def _validate_path(self, raw_path: str) -> str | None:
+    def _validate_path(self, raw_path: str, *, cwd: Path | None = None) -> str | None:
         candidate = Path(raw_path).expanduser()
         resolved = (
             candidate.resolve()
             if candidate.is_absolute()
-            else (self._workspace / candidate).resolve()
+            else ((cwd or self._workspace) / candidate).resolve()
         )
         if not is_within(resolved, self._workspace):
             return f"path escapes the Run worktree: {raw_path}"
@@ -212,56 +206,112 @@ class CodingToolPolicy:
             return GovernanceDecision.deny("privilege escalation command is forbidden")
         if any(pattern.search(normalized) for pattern in _SHELL_HARD_DENIES):
             return GovernanceDecision.deny("destructive remote command is forbidden")
-        if self._contains_protected_shell_path(command):
-            return GovernanceDecision.deny("shell command targets a protected path")
+        path_decision = self._shell_path_decision(command, request)
+        if path_decision is not None:
+            return path_decision
         if _SHELL_APPROVAL_COMMAND.search(normalized):
             return GovernanceDecision.require_approval(
                 "shell command may produce external network side effects"
             )
         return None
 
-    def _contains_protected_shell_path(self, command: str) -> bool:
-        command = _FIND_GIT_EXCLUSION.sub(r"\1'__excluded_git_entries__'", command)
-        normalized = command.replace("\\", "/")
-        if "../" in normalized or "/.git/" in normalized or " .git/" in normalized:
-            return True
-        if str(self._transactional_root) in command:
-            return True
-        if any(
-            marker in normalized.casefold()
-            for marker in ("/.env", "/.ssh/", "/.aws/", "/.gnupg/", "credentials.json")
-        ):
-            return True
-
-        lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
+    def _shell_path_decision(
+        self, command: str, request: ToolExecutionRequest
+    ) -> GovernanceDecision | None:
+        # Resolve literal operands, not substrings of the entire command. This
+        # remains a best-effort policy; it does not interpret embedded programs.
+        lexer = shlex.shlex(command, posix=True, punctuation_chars="();<>|&\n")
+        lexer.whitespace = " \t\r"
         lexer.whitespace_split = True
         lexer.commenters = ""
         try:
             tokens = list(lexer)
         except ValueError:
-            return True
+            return GovernanceDecision.deny("shell command could not be parsed")
 
+        if any(token in {"<<", "<<-", "<<<"} for token in tokens):
+            return GovernanceDecision.require_approval(
+                "inline shell input requires review; path literals may be data or file access"
+            )
+
+        cwd = self._workspace
+        for key in ("cwd", "working_directory"):
+            value = request.arguments.get(key)
+            if isinstance(value, str):
+                cwd = (self._workspace / value).resolve()
         command_start = True
-        skip_payload = False
-        for token in tokens:
-            if token in {";", "&&", "||", "|", "&"}:
+        executable = ""
+        grep_pattern = False
+        skip_argument = False
+        redirect = False
+        pending: GovernanceDecision | None = None
+        for index, token in enumerate(tokens):
+            if token in {";", "&&", "||", "|", "&", "\n"} or set(token) <= {";", "\n"}:
                 command_start = True
-                skip_payload = False
+                skip_argument = False
                 continue
-            if command_start:
+            if token in {">", ">>", "<", "<>"}:
+                redirect = True
+                continue
+            if any(marker in token for marker in ("$", "`")):
+                pending = GovernanceDecision.require_approval("dynamic shell paths require review")
+            if command_start and not redirect:
                 command_start = False
+                executable = Path(token).name
+                grep_pattern = executable in {"grep", "rg"}
                 continue
-            if skip_payload:
-                skip_payload = False
+            if skip_argument:
+                skip_argument = False
                 continue
-            if token in {"-c", "-Command"}:
-                skip_payload = True
+            if token in {"-c", "-Command"} and (
+                re.fullmatch(r"python(?:\d+(?:\.\d+)*)?", executable)
+                or executable in {"bash", "sh", "zsh", "pwsh", "powershell"}
+            ):
+                payload = tokens[index + 1] if index + 1 < len(tokens) else ""
+                paths = re.findall(r"""(?:~?/|\.\.?/)[^\s'"(),;]+""", payload)
+                if "credentials.json" in payload.casefold() or any(
+                    self._validate_path(path, cwd=cwd) is not None for path in paths
+                ):
+                    pending = GovernanceDecision.require_approval(
+                        "inline program requires review; path literals may be data or file access"
+                    )
+                skip_argument = True
+                continue
+            previous = tokens[index - 1]
+            following = tokens[index + 1] if index + 1 < len(tokens) else ""
+            if not redirect and executable == "find" and previous in {"-path", "-ipath"}:
+                negated = index >= 2 and tokens[index - 2] in {"!", "-not"}
+                if negated or following == "-prune":
+                    continue
+            if not redirect and executable in {"echo", "printf"}:
+                continue
+            if not redirect and executable in {"grep", "rg"} and token == "-e":
+                skip_argument = True
+                grep_pattern = False
+                continue
+            if not redirect and executable in {"grep", "rg"} and token == "-f":
+                grep_pattern = False
                 continue
             if token.startswith("-") or "://" in token:
                 continue
-            if Path(token).is_absolute() and self._validate_path(token) is not None:
-                return True
-        return False
+            if not redirect and grep_pattern:
+                grep_pattern = False
+                continue
+            if any(marker in token for marker in ("$", "`")):
+                continue
+            denial = (
+                None if redirect and token == "/dev/null" else self._validate_path(token, cwd=cwd)
+            )
+            if denial is not None:
+                return GovernanceDecision.deny(denial)
+            if executable == "cd" and not redirect:
+                cwd = (cwd / token).resolve()
+                if following and following != "&&":
+                    pending = GovernanceDecision.require_approval(
+                        "conditional shell working directory requires review; use cd ... && ..."
+                    )
+            redirect = False
+        return pending
 
 
 class CodingToolGovernanceGate:

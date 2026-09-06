@@ -81,6 +81,18 @@ do not pool their counts or outcomes with this protocol as an unchanged experime
 
 ## Results and failure evidence
 
+Full's `coding-v2` Shell policy resolves literal paths against the working
+directory (including simple `cd ... && ...`), rather than rejecting every `../`
+substring. Find exclusions/pruning and grep patterns are data; file operands and
+redirection destinations still undergo workspace, Git metadata and secret checks.
+Normal `git status`/`git diff` remain allowed. The policy is not an OS sandbox.
+Here-documents, dynamic paths and inline programs with potentially protected paths
+require review because this policy cannot distinguish test data from file access.
+Without an approval handler these requests remain denied; this change does not
+guarantee fewer calls in an unattended Pilot. Record policy denials separately
+from Recovery and do not combine earlier runs with the changed policy as one
+frozen experiment.
+
 Every started run saves `result.json` (schema version 2), including failures and
 handled cancellation. It records the implementation commit and dirty flag,
 manifest hash, resolved budget, logical calls, usage, event kinds and failure

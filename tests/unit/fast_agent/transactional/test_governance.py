@@ -81,6 +81,89 @@ def test_policy_denies_patch_escape(tmp_path: Path) -> None:
     assert decision.disposition is GovernanceDisposition.DENY
 
 
+@pytest.mark.parametrize(
+    "command",
+    [
+        "cat src/../README.md",
+        "cd src && cat ../README.md",
+        "git status && git diff",
+        "echo '../outside .git/config'",
+        "grep -v '^./.git/' README.md",
+        "grep -e '../outside' README.md",
+        "cd src && find . -type f -not -path './.git/*'",
+        "find . -path './.git' -prune -o -type f -print",
+        "find . -name __pycache__ -type d -exec rm -rf {} + 2>/dev/null",
+        "python3 -c \"from pathlib import Path; Path('tracked.txt').write_text('ok')\"",
+    ],
+)
+def test_shell_allows_local_paths_and_non_path_patterns(tmp_path: Path, command: str) -> None:
+    policy, workspace = _policy(tmp_path)
+    (workspace / "src").mkdir()
+    decision = policy.evaluate(
+        _request("execute", {"command": command}), ToolEffect.WORKSPACE_WRITE
+    )
+    assert decision.disposition is GovernanceDisposition.ALLOW
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "cat src/../../outside",
+        "cd src && cat ../../outside",
+        "cat .env",
+        "echo data > .git/config",
+        "> .git/config echo data",
+        "echo data > ../outside",
+        "echo data\ncat ../outside",
+        "grep -e harmless .git/config",
+        "grep -f .git/config README.md",
+        "find . -path './.git' -prune -o -type f -print; cat .git/config",
+    ],
+)
+def test_shell_still_denies_real_protected_operands(tmp_path: Path, command: str) -> None:
+    policy, workspace = _policy(tmp_path)
+    (workspace / "src").mkdir()
+    decision = policy.evaluate(
+        _request("execute", {"command": command}), ToolEffect.WORKSPACE_WRITE
+    )
+    assert decision.disposition is GovernanceDisposition.DENY
+
+
+def test_shell_resolves_request_cwd_and_symlinks(tmp_path: Path) -> None:
+    policy, workspace = _policy(tmp_path)
+    (workspace / "src").mkdir()
+    (workspace / "link").symlink_to(tmp_path, target_is_directory=True)
+    for command, cwd, expected in [
+        ("cat ../README.md", "src", GovernanceDisposition.ALLOW),
+        ("cat ../outside", ".", GovernanceDisposition.DENY),
+        ("cat link/outside", ".", GovernanceDisposition.DENY),
+    ]:
+        decision = policy.evaluate(
+            _request("execute", {"command": command, "working_directory": cwd}),
+            ToolEffect.WORKSPACE_WRITE,
+        )
+        assert decision.disposition is expected
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "python3 -c \"print('../outside')\"",
+        "python3 -c \"open('../outside').read()\"",
+        "python3 - <<'PY'\nprint('../outside')\nPY",
+    ],
+)
+def test_ambiguous_inline_paths_require_review_instead_of_claiming_access(
+    tmp_path: Path, command: str
+) -> None:
+    policy, _ = _policy(tmp_path)
+    decision = policy.evaluate(
+        _request("execute", {"command": command}), ToolEffect.WORKSPACE_WRITE
+    )
+    assert decision.disposition is GovernanceDisposition.REQUIRE_APPROVAL
+    assert "review" in decision.reason
+
+
 @pytest.mark.parametrize("negation", ["-not", "!"])
 def test_policy_allows_find_excluding_git_metadata(tmp_path: Path, negation: str) -> None:
     policy, _ = _policy(tmp_path)

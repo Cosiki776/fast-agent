@@ -3,7 +3,6 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-import shlex
 from copy import deepcopy
 from dataclasses import dataclass
 from enum import StrEnum
@@ -24,7 +23,7 @@ if TYPE_CHECKING:
     from fast_agent.transactional.execution import ToolExecutionRequest
 
 
-POLICY_VERSION = "coding-v1"
+POLICY_VERSION = "coding-v3"
 
 _PATH_ARGUMENTS = ("path", "cwd", "working_directory")
 _PATCH_PATH = re.compile(r"^\*\*\* (?:Add|Delete|Update) File: (.+)$", re.MULTILINE)
@@ -158,12 +157,12 @@ class CodingToolPolicy:
                 return denial
         return None
 
-    def _validate_path(self, raw_path: str) -> str | None:
+    def _validate_path(self, raw_path: str, *, cwd: Path | None = None) -> str | None:
         candidate = Path(raw_path).expanduser()
         resolved = (
             candidate.resolve()
             if candidate.is_absolute()
-            else (self._workspace / candidate).resolve()
+            else ((cwd or self._workspace) / candidate).resolve()
         )
         if not is_within(resolved, self._workspace):
             return f"path escapes the Run worktree: {raw_path}"
@@ -201,60 +200,18 @@ class CodingToolPolicy:
         ):
             return GovernanceDecision.deny("shell output limit exceeds the coding policy limit")
 
+        # Deliberately avoid treating arbitrary command tokens as paths. Shell
+        # syntax is too dynamic for this application policy to be a sandbox.
         normalized = " ".join(command.split())
         if _SHELL_PRIVILEGE_ESCALATION.search(normalized):
             return GovernanceDecision.deny("privilege escalation command is forbidden")
         if any(pattern.search(normalized) for pattern in _SHELL_HARD_DENIES):
             return GovernanceDecision.deny("destructive remote command is forbidden")
-        if self._contains_protected_shell_path(command):
-            return GovernanceDecision.deny("shell command targets a protected path")
         if _SHELL_APPROVAL_COMMAND.search(normalized):
             return GovernanceDecision.require_approval(
                 "shell command may produce external network side effects"
             )
         return None
-
-    def _contains_protected_shell_path(self, command: str) -> bool:
-        normalized = command.replace("\\", "/")
-        if "../" in normalized or "/.git/" in normalized or " .git/" in normalized:
-            return True
-        if str(self._transactional_root) in command:
-            return True
-        if any(
-            marker in normalized.casefold()
-            for marker in ("/.env", "/.ssh/", "/.aws/", "/.gnupg/", "credentials.json")
-        ):
-            return True
-
-        lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
-        lexer.whitespace_split = True
-        lexer.commenters = ""
-        try:
-            tokens = list(lexer)
-        except ValueError:
-            return True
-
-        command_start = True
-        skip_payload = False
-        for token in tokens:
-            if token in {";", "&&", "||", "|", "&"}:
-                command_start = True
-                skip_payload = False
-                continue
-            if command_start:
-                command_start = False
-                continue
-            if skip_payload:
-                skip_payload = False
-                continue
-            if token in {"-c", "-Command"}:
-                skip_payload = True
-                continue
-            if token.startswith("-") or "://" in token:
-                continue
-            if Path(token).is_absolute() and self._validate_path(token) is not None:
-                return True
-        return False
 
 
 class CodingToolGovernanceGate:

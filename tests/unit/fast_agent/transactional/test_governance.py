@@ -84,6 +84,96 @@ def test_policy_denies_patch_escape(tmp_path: Path) -> None:
 @pytest.mark.parametrize(
     "command",
     [
+        "cat src/../README.md",
+        "cd src && cat ../README.md",
+        "git status && git diff",
+        "echo '../outside .git/config'",
+        "grep -v '^./.git/' README.md",
+        "grep -e '../outside' README.md",
+        "cd src && find . -type f -not -path './.git/*'",
+        "find . -path './.git' -prune -o -type f -print",
+        "find . -name __pycache__ -type d -exec rm -rf {} + 2>/dev/null",
+        "python3 -c \"from pathlib import Path; Path('tracked.txt').write_text('ok')\"",
+    ],
+)
+def test_shell_allows_local_paths_and_non_path_patterns(tmp_path: Path, command: str) -> None:
+    policy, workspace = _policy(tmp_path)
+    (workspace / "src").mkdir()
+    decision = policy.evaluate(
+        _request("execute", {"command": command}), ToolEffect.WORKSPACE_WRITE
+    )
+    assert decision.disposition is GovernanceDisposition.ALLOW
+
+
+@pytest.mark.parametrize(
+    ("working_directory", "expected"),
+    [
+        (".", GovernanceDisposition.ALLOW),
+        ("src", GovernanceDisposition.ALLOW),
+        ("../outside", GovernanceDisposition.DENY),
+        (".git", GovernanceDisposition.DENY),
+    ],
+)
+def test_shell_validates_structured_working_directory(
+    tmp_path: Path,
+    working_directory: str,
+    expected: GovernanceDisposition,
+) -> None:
+    policy, workspace = _policy(tmp_path)
+    (workspace / "src").mkdir()
+    decision = policy.evaluate(
+        _request(
+            "execute",
+            {"command": "python3 -c 'print(1)'", "working_directory": working_directory},
+        ),
+        ToolEffect.WORKSPACE_WRITE,
+    )
+    assert decision.disposition is expected
+
+
+@pytest.mark.parametrize("negation", ["-not", "!"])
+def test_policy_allows_find_excluding_git_metadata(tmp_path: Path, negation: str) -> None:
+    policy, _ = _policy(tmp_path)
+    command = (
+        f'find . -type f {negation} -path "./.git/*" | head -50 '
+        '&& echo "---" && ls -la order_service tests'
+    )
+    assert (
+        policy.evaluate(
+            _request("execute", {"command": command}), ToolEffect.WORKSPACE_WRITE
+        ).disposition
+        is GovernanceDisposition.ALLOW
+    )
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        'find . -type f -path "./.git/*"',
+        'find .git -type f -not -path "./.git/*"',
+        'find . -type f -not -path "./.git/*" -o -path "./.git/config"',
+        'find . -type f -not -path "./.git/*" -exec cat .git/config \\;',
+        'find . -type f -not -path "./.git/*" && cat .git/config',
+        'find . -type f -not -path "./.git/*" > .git/config',
+        'find . -type f -not -path "./.git/*" | cat /tmp/outside',
+        'find . -type f -not -path "./.git/*"; cat ../outside',
+    ],
+)
+def test_shell_policy_does_not_interpret_path_like_command_text(
+    tmp_path: Path, command: str
+) -> None:
+    policy, _ = _policy(tmp_path)
+    assert (
+        policy.evaluate(
+            _request("execute", {"command": command}), ToolEffect.WORKSPACE_WRITE
+        ).disposition
+        is GovernanceDisposition.ALLOW
+    )
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
         "git push --force origin main",
         "git push --force-with-lease origin main",
         "git push --mirror origin",

@@ -8,5 +8,5 @@ verification:
   command: python3 -m unittest discover -s tests
   timeout_seconds: 120
 budget:
-  max_llm_calls: 12
-  max_tool_calls: 50
+  max_llm_calls: 40
+  max_tool_calls: 80

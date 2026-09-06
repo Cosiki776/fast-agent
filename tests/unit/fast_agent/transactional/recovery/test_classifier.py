@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import pytest
 from mcp.types import CallToolResult, TextContent
 
+from fast_agent.tools.shell_process import process_result
 from fast_agent.transactional.execution import ToolExecutionRequest
 from fast_agent.transactional.models import RunId, ToolCallId, ToolEffect
 from fast_agent.transactional.recovery.classifier import (
@@ -80,3 +82,75 @@ def test_failure_signature_is_stable_for_equivalent_whitespace() -> None:
     second = classifier.classify("bash", _error("failed", " same   assertion failed "))
 
     assert first.signature == second.signature
+
+
+def _shell_failure(process_id: str, output: str = "", exit_code: int = 1) -> CallToolResult:
+    return process_result(
+        f"{output}process_id: {process_id}\nprocess exit code was {exit_code}",
+        is_error=True,
+        metadata={
+            "process_id": process_id,
+            "lifecycle": "session",
+            "process_status": "failed",
+            "exit_code": exit_code,
+        },
+    )
+
+
+@pytest.mark.parametrize("output", ["", "AssertionError: expected 10, got 11\n"])
+def test_shell_failure_signature_ignores_only_generated_process_id(output: str) -> None:
+    classifier = FailureClassifier()
+    first_result = _shell_failure("process-1", output)
+    original = first_result.model_dump_json()
+    first = classifier.classify("execute", first_result)
+    second = classifier.classify("execute", _shell_failure("process-2", output))
+
+    assert first.signature == second.signature
+    assert first.kind is FailureKind.TASK_FAILURE
+    assert "process-1" in first.summary  # Diagnostic evidence retains the real ID.
+    assert first_result.model_dump_json() == original
+
+
+@pytest.mark.parametrize(
+    ("output", "exit_code"),
+    [("AssertionError: expected 10, got 12\n", 1), ("AssertionError: expected 10, got 11\n", 2)],
+)
+def test_shell_failure_signature_preserves_actual_error_and_exit_code(
+    output: str,
+    exit_code: int,
+) -> None:
+    classifier = FailureClassifier()
+    first = classifier.classify(
+        "execute", _shell_failure("process-1", "AssertionError: expected 10, got 11\n")
+    )
+    second = classifier.classify("execute", _shell_failure("process-2", output, exit_code))
+    assert first.signature != second.signature
+
+
+def test_program_output_resembling_process_metadata_is_not_removed() -> None:
+    classifier = FailureClassifier()
+    first = classifier.classify("execute", _shell_failure("process-1", "process_id: process-1\n"))
+    second = classifier.classify("execute", _shell_failure("process-2", "process_id: process-2\n"))
+    assert first.signature != second.signature
+
+
+@pytest.mark.parametrize(
+    "case", ["missing_metadata", "mismatched_metadata", "structured_message", "other_tool"]
+)
+def test_process_id_normalization_requires_the_native_shell_envelope(case: str) -> None:
+    classifier = FailureClassifier()
+    results = [_shell_failure("process-1"), _shell_failure("process-2")]
+    for result in results:
+        if case == "missing_metadata":
+            result.meta = None
+        elif case == "mismatched_metadata":
+            result.meta = _shell_failure("process-unrelated").meta
+        elif case == "structured_message":
+            block = result.content[0]
+            assert isinstance(block, TextContent)
+            result.structured_content = {"message": block.text}
+    tool_name = "remote_tool" if case == "other_tool" else "execute"
+    assert (
+        classifier.classify(tool_name, results[0]).signature
+        != classifier.classify(tool_name, results[1]).signature
+    )

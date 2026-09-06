@@ -22,6 +22,7 @@ type NonNegativeInt = Annotated[int, Field(ge=0)]
 class BenchmarkBudgetSpec(BaseModel):
     max_llm_calls: int = Field(gt=0)
     max_tool_calls: int = Field(gt=0)
+    max_wall_time_seconds: float = Field(default=600, gt=0)
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
